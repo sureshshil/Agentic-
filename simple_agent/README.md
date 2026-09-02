@@ -22,7 +22,7 @@ Type messages at the `You:` prompt; type `exit` to quit.
 ## How it works
 
 - `agent.py` defines an `Agent` class that keeps conversation history and
-  runs a loop against the Claude Messages API (`claude-opus-5`).
+  runs a loop against the Claude Messages API (`claude-haiku-4-5`).
 - Two example tools are wired up (`get_current_time`, `calculator`) to show
   how Claude can call tools and receive results back mid-conversation.
 - Add new tools by appending a definition to `TOOLS` and a matching branch

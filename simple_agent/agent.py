@@ -5,7 +5,7 @@ import json
 
 import anthropic
 
-MODEL = "claude-opus-5"
+MODEL = "claude-haiku-4-5"
 MAX_TOKENS = 16000
 
 SYSTEM_PROMPT = (
