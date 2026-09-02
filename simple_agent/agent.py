@@ -2,6 +2,8 @@
 
 import datetime
 import json
+import os
+import sys
 
 import anthropic
 
@@ -102,7 +104,45 @@ class Agent:
         )
 
 
+def _serialize_content(content):
+    if isinstance(content, list):
+        return [c.to_dict() if hasattr(c, "to_dict") else c for c in content]
+    return content
+
+
+def load_history(state_path: str) -> list:
+    if os.path.exists(state_path):
+        with open(state_path) as f:
+            return json.load(f)
+    return []
+
+
+def save_history(state_path: str, messages: list) -> None:
+    serializable = [
+        {"role": m["role"], "content": _serialize_content(m["content"])}
+        for m in messages
+    ]
+    with open(state_path, "w") as f:
+        json.dump(serializable, f)
+
+
+def run_single_turn(user_input: str, state_path: str) -> str:
+    """Send one message, persisting conversation history to state_path so
+    separate process invocations can continue the same conversation."""
+    agent = Agent()
+    agent.messages = load_history(state_path)
+    reply = agent.send(user_input)
+    save_history(state_path, agent.messages)
+    return reply
+
+
 def main():
+    if len(sys.argv) > 1:
+        state_path = os.environ.get("AGENT_STATE_PATH", ".agent_state.json")
+        user_input = " ".join(sys.argv[1:])
+        print(f"Agent: {run_single_turn(user_input, state_path)}")
+        return
+
     agent = Agent()
     print("Simple agent ready. Type 'exit' to quit.")
     while True:
