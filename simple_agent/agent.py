@@ -164,6 +164,7 @@ class Agent:
         return f"{SYSTEM_PROMPT}\n\nThings you remember about the user:\n{facts_block}"
 
     def send(self, user_input: str) -> str:
+        turn_start = len(self.messages)
         self.messages.append({"role": "user", "content": user_input})
 
         resumes = 0
@@ -212,9 +213,21 @@ class Agent:
                     )
             self.messages.append({"role": "user", "content": tool_results})
 
-        return "".join(
+        reply = "".join(
             block.text for block in response.content if block.type == "text"
         )
+
+        # Collapse this turn's tool_use/tool_result/search exchanges down to
+        # a plain {user, assistant} text pair. Raw search results carry a
+        # large opaque verification blob per result (~thousands of tokens),
+        # and since the API is stateless, anything left in self.messages
+        # gets resent on every future turn. The visible answer text is all
+        # future turns actually need.
+        self.messages[turn_start:] = [
+            {"role": "user", "content": user_input},
+            {"role": "assistant", "content": reply},
+        ]
+        return reply
 
 
 def _serialize_content(content):

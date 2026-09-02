@@ -58,6 +58,15 @@ chatting — `agent.messages` persists in the kernel's memory between runs.
   `AGENT_MAX_TOKENS`. This caps how long a single reply can be, not total
   spend across a conversation — a long back-and-forth still resends the
   full history every turn.
+- **Completed turns are collapsed to plain text.** A `web_search` result
+  carries an opaque per-result verification blob that can run into
+  thousands of tokens (measured: ~21K characters for one search-backed
+  reply). Since the API is stateless, anything sitting in history gets
+  resent on *every* future turn — so after a turn finishes, `Agent.send`
+  replaces the whole tool_use/tool_result exchange with a plain
+  `{user, assistant-text}` pair. The final answer is preserved; the raw
+  tool internals aren't. This is what actually keeps long conversations
+  cheap, more than the per-response cap below.
 - `MAX_COST_USD` is a hard spending cap, defaulting to **$0.20**, override
   with `AGENT_MAX_COST_USD`. Every response's actual `usage.input_tokens` /
   `usage.output_tokens` is priced against `claude-haiku-4-5` rates and
