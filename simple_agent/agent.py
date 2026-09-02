@@ -11,9 +11,14 @@ MODEL = "claude-haiku-4-5"
 MAX_TOKENS = 16000
 
 SYSTEM_PROMPT = (
-    "You are a helpful assistant with access to tools. "
-    "Use them when they help answer the user's request; otherwise reply directly."
+    "You are a helpful personal assistant with access to tools: a calculator, "
+    "the current time, web search, and long-term memory. When the user shares "
+    "a fact or preference worth keeping for future conversations, call "
+    "'remember'. Use 'web_search' for current events or anything you're not "
+    "sure about. Otherwise reply directly."
 )
+
+DEFAULT_MEMORY_PATH = ".agent_memory.json"
 
 TOOLS = [
     {
@@ -38,6 +43,34 @@ TOOLS = [
             "required": ["expression"],
         },
     },
+    {
+        "name": "remember",
+        "description": "Save a fact or preference about the user to long-term memory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fact": {
+                    "type": "string",
+                    "description": "A concise fact to remember, e.g. 'Prefers metric units.'",
+                },
+            },
+            "required": ["fact"],
+        },
+    },
+    {
+        "name": "recall",
+        "description": "List everything currently stored in long-term memory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "type": "web_search_20260209",
+        "name": "web_search",
+        "max_uses": 5,
+        "allowed_callers": ["direct"],
+    },
 ]
 
 
@@ -55,33 +88,89 @@ def calculator(expression: str) -> str:
         return f"Error: {exc}"
 
 
-def execute_tool(name: str, tool_input: dict) -> str:
+def load_memory(memory_path: str) -> list:
+    if os.path.exists(memory_path):
+        with open(memory_path) as f:
+            return json.load(f)
+    return []
+
+
+def save_memory(memory_path: str, memory: list) -> None:
+    with open(memory_path, "w") as f:
+        json.dump(memory, f, indent=2)
+
+
+def remember(fact: str, memory_path: str) -> str:
+    memory = load_memory(memory_path)
+    memory.append(fact)
+    save_memory(memory_path, memory)
+    return f"Remembered: {fact}"
+
+
+def recall(memory_path: str) -> str:
+    memory = load_memory(memory_path)
+    if not memory:
+        return "No memories stored yet."
+    return "\n".join(f"- {fact}" for fact in memory)
+
+
+def execute_tool(name: str, tool_input: dict, memory_path: str) -> str:
     if name == "get_current_time":
         return get_current_time()
     if name == "calculator":
         return calculator(tool_input["expression"])
+    if name == "remember":
+        return remember(tool_input["fact"], memory_path)
+    if name == "recall":
+        return recall(memory_path)
     return f"Error: unknown tool '{name}'"
+
+
+MAX_PAUSE_RESUMES = 10
 
 
 class Agent:
     """A minimal conversational agent that can call tools in a loop."""
 
-    def __init__(self, client: anthropic.Anthropic | None = None):
+    def __init__(
+        self,
+        client: anthropic.Anthropic | None = None,
+        memory_path: str | None = None,
+    ):
         self.client = client or anthropic.Anthropic()
         self.messages: list[dict] = []
+        self.memory_path = memory_path or os.environ.get(
+            "AGENT_MEMORY_PATH", DEFAULT_MEMORY_PATH
+        )
+
+    def _system_prompt(self) -> str:
+        facts = load_memory(self.memory_path)
+        if not facts:
+            return SYSTEM_PROMPT
+        facts_block = "\n".join(f"- {fact}" for fact in facts)
+        return f"{SYSTEM_PROMPT}\n\nThings you remember about the user:\n{facts_block}"
 
     def send(self, user_input: str) -> str:
         self.messages.append({"role": "user", "content": user_input})
 
+        resumes = 0
         while True:
             response = self.client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
+                system=self._system_prompt(),
                 tools=TOOLS,
                 messages=self.messages,
             )
             self.messages.append({"role": "assistant", "content": response.content})
+
+            if response.stop_reason == "pause_turn":
+                # A server-side tool (e.g. web_search) hit its per-turn
+                # iteration limit; resend as-is to let Claude continue.
+                resumes += 1
+                if resumes > MAX_PAUSE_RESUMES:
+                    break
+                continue
 
             if response.stop_reason != "tool_use":
                 break
@@ -89,7 +178,7 @@ class Agent:
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    result = execute_tool(block.name, block.input)
+                    result = execute_tool(block.name, block.input, self.memory_path)
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -99,8 +188,8 @@ class Agent:
                     )
             self.messages.append({"role": "user", "content": tool_results})
 
-        return next(
-            (block.text for block in response.content if block.type == "text"), ""
+        return "".join(
+            block.text for block in response.content if block.type == "text"
         )
 
 
