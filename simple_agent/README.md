@@ -19,6 +19,22 @@ python agent.py
 
 Type messages at the `You:` prompt; type `exit` to quit.
 
+You can also run one message at a time (conversation state is persisted to
+a local JSON file between invocations, path configurable via
+`AGENT_STATE_PATH`):
+
+```bash
+python agent.py "What's 12 * 7?"
+```
+
+## Notebook version
+
+`agent.ipynb` has the same `Agent` class split across notebook cells, for
+running in JupyterLab, Jupyter Notebook, or Google Colab. Open it, run the
+cells top to bottom (the API key cell uses `getpass` so the key isn't saved
+into the notebook file), then re-run the "send a message" cell to keep
+chatting — `agent.messages` persists in the kernel's memory between runs.
+
 ## How it works
 
 - `agent.py` defines an `Agent` class that keeps conversation history and
