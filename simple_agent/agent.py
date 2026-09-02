@@ -8,7 +8,19 @@ import sys
 import anthropic
 
 MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 16000
+MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "1024"))
+
+# claude-haiku-4-5 pricing, $/1M tokens - update if you switch models.
+INPUT_COST_PER_MTOK = 1.00
+OUTPUT_COST_PER_MTOK = 5.00
+
+# Hard spending cap for a single Agent instance (i.e. one process run).
+MAX_COST_USD = float(os.environ.get("AGENT_MAX_COST_USD", "0.20"))
+
+
+class BudgetExceededError(RuntimeError):
+    pass
+
 
 SYSTEM_PROMPT = (
     "You are a helpful personal assistant with access to tools: a calculator, "
@@ -68,7 +80,7 @@ TOOLS = [
     {
         "type": "web_search_20260209",
         "name": "web_search",
-        "max_uses": 5,
+        "max_uses": 3,
         "allowed_callers": ["direct"],
     },
 ]
@@ -142,6 +154,7 @@ class Agent:
         self.memory_path = memory_path or os.environ.get(
             "AGENT_MEMORY_PATH", DEFAULT_MEMORY_PATH
         )
+        self.total_cost_usd = 0.0
 
     def _system_prompt(self) -> str:
         facts = load_memory(self.memory_path)
@@ -155,6 +168,13 @@ class Agent:
 
         resumes = 0
         while True:
+            if self.total_cost_usd >= MAX_COST_USD:
+                raise BudgetExceededError(
+                    f"Session cost ${self.total_cost_usd:.4f} has reached the "
+                    f"${MAX_COST_USD:.4f} cap (AGENT_MAX_COST_USD). Raise the "
+                    "cap or start a new session to continue."
+                )
+
             response = self.client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
@@ -162,6 +182,10 @@ class Agent:
                 tools=TOOLS,
                 messages=self.messages,
             )
+            self.total_cost_usd += (
+                response.usage.input_tokens * INPUT_COST_PER_MTOK
+                + response.usage.output_tokens * OUTPUT_COST_PER_MTOK
+            ) / 1_000_000
             self.messages.append({"role": "assistant", "content": response.content})
 
             if response.stop_reason == "pause_turn":
@@ -199,41 +223,58 @@ def _serialize_content(content):
     return content
 
 
-def load_history(state_path: str) -> list:
-    if os.path.exists(state_path):
-        with open(state_path) as f:
-            return json.load(f)
-    return []
+def load_state(state_path: str) -> dict:
+    if not os.path.exists(state_path):
+        return {"messages": [], "total_cost_usd": 0.0}
+    with open(state_path) as f:
+        data = json.load(f)
+    if isinstance(data, list):  # legacy format: a bare list of messages
+        return {"messages": data, "total_cost_usd": 0.0}
+    return data
 
 
-def save_history(state_path: str, messages: list) -> None:
-    serializable = [
+def save_state(state_path: str, messages: list, total_cost_usd: float) -> None:
+    serializable_messages = [
         {"role": m["role"], "content": _serialize_content(m["content"])}
         for m in messages
     ]
     with open(state_path, "w") as f:
-        json.dump(serializable, f)
+        json.dump(
+            {"messages": serializable_messages, "total_cost_usd": total_cost_usd}, f
+        )
 
 
-def run_single_turn(user_input: str, state_path: str) -> str:
-    """Send one message, persisting conversation history to state_path so
-    separate process invocations can continue the same conversation."""
+def run_single_turn(user_input: str, state_path: str) -> tuple[str, float]:
+    """Send one message, persisting conversation history and spend to
+    state_path so separate process invocations continue the same
+    conversation and the same spending cap."""
+    state = load_state(state_path)
     agent = Agent()
-    agent.messages = load_history(state_path)
-    reply = agent.send(user_input)
-    save_history(state_path, agent.messages)
-    return reply
+    agent.messages = state["messages"]
+    agent.total_cost_usd = state["total_cost_usd"]
+    try:
+        reply = agent.send(user_input)
+        return reply, agent.total_cost_usd
+    finally:
+        save_state(state_path, agent.messages, agent.total_cost_usd)
 
 
 def main():
     if len(sys.argv) > 1:
         state_path = os.environ.get("AGENT_STATE_PATH", ".agent_state.json")
         user_input = " ".join(sys.argv[1:])
-        print(f"Agent: {run_single_turn(user_input, state_path)}")
+        try:
+            reply, cost = run_single_turn(user_input, state_path)
+        except BudgetExceededError as exc:
+            print(f"Agent: [stopped] {exc}")
+            return
+        print(f"Agent: {reply}\n(this run cost ~${cost:.4f})")
         return
 
     agent = Agent()
-    print("Simple agent ready. Type 'exit' to quit.")
+    print(
+        f"Simple agent ready (cap ${MAX_COST_USD:.4f}/session). Type 'exit' to quit."
+    )
     while True:
         try:
             user_input = input("You: ")
@@ -241,8 +282,12 @@ def main():
             break
         if user_input.strip().lower() in {"exit", "quit"}:
             break
-        reply = agent.send(user_input)
-        print(f"Agent: {reply}")
+        try:
+            reply = agent.send(user_input)
+        except BudgetExceededError as exc:
+            print(f"Agent: [stopped] {exc}")
+            break
+        print(f"Agent: {reply}  (session cost so far: ~${agent.total_cost_usd:.4f})")
 
 
 if __name__ == "__main__":

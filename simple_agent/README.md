@@ -51,3 +51,27 @@ chatting — `agent.messages` persists in the kernel's memory between runs.
     runs, not just within one conversation.
 - Add new tools by appending a definition to `TOOLS` and a matching branch
   in `execute_tool`.
+
+## Cost controls
+
+- `max_tokens` (per response) defaults to **1024**, override with
+  `AGENT_MAX_TOKENS`. This caps how long a single reply can be, not total
+  spend across a conversation — a long back-and-forth still resends the
+  full history every turn.
+- `MAX_COST_USD` is a hard spending cap, defaulting to **$0.20**, override
+  with `AGENT_MAX_COST_USD`. Every response's actual `usage.input_tokens` /
+  `usage.output_tokens` is priced against `claude-haiku-4-5` rates and
+  accumulated; once the total hits the cap, further calls raise
+  `BudgetExceededError` instead of hitting the API again.
+  - In the interactive REPL and the notebook, the cap applies for the
+    life of that process/kernel.
+  - In single-message mode (`python agent.py "..."`), accumulated cost is
+    persisted in the state file alongside the conversation, so the cap
+    holds across separate invocations too.
+- `web_search`'s `max_uses` is capped at 3 per turn — each search adds
+  tokens (and the cited source text), so this bounds worst-case spend on
+  a single search-heavy question.
+- The printed `(session cost so far: ~$X)` after every reply is an
+  estimate from local pricing constants, not a billing-accurate figure —
+  check the [Anthropic Console](https://console.anthropic.com) for actual
+  usage.
