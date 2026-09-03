@@ -63,45 +63,33 @@ Current notebooks:
 2. Under APIs & Services → Credentials → **Create Credentials → OAuth
    client ID**, choose application type **Desktop app**, and download the
    resulting JSON.
-3. Upload that file into `simple_agent/notebooks/`, renamed to
-   `client_secret.json`. It's gitignored — never commit it.
-4. Authorize once to get `gmail_token.json` (also gitignored; later runs
-   reuse it and never touch the browser again). Two ways to do this:
+3. Download **[`get_token.py`](get_token.py)** from this repo onto your
+   own computer (**not** the Codespace) and put your `client_secret.json`
+   next to it.
+4. On that computer:
+   ```bash
+   pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+   python get_token.py
+   ```
+   This opens your real local browser — sign in and grant access. It
+   writes `gmail_token.json` next to the script.
 
-   - **Try it in the Codespace directly:** run the notebook's OAuth cell.
-     It prints an authorization URL — open it in your own browser (it
-     can't auto-open one inside a remote container), sign in, grant
-     access. The redirect lands on a local server the cell starts on an
-     OS-assigned free port; Codespaces usually auto-forwards it. This can
-     be flaky in practice — a `MismatchingStateError` usually means a
-     stale tab or a port-preview probe got there first (retry with a
-     fresh kernel + a brand-new tab); an `Address already in use` error
-     means something else already holds that port (rare now that the
-     port is OS-assigned rather than fixed at 8080, but restart the
-     kernel if it recurs).
-   - **More reliable: authorize on your own machine instead.** Real
-     `localhost`, no forwarding involved at all. On any machine with
-     Python:
-     ```bash
-     pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
-     ```
-     ```python
-     # get_token.py - run next to your client_secret.json
-     from google_auth_oauthlib.flow import InstalledAppFlow
-
-     SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-     flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
-     creds = flow.run_local_server(port=0)  # opens your real local browser
-
-     with open("gmail_token.json", "w") as f:
-         f.write(creds.to_json())
-     print("Saved gmail_token.json")
-     ```
-     Then upload the resulting `gmail_token.json` into
-     `simple_agent/notebooks/` in the Codespace (drag into the file
-     explorer, or right-click the folder → Upload). The notebook's OAuth
-     cell checks for this file first and will skip the browser flow
-     entirely once it exists.
+   **Why it has to be your own computer, not the Codespace browser flow:**
+   the redirect Google sends the browser to is hardcoded to literal
+   `http://localhost:PORT` (Google only allows `localhost`/`127.0.0.1`
+   redirects for this client type — it can't be rewritten to a forwarded
+   `https://...app.github.dev` URL). That only resolves correctly when
+   the browser and the listening server are the same machine. Unless
+   you're driving the Codespace through VS Code Desktop (which quietly
+   tunnels `localhost` to the container), a browser-based Codespace UI
+   has no such tunnel, and the redirect will fail with
+   `ERR_CONNECTION_REFUSED` — not a bug to keep retrying, just the wrong
+   environment for this particular step.
+5. Upload the resulting `gmail_token.json` into `simple_agent/notebooks/`
+   in the Codespace (drag into the file explorer, or right-click the
+   folder → Upload). It's gitignored — never commit it. The notebook's
+   OAuth cell checks for this file first and will skip the browser flow
+   entirely once it exists, so this is a one-time step.
 
 Scope used is `https://www.googleapis.com/auth/gmail.send` only — the
 integration can send mail as you, but can't read your inbox.
