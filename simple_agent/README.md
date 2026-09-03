@@ -52,6 +52,24 @@ Current notebooks:
 | `02_memory.ipynb` | `remember` / `recall`, file-backed, persists across kernel restarts | None |
 | `03_web_search_tavily.ipynb` | Web search via [Tavily](https://tavily.com)'s API instead of Anthropic's built-in `web_search` | Free Tavily API key |
 | `04_weather.ipynb` | Current weather via [Open-Meteo](https://open-meteo.com) (geocode city → fetch conditions) | None — fully keyless |
+| `05_weather_email.ipynb` | `get_weather` + `send_email` — a tool with a real side effect (actually sends mail via Gmail SMTP) | Gmail address + App Password |
+
+**`05_weather_email.ipynb` — the first "reactive" tool:** every notebook up
+to this point only ever answers in chat. `send_email` actually does
+something in the world. Two things worth knowing:
+
+- **Setup uses an App Password, not OAuth or your real Gmail password.**
+  Enable 2-Step Verification on your Google account, then generate one at
+  [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords).
+  Much less setup than the full Gmail API OAuth flow, at the cost of only
+  working for your own Gmail account (not "send on behalf of any user"
+  the way a real OAuth integration would).
+- **The system prompt explicitly says "only send email when asked."** A
+  tool with a side effect firing on the model's own initiative (e.g.
+  deciding unprompted that a search result was "worth emailing") is a
+  real risk once tools can act, not just answer — worth keeping in mind
+  as you add more tools with side effects (file writes, calendar events,
+  purchases, etc.).
 
 **Why Tavily instead of Anthropic's built-in `web_search`:** the built-in
 tool is zero-setup (same API key, no extra account) but its results carry
