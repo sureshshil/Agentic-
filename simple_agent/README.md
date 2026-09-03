@@ -65,15 +65,43 @@ Current notebooks:
    resulting JSON.
 3. Upload that file into `simple_agent/notebooks/`, renamed to
    `client_secret.json`. It's gitignored — never commit it.
-4. Run the notebook's OAuth cell. It prints an authorization URL — open
-   it in your own browser (it can't auto-open one inside a remote
-   container), sign in, and grant access. The redirect lands on a local
-   server the cell starts on port 8080; in a Codespace this is usually
-   auto-forwarded, but if the browser can't complete the redirect, check
-   the **Ports** tab and make sure 8080 is forwarded.
-5. On success, `gmail_token.json` (also gitignored) is saved so you won't
-   need to repeat the browser step on later runs, until the token expires
-   or is revoked.
+4. Authorize once to get `gmail_token.json` (also gitignored; later runs
+   reuse it and never touch the browser again). Two ways to do this:
+
+   - **Try it in the Codespace directly:** run the notebook's OAuth cell.
+     It prints an authorization URL — open it in your own browser (it
+     can't auto-open one inside a remote container), sign in, grant
+     access. The redirect lands on a local server the cell starts on an
+     OS-assigned free port; Codespaces usually auto-forwards it. This can
+     be flaky in practice — a `MismatchingStateError` usually means a
+     stale tab or a port-preview probe got there first (retry with a
+     fresh kernel + a brand-new tab); an `Address already in use` error
+     means something else already holds that port (rare now that the
+     port is OS-assigned rather than fixed at 8080, but restart the
+     kernel if it recurs).
+   - **More reliable: authorize on your own machine instead.** Real
+     `localhost`, no forwarding involved at all. On any machine with
+     Python:
+     ```bash
+     pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+     ```
+     ```python
+     # get_token.py - run next to your client_secret.json
+     from google_auth_oauthlib.flow import InstalledAppFlow
+
+     SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+     flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
+     creds = flow.run_local_server(port=0)  # opens your real local browser
+
+     with open("gmail_token.json", "w") as f:
+         f.write(creds.to_json())
+     print("Saved gmail_token.json")
+     ```
+     Then upload the resulting `gmail_token.json` into
+     `simple_agent/notebooks/` in the Codespace (drag into the file
+     explorer, or right-click the folder → Upload). The notebook's OAuth
+     cell checks for this file first and will skip the browser flow
+     entirely once it exists.
 
 Scope used is `https://www.googleapis.com/auth/gmail.send` only — the
 integration can send mail as you, but can't read your inbox.
