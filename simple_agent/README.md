@@ -55,6 +55,13 @@ Current notebooks:
 | `05_weather_email.ipynb` | `get_weather` + `send_email` — a tool with a real side effect (actually sends mail via Gmail SMTP) | Gmail address + App Password |
 | `06_gmail_oauth.ipynb` | Same `get_weather` + `send_email` combo, but via the real Gmail API with OAuth (`gmail.send` scope only) instead of SMTP | Google Cloud project + OAuth client (see below) |
 | `07_weather_notification.ipynb` | `get_weather` + `send_notification` — pushes to your phone via [ntfy.sh](https://ntfy.sh) instead of email/SMS | Free ntfy app + a topic name, no signup |
+| `08_weather_telegram.ipynb` | `get_weather` + `send_telegram_message` via the official [Telegram Bot API](https://core.telegram.org/bots/api) | Free bot via @BotFather, no signup beyond that |
+
+**`08_weather_telegram.ipynb`** — another free, reliable, no-cost-per-message
+channel, via a bot you create in ~30 seconds through Telegram's own
+@BotFather. The notebook auto-discovers your `chat_id` by reading back
+the first message you send the bot (Telegram bots can't message you
+first — you have to message them once so they know who you are).
 
 **Why push notification instead of SMS:** real SMS APIs (Twilio) charge
 per message and per phone number, and pricing varies a lot by country —
