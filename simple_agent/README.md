@@ -54,6 +54,19 @@ Current notebooks:
 | `04_weather.ipynb` | Current weather via [Open-Meteo](https://open-meteo.com) (geocode city → fetch conditions) | None — fully keyless |
 | `05_weather_email.ipynb` | `get_weather` + `send_email` — a tool with a real side effect (actually sends mail via Gmail SMTP) | Gmail address + App Password |
 | `06_gmail_oauth.ipynb` | Same `get_weather` + `send_email` combo, but via the real Gmail API with OAuth (`gmail.send` scope only) instead of SMTP | Google Cloud project + OAuth client (see below) |
+| `07_weather_notification.ipynb` | `get_weather` + `send_notification` — pushes to your phone via [ntfy.sh](https://ntfy.sh) instead of email/SMS | Free ntfy app + a topic name, no signup |
+
+**Why push notification instead of SMS:** real SMS APIs (Twilio) charge
+per message and per phone number, and pricing varies a lot by country —
+e.g. Japan is ~$0.089/message plus an international number rental, over
+10x the US rate. Free carrier email-to-SMS gateways are a well-known US
+convention (`number@txt.att.net`, etc.) but Japan and many other
+countries don't have an equivalent reliable enough to build on. ntfy.sh
+sidesteps this: it's free, doesn't care what country you're in, needs no
+phone number, and delivers straight to a phone app via one plain HTTP
+POST. Setup: install the ntfy app, subscribe to a topic name you pick
+(treat it like a password — anyone who knows it can publish to or read
+it, since there's no login at all).
 
 **`06_gmail_oauth.ipynb` — proper OAuth setup:**
 
