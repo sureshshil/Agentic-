@@ -51,6 +51,7 @@ Current notebooks:
 | `01_basics.ipynb` | Calculator + current time — the smallest possible loop | None |
 | `02_memory.ipynb` | `remember` / `recall`, file-backed, persists across kernel restarts | None |
 | `03_web_search_tavily.ipynb` | Web search via [Tavily](https://tavily.com)'s API instead of Anthropic's built-in `web_search` | Free Tavily API key |
+| `04_weather.ipynb` | Current weather via [Open-Meteo](https://open-meteo.com) (geocode city → fetch conditions) | None — fully keyless |
 
 **Why Tavily instead of Anthropic's built-in `web_search`:** the built-in
 tool is zero-setup (same API key, no extra account) but its results carry
