@@ -53,6 +53,36 @@ Current notebooks:
 | `03_web_search_tavily.ipynb` | Web search via [Tavily](https://tavily.com)'s API instead of Anthropic's built-in `web_search` | Free Tavily API key |
 | `04_weather.ipynb` | Current weather via [Open-Meteo](https://open-meteo.com) (geocode city → fetch conditions) | None — fully keyless |
 | `05_weather_email.ipynb` | `get_weather` + `send_email` — a tool with a real side effect (actually sends mail via Gmail SMTP) | Gmail address + App Password |
+| `06_gmail_oauth.ipynb` | Same `get_weather` + `send_email` combo, but via the real Gmail API with OAuth (`gmail.send` scope only) instead of SMTP | Google Cloud project + OAuth client (see below) |
+
+**`06_gmail_oauth.ipynb` — proper OAuth setup:**
+
+1. In [Google Cloud Console](https://console.cloud.google.com), create a
+   project (or use an existing one) and enable the **Gmail API**
+   (APIs & Services → Library → search "Gmail API" → Enable).
+2. Under APIs & Services → Credentials → **Create Credentials → OAuth
+   client ID**, choose application type **Desktop app**, and download the
+   resulting JSON.
+3. Upload that file into `simple_agent/notebooks/`, renamed to
+   `client_secret.json`. It's gitignored — never commit it.
+4. Run the notebook's OAuth cell. It prints an authorization URL — open
+   it in your own browser (it can't auto-open one inside a remote
+   container), sign in, and grant access. The redirect lands on a local
+   server the cell starts on port 8080; in a Codespace this is usually
+   auto-forwarded, but if the browser can't complete the redirect, check
+   the **Ports** tab and make sure 8080 is forwarded.
+5. On success, `gmail_token.json` (also gitignored) is saved so you won't
+   need to repeat the browser step on later runs, until the token expires
+   or is revoked.
+
+Scope used is `https://www.googleapis.com/auth/gmail.send` only — the
+integration can send mail as you, but can't read your inbox.
+
+**05 vs. 06 — which to use:** 05 (App Password/SMTP) is far less setup
+and fine for personal scripts. 06 (OAuth) is the direction a real
+production integration would take — narrower scope, revocable access,
+and the pattern you'd extend toward "send on behalf of other users."
+Both are kept as separate notebooks so you can compare them directly.
 
 **`05_weather_email.ipynb` — the first "reactive" tool:** every notebook up
 to this point only ever answers in chat. `send_email` actually does

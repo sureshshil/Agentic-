@@ -6,3 +6,5 @@ venv/
 .agent_state.json
 .agent_memory.json
 .memory_notebook.json
+client_secret.json
+gmail_token.json
