@@ -5,3 +5,4 @@ venv/
 .env
 .agent_state.json
 .agent_memory.json
+.memory_notebook.json
