@@ -141,6 +141,20 @@ def execute_tool(name: str, tool_input: dict, memory_path: str) -> str:
 MAX_PAUSE_RESUMES = 10
 
 
+def build_client() -> anthropic.Anthropic:
+    """Some API keys (personal keys not scoped to one workspace) require an
+    anthropic-workspace-id header on every request - see
+    https://platform.claude.com/docs/en/manage-claude/authentication#select-a-workspace.
+    Set ANTHROPIC_WORKSPACE_ID if you hit: 'anthropic-workspace-id is
+    required when authenticating with an identity-linked API key'."""
+    workspace_id = os.environ.get("ANTHROPIC_WORKSPACE_ID")
+    if workspace_id:
+        return anthropic.Anthropic(
+            default_headers={"anthropic-workspace-id": workspace_id}
+        )
+    return anthropic.Anthropic()
+
+
 class Agent:
     """A minimal conversational agent that can call tools in a loop."""
 
@@ -149,7 +163,7 @@ class Agent:
         client: anthropic.Anthropic | None = None,
         memory_path: str | None = None,
     ):
-        self.client = client or anthropic.Anthropic()
+        self.client = client or build_client()
         self.messages: list[dict] = []
         self.memory_path = memory_path or os.environ.get(
             "AGENT_MEMORY_PATH", DEFAULT_MEMORY_PATH

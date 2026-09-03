@@ -67,3 +67,29 @@ on your existing Anthropic key.
 Copy the "install → keys → tools/Agent class → create agent → try it →
 optional chat loop" structure from an existing notebook, swap in just the
 new tool(s), and keep the cost-cap + turn-collapsing core intact.
+
+### Troubleshooting: `anthropic-workspace-id is required...`
+
+If you see:
+
+```
+BadRequestError: ... 'anthropic-workspace-id is required when authenticating
+with an identity-linked API key; send the id of the workspace this request
+acts in.'
+```
+
+Your API key is a personal/service-account key that isn't scoped to a
+single workspace, so every request needs to say which workspace it acts
+in. Two ways to fix it:
+
+1. **Simplest — rescope the key.** In the [Claude Console](https://platform.claude.com/settings/keys),
+   create (or edit) the key with a specific workspace selected. No code
+   changes needed after that.
+2. **Or set the workspace ID yourself.** Find it under
+   [Settings → Workspaces](https://platform.claude.com/settings/workspaces)
+   (the ID column), then either set `ANTHROPIC_WORKSPACE_ID` as an
+   environment variable (or Codespaces secret) before running, or just
+   type it in when a notebook's key-setup cell prompts for it (leave
+   blank if you don't need it). `agent.py` and every notebook's
+   `build_client()` picks it up automatically and attaches it as the
+   `anthropic-workspace-id` header.
