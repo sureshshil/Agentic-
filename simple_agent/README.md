@@ -198,45 +198,48 @@ continue.
 
 **Hosting — this needs to stay running, unlike everything else in this
 repo.** GitHub Actions (used for `scheduled/` below) only runs on a
-schedule/trigger and can't host a persistent process. Options, cheapest
-first:
-- Keep a terminal open (a Codespace, your own machine) — free, but stops
-  the moment you close it.
-- A free-tier background worker on something like Railway, Fly.io, or
-  Render — a few minutes of setup, stays up continuously for no cost at
-  low usage.
-- Any always-on machine you already have (a Raspberry Pi, a home server).
+schedule/trigger and can't host a persistent process. Quickest way to try
+it: keep a terminal open (a Codespace, your own machine) — free, but stops
+the moment you close it. For something that stays up permanently, see
+"Hosting on a cheap VPS" below.
 
-### Hosting on Oracle Cloud's Always Free tier
+### Hosting on a cheap VPS
 
 Unlike everything else in this repo, `telegram_bot.py` needs to run
-continuously somewhere. Oracle Cloud's **Always Free** tier is a genuinely
-permanent free tier (not a trial that later bills you) and this bot barely
-uses any CPU or RAM — polling Telegram every ~30 seconds — so even their
-smallest free instance is overkill. No inbound ports need to be opened at
-all: the bot only makes outbound requests (long-polling Telegram, calling
-Anthropic/Tavily/Gmail), so you can leave the default security list as-is.
+continuously somewhere. **Oracle Cloud's Always Free tier turned out too
+flaky in practice** (their free-tier capacity, especially the ARM shapes,
+is notoriously oversubscribed and can be reclaimed/throttled without
+warning) - not worth fighting for something meant to run every day. A
+small paid VPS costs a few dollars a month and just works:
+
+| Provider | Cost | Notes |
+|---|---|---|
+| [Hetzner Cloud](https://www.hetzner.com/cloud/) | ~€4/mo (~$4.50) | Cheapest reliable option, EU data centers |
+| [DigitalOcean](https://www.digitalocean.com/) | ~$4-6/mo | Polished dashboard/docs, US + EU regions |
+| [Vultr](https://www.vultr.com/) | ~$5/mo | Similar to DigitalOcean |
+
+Any of these work identically from here on - pick whichever's signup is
+easiest for you. This bot barely uses any CPU or RAM (polling Telegram
+every ~30 seconds), so their smallest/cheapest instance size is plenty.
+No inbound ports need to be opened either: the bot only makes outbound
+requests (long-polling Telegram, calling Anthropic/Tavily/Gmail), so you
+can leave the default firewall as-is.
 
 **1. Create the account and VM:**
-1. Sign up at [cloud.oracle.com](https://www.oracle.com/cloud/free/) (a
-   card is required for identity verification but the Always Free
-   resources never charge it).
-2. In the console: **Compute → Instances → Create Instance**.
-3. Under **Image and shape**, pick an **Always Free eligible** shape (an
-   `Ampere A1` ARM shape or a `VM.Standard.E2.1.Micro`) — the console
-   labels these explicitly.
-4. Under **Add SSH keys**, either generate a new key pair (download the
-   private key) or paste your own public key.
-5. Leave networking as the default VCN/subnet and click **Create**. Note
-   the instance's public IP once it's running.
+1. Sign up with your chosen provider and add a payment method.
+2. Create a new VM/droplet/instance: smallest size, **Ubuntu 22.04 or
+   24.04** as the image, and either upload your own SSH public key or
+   download the generated private key during creation.
+3. Note the instance's public IP once it's running.
 
 **2. SSH in and set up the project:**
 ```bash
-ssh -i /path/to/your/private_key ubuntu@<instance-public-ip>
-# (username is "ubuntu" for Canonical Ubuntu images, "opc" for Oracle Linux)
+ssh -i /path/to/your/private_key root@<instance-public-ip>
+# (Hetzner/DigitalOcean/Vultr's Ubuntu images log you in as "root" by
+# default - adjust the deploy/telegram-bot.service User= field below if
+# you create a separate non-root user instead)
 
-sudo apt update && sudo apt install -y python3-venv git   # Ubuntu
-# sudo dnf install -y python3 git                          # Oracle Linux
+apt update && apt install -y python3-venv git
 
 git clone https://github.com/sureshshil/Agentic-.git
 cd Agentic-
@@ -255,15 +258,16 @@ nano telegram_bot.env   # fill in your real values
 ```
 
 **4. Install it as a systemd service**, so it survives you logging out and
-restarts automatically on crash or VM reboot:
+restarts automatically on crash or VM reboot. `deploy/telegram-bot.service`
+defaults to a `root` user at `/root/Agentic-` (the common default on these
+providers) - if your setup differs, edit `User=`, `WorkingDirectory=`,
+`EnvironmentFile=`, and `ExecStart=` first to match:
 ```bash
-sudo cp deploy/telegram-bot.service /etc/systemd/system/telegram-bot.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now telegram-bot
+nano deploy/telegram-bot.service   # fix the paths/User= for your setup
+cp deploy/telegram-bot.service /etc/systemd/system/telegram-bot.service
+systemctl daemon-reload
+systemctl enable --now telegram-bot
 ```
-If your clone isn't at `/home/ubuntu/Agentic-`, edit the paths in
-`/etc/systemd/system/telegram-bot.service` first (`WorkingDirectory`,
-`EnvironmentFile`, `ExecStart`).
 
 **5. Check it's running and message your bot:**
 ```bash
