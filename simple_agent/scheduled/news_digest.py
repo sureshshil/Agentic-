@@ -74,8 +74,12 @@ def summarize(search_data: dict) -> str:
         max_tokens=500,
         system=(
             "Summarize the following news search results into a short, "
-            "readable digest (5-8 bullet points max), suitable for a push "
-            "notification. Be concise and skip filler."
+            "readable digest (5-8 points max), suitable for a push "
+            "notification. Be concise and skip filler.\n\n"
+            "Plain text only - this is rendered as-is on a phone lock "
+            "screen with no markdown support. Do not use **bold**, "
+            "# headings, _italics_, or markdown bullet syntax. Start each "
+            "point with a plain dash (-) and a line break between points."
         ),
         messages=[{"role": "user", "content": raw_news}],
     )
