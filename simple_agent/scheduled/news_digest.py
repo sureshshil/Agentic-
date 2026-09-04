@@ -108,6 +108,7 @@ def main() -> None:
             "Settings -> Secrets and variables -> Actions -> New repository secret."
         )
 
+    print(f"Query: {NEWS_QUERY!r}")
     search_data = search_news(NEWS_QUERY)
     digest = summarize(search_data)
     print(digest)
