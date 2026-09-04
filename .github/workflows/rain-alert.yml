@@ -18,3 +18,4 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           ALERT_LOCATION: ${{ vars.ALERT_LOCATION }}
+          RAIN_THRESHOLD_MM: ${{ vars.RAIN_THRESHOLD_MM }}
