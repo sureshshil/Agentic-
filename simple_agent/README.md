@@ -207,6 +207,72 @@ first:
   low usage.
 - Any always-on machine you already have (a Raspberry Pi, a home server).
 
+### Hosting on Oracle Cloud's Always Free tier
+
+Unlike everything else in this repo, `telegram_bot.py` needs to run
+continuously somewhere. Oracle Cloud's **Always Free** tier is a genuinely
+permanent free tier (not a trial that later bills you) and this bot barely
+uses any CPU or RAM — polling Telegram every ~30 seconds — so even their
+smallest free instance is overkill. No inbound ports need to be opened at
+all: the bot only makes outbound requests (long-polling Telegram, calling
+Anthropic/Tavily/Gmail), so you can leave the default security list as-is.
+
+**1. Create the account and VM:**
+1. Sign up at [cloud.oracle.com](https://www.oracle.com/cloud/free/) (a
+   card is required for identity verification but the Always Free
+   resources never charge it).
+2. In the console: **Compute → Instances → Create Instance**.
+3. Under **Image and shape**, pick an **Always Free eligible** shape (an
+   `Ampere A1` ARM shape or a `VM.Standard.E2.1.Micro`) — the console
+   labels these explicitly.
+4. Under **Add SSH keys**, either generate a new key pair (download the
+   private key) or paste your own public key.
+5. Leave networking as the default VCN/subnet and click **Create**. Note
+   the instance's public IP once it's running.
+
+**2. SSH in and set up the project:**
+```bash
+ssh -i /path/to/your/private_key ubuntu@<instance-public-ip>
+# (username is "ubuntu" for Canonical Ubuntu images, "opc" for Oracle Linux)
+
+sudo apt update && sudo apt install -y python3-venv git   # Ubuntu
+# sudo dnf install -y python3 git                          # Oracle Linux
+
+git clone https://github.com/sureshshil/Agentic-.git
+cd Agentic-
+git checkout claude/simple-agent-creation-qys564
+cd simple_agent
+
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+**3. Add your secrets** (never committed - `telegram_bot.env` is
+gitignored):
+```bash
+cp deploy/telegram_bot.env.example telegram_bot.env
+nano telegram_bot.env   # fill in your real values
+```
+
+**4. Install it as a systemd service**, so it survives you logging out and
+restarts automatically on crash or VM reboot:
+```bash
+sudo cp deploy/telegram-bot.service /etc/systemd/system/telegram-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-bot
+```
+If your clone isn't at `/home/ubuntu/Agentic-`, edit the paths in
+`/etc/systemd/system/telegram-bot.service` first (`WorkingDirectory`,
+`EnvironmentFile`, `ExecStart`).
+
+**5. Check it's running and message your bot:**
+```bash
+sudo systemctl status telegram-bot     # should show "active (running)"
+sudo journalctl -u telegram-bot -f     # live logs - watch for "You: ..." / "Agent: ..."
+```
+
+**Updating later:** `git pull`, then `sudo systemctl restart telegram-bot`.
+
 ## `scheduled/` + GitHub Actions — automatic, unattended notifications
 
 Everything above only runs when you open a notebook and execute cells.

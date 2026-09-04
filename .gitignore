@@ -10,3 +10,4 @@ client_secret.json
 gmail_token.json
 .telegram_bot_state.json
 .telegram_bot_memory.json
+telegram_bot.env

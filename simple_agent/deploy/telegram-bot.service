@@ -1,0 +1,28 @@
+# systemd unit for telegram_bot.py - keeps the bot running continuously,
+# restarts it if it crashes, and starts it automatically on VM reboot.
+#
+# Install (see simple_agent/README.md's Oracle Cloud section for the full
+# walkthrough):
+#   sudo cp deploy/telegram-bot.service /etc/systemd/system/telegram-bot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now telegram-bot
+#
+# Adjust User/WorkingDirectory/ExecStart/EnvironmentFile below if you clone
+# the repo somewhere other than /home/ubuntu/Agentic-.
+
+[Unit]
+Description=Telegram bot for the simple_agent project
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Agentic-/simple_agent
+EnvironmentFile=/home/ubuntu/Agentic-/simple_agent/telegram_bot.env
+ExecStart=/home/ubuntu/Agentic-/simple_agent/.venv/bin/python telegram_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
