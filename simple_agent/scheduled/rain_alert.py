@@ -15,8 +15,8 @@ import os
 
 import requests
 
-LOCATION = os.environ.get("ALERT_LOCATION", "Tokyo, Japan")
-RAIN_THRESHOLD_MM = float(os.environ.get("RAIN_THRESHOLD_MM", "7.5"))
+LOCATION = os.environ.get("ALERT_LOCATION") or "Tokyo, Japan"
+RAIN_THRESHOLD_MM = float(os.environ.get("RAIN_THRESHOLD_MM") or "7.5")
 
 # WMO weather codes that count as "heavy" regardless of the precipitation
 # reading (e.g. any thunderstorm, even a brief one, is worth flagging).
@@ -91,6 +91,12 @@ def send_notification(title: str, message: str) -> None:
 
 
 def main() -> None:
+    if not os.environ.get("NTFY_TOPIC"):
+        raise SystemExit(
+            "NTFY_TOPIC is not set. Add it as a repository secret: "
+            "Settings -> Secrets and variables -> Actions -> New repository secret."
+        )
+
     place = geocode(LOCATION)
     current = get_current_conditions(place["latitude"], place["longitude"])
     condition = WMO_CODES.get(current.get("weather_code"), "Unknown conditions")

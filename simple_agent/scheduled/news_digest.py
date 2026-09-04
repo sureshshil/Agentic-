@@ -19,7 +19,7 @@ import anthropic
 import requests
 
 MODEL = "claude-haiku-4-5"
-NEWS_QUERY = os.environ.get("NEWS_QUERY", "top world news today")
+NEWS_QUERY = os.environ.get("NEWS_QUERY") or "top world news today"
 TAVILY_MAX_RESULTS = 5
 
 
@@ -93,6 +93,17 @@ def send_notification(title: str, message: str) -> None:
 
 
 def main() -> None:
+    missing = [
+        name
+        for name in ("ANTHROPIC_API_KEY", "TAVILY_API_KEY", "NTFY_TOPIC")
+        if not os.environ.get(name)
+    ]
+    if missing:
+        raise SystemExit(
+            f"Missing required secret(s): {', '.join(missing)}. Add them: "
+            "Settings -> Secrets and variables -> Actions -> New repository secret."
+        )
+
     search_data = search_news(NEWS_QUERY)
     digest = summarize(search_data)
     print(digest)
