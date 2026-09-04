@@ -20,4 +20,4 @@ jobs:
           ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          NEWS_QUERY: ${{ vars.NEWS_QUERY }}
+          NEWS_QUERY: ${{ vars.NEWS_QUERY || secrets.NEWS_QUERY }}

@@ -17,5 +17,5 @@ jobs:
       - run: python simple_agent/scheduled/rain_alert.py
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          ALERT_LOCATION: ${{ vars.ALERT_LOCATION }}
-          RAIN_THRESHOLD_MM: ${{ vars.RAIN_THRESHOLD_MM }}
+          ALERT_LOCATION: ${{ vars.ALERT_LOCATION || secrets.ALERT_LOCATION }}
+          RAIN_THRESHOLD_MM: ${{ vars.RAIN_THRESHOLD_MM || secrets.RAIN_THRESHOLD_MM }}
