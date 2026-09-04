@@ -146,6 +146,67 @@ chars/snippet), and a short synthesized `answer` field instead of raw
 pages. Trade-off: it needs its own API key and account instead of riding
 on your existing Anthropic key.
 
+## `telegram_bot.py` — a real, two-way personal assistant
+
+Every notebook above (and the `scheduled/` scripts below) either only
+answers when you run a cell, or only ever pushes *to* you on a timer. This
+is different: it's a long-running process that **listens** for your
+Telegram messages and replies through the same tool-use loop — a real chat
+interface you can use from your phone, no notebook or terminal open. It
+combines memory, weather, web search, and email into one assistant instead
+of one tool per notebook.
+
+**How it works:** Telegram's `getUpdates` endpoint supports long-polling —
+the bot asks "any new messages?" and Telegram holds the connection open for
+up to 30 seconds before replying, so there's no need for a public URL or
+webhook. The loop just asks again immediately after each response.
+
+**Setup:**
+1. You already have a bot token and `chat_id` if you did notebook 08's
+   setup — reuse them. Otherwise: message **@BotFather** → `/newbot`, then
+   send your new bot any message so it knows who you are.
+2. Set env vars (locally, in a Codespace, or on whatever host you pick
+   below):
+   ```bash
+   export ANTHROPIC_API_KEY=...
+   export TELEGRAM_BOT_TOKEN=...
+   export TELEGRAM_ALLOWED_CHAT_ID=...   # your chat_id - see below
+   # optional:
+   export TAVILY_API_KEY=...             # enables web_search
+   export EMAIL_ADDRESS=you@gmail.com    # enables send_email
+   export EMAIL_APP_PASSWORD=...
+   ```
+   Find your `chat_id` by messaging the bot once, then visiting
+   `https://api.telegram.org/bot<token>/getUpdates` in a browser (or reuse
+   notebook 08's `discover_chat_id()` cell).
+3. Run it: `python simple_agent/telegram_bot.py`. Message your bot from
+   Telegram — it replies through the real agent loop.
+
+**Security: `TELEGRAM_ALLOWED_CHAT_ID` is not optional.** Telegram bots are
+discoverable by username — anyone could find yours and message it. Every
+incoming message is checked against this one chat_id; anything else is
+silently ignored, printed to the log, and never reaches the model or your
+tools (several of which have real side effects, like sending email as you).
+
+**Cost cap works differently here than in the notebooks.** The notebooks
+reset their `MAX_COST_USD` cap every kernel session; this process doesn't
+restart on its own, so `AGENT_MAX_COST_USD` (default `1.00`) is a running
+total for as long as it stays up. Once hit, the bot keeps listening but
+replies with a "[stopped]" message instead of calling the model — delete
+`BOT_STATE_PATH` (default `.telegram_bot_state.json`) or raise the cap to
+continue.
+
+**Hosting — this needs to stay running, unlike everything else in this
+repo.** GitHub Actions (used for `scheduled/` below) only runs on a
+schedule/trigger and can't host a persistent process. Options, cheapest
+first:
+- Keep a terminal open (a Codespace, your own machine) — free, but stops
+  the moment you close it.
+- A free-tier background worker on something like Railway, Fly.io, or
+  Render — a few minutes of setup, stays up continuously for no cost at
+  low usage.
+- Any always-on machine you already have (a Raspberry Pi, a home server).
+
 ## `scheduled/` + GitHub Actions — automatic, unattended notifications
 
 Everything above only runs when you open a notebook and execute cells.
