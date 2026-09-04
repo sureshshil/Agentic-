@@ -146,6 +146,65 @@ chars/snippet), and a short synthesized `answer` field instead of raw
 pages. Trade-off: it needs its own API key and account instead of riding
 on your existing Anthropic key.
 
+## `scheduled/` + GitHub Actions — automatic, unattended notifications
+
+Everything above only runs when you open a notebook and execute cells.
+For something to fire on its own — a rain alert every 30 minutes, a
+daily news digest — whether or not the Codespace is even open, the code
+needs to run somewhere that isn't your notebook session. **GitHub
+Actions** does this: the workflow files under `.github/workflows/` tell
+GitHub to run a script in the cloud on a cron schedule, for free (public
+repos get unlimited free minutes; private repos get a generous free
+tier).
+
+| Script | Runs | Uses Claude? | Approx. cost/run |
+|---|---|---|---|
+| `scheduled/rain_alert.py` | Every 30 min (`*/30 * * * *`) | No | $0 — plain Open-Meteo + ntfy.sh, no LLM call at all |
+| `scheduled/news_digest.py` | Daily, 23:00 UTC = 08:00 JST (`0 23 * * *`) | Yes, once per run | ~$0.001–0.003 (one fixed Tavily search + one Claude summarization call, not an open-ended agent loop) |
+
+**Why `rain_alert.py` skips Claude entirely:** "is it raining heavily"
+is a deterministic check (a WMO weather code or precipitation reading
+crossing a threshold), not something that needs judgment. Reaching for
+an LLM here would just add cost and a point of failure for zero benefit
+— plain Python is the correct tool. It only sends a notification when
+conditions actually cross the "heavy" threshold (`RAIN_THRESHOLD_MM`,
+default 7.5mm/hour, or specific storm/thunderstorm codes) — checking
+every 30 minutes doesn't mean 48 notifications a day, only sporadic ones
+when something is actually happening. Note: as written, it re-alerts on
+every run while heavy conditions persist (no dedup/cooldown) - fine for
+"tell me it's still storming," easy to add a cooldown later if it gets
+noisy.
+
+**Why `news_digest.py` does use Claude:** summarizing search results
+into a readable digest is exactly what an LLM is good at, unlike the
+rain check. It's still just one fixed request per run (not a tool-use
+loop), so cost stays small and predictable without needing the
+notebooks' `BudgetExceededError` machinery.
+
+### Setup
+
+1. In your GitHub repo: **Settings → Secrets and variables → Actions**.
+2. Under **Secrets**, add (only what each workflow needs):
+   - `NTFY_TOPIC` — same topic from notebook 07 (both scripts use it)
+   - `ANTHROPIC_API_KEY`, and `ANTHROPIC_WORKSPACE_ID` if you needed one
+     (news digest only)
+   - `TAVILY_API_KEY` (news digest only)
+3. Under **Variables** (not secret, but optional overrides):
+   - `ALERT_LOCATION` (default `Tokyo, Japan` if unset)
+   - `NEWS_QUERY` (default `top world news today` if unset)
+4. Commit and push — the workflows activate automatically once they're on
+   the repo's default branch. (Scheduled workflows only run from the
+   default branch, not from feature branches like this one — merge before
+   expecting the cron to fire.)
+5. **Test without waiting for the schedule:** go to the **Actions** tab →
+   select "Rain Alert" or "News Digest" → **Run workflow**. This uses the
+   same `workflow_dispatch` trigger both files include specifically for
+   manual testing.
+
+All cron times are UTC — adjust the `cron:` line in the `.yml` files for
+your own schedule preference; GitHub's schedule syntax is standard 5-field
+cron.
+
 ### Adding a new feature notebook
 
 Copy the "install → keys → tools/Agent class → create agent → try it →
