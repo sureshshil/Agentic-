@@ -199,9 +199,12 @@ continue.
 **Managing conversation history — sessions.** Conversation state is split
 across two kinds of file. `BOT_STATE_PATH` (default
 `.telegram_bot_state.json`) is just an *index*: which session is
-currently active, plus the two things shared across all of them
-(`total_cost_usd`, the Telegram `update_offset`). The actual messages for
-each session live in their own file under `BOT_SESSIONS_DIR` (default
+currently active, plus the two things shared across every session —
+`total_cost_usd` (**lifetime** spend, across all sessions ever — this is
+what `AGENT_MAX_COST_USD` caps) and the Telegram `update_offset`. The
+actual messages for each session, plus that session's own
+`session_cost_usd` (what's been spent just in it — informational, no cap
+of its own), live in their own file under `BOT_SESSIONS_DIR` (default
 `.telegram_bot_sessions/`), named by session id.
 
 This matters because nothing trims a session's history automatically —
@@ -212,16 +215,20 @@ eventually its history can exceed the model's context window, after
 which every message in *that* session fails the same way.
 
 Send `/reset` or `/new` from Telegram at any time to start a fresh
-session — a new, empty session file, with the old one left exactly as it
-was (nothing is deleted, so you can look back at past conversations by
-reading the file under `BOT_SESSIONS_DIR` directly). Long-term memory
-(`remember`/`recall`) and the running cost total aren't session-scoped —
+session — a new, empty session file with `session_cost_usd` back at $0,
+and the old one left exactly as it was (nothing is deleted, so you can
+look back at a past session's messages *and* what it cost by reading its
+file under `BOT_SESSIONS_DIR` directly; the reset confirmation message
+also reports what the session you just left cost). Long-term memory
+(`remember`/`recall`) and the lifetime cost total aren't session-scoped —
 both carry over regardless of how many times you reset.
 
 *Upgrading from an older version:* if `BOT_STATE_PATH` still has the old
-flat format (messages stored directly in it, no `active_session_id`),
-the bot migrates it automatically on first run — that history becomes
-your first session file, and `total_cost_usd`/`update_offset` carry over
+flat format (messages and cost stored directly in it, no
+`active_session_id`), the bot migrates it automatically on first run —
+that history becomes your first session file, credited with whatever
+`total_cost_usd` had already accumulated (it was the only conversation
+that existed at the time), and the lifetime total/offset carry over
 unchanged so you don't lose spend tracking or replay old messages.
 
 **Hosting — this needs to stay running, unlike everything else in this

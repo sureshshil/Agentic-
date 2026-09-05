@@ -15,22 +15,26 @@ must not act on messages from strangers who find its username.
 
 Commands:
   /reset, /new   Start a new session - a fresh conversation with empty
-                 history. Conversation history only ever grows otherwise
-                 (every reply resends the full history to the API - see
-                 README's "Managing conversation history" section), so
-                 this is how you bound it day to day. The previous
-                 session's file is kept, not deleted - see "Session
-                 files" below. Doesn't affect long-term memory
-                 (remember/recall) or the running cost total.
+                 history and its own cost counter reset to $0. Conversation
+                 history only ever grows otherwise (every reply resends
+                 the full history to the API - see README's "Managing
+                 conversation history" section), so this is how you bound
+                 it day to day. The previous session's file is kept, not
+                 deleted - see "Session files" below. Doesn't affect
+                 long-term memory (remember/recall) or the lifetime cost
+                 total that AGENT_MAX_COST_USD caps.
 
 Session files:
   BOT_STATE_PATH is an *index* - which session is currently active, plus
-  state shared across all sessions (total_cost_usd, the Telegram
-  update_offset). It never holds conversation content. Each session's
-  actual messages live in their own file under BOT_SESSIONS_DIR, named
-  by session id - so /reset starts a new file instead of overwriting the
-  old one, and old conversations stay on disk if you want to look back
-  (nothing currently prunes BOT_SESSIONS_DIR automatically).
+  state shared across all sessions: total_cost_usd (LIFETIME spend, across
+  every session ever - what AGENT_MAX_COST_USD caps) and the Telegram
+  update_offset. It never holds conversation content. Each session's
+  actual messages AND its own session_cost_usd (spend in just that
+  session, informational only, no cap of its own) live in their own file
+  under BOT_SESSIONS_DIR, named by session id - so /reset starts a new
+  file instead of overwriting the old one, and old conversations (with
+  what they cost) stay on disk if you want to look back (nothing
+  currently prunes BOT_SESSIONS_DIR automatically).
 
 Env vars:
   ANTHROPIC_API_KEY         required
@@ -360,7 +364,12 @@ class Agent:
     def __init__(self, client: anthropic.Anthropic | None = None):
         self.client = client or build_client()
         self.messages: list[dict] = []
+        # Lifetime, across every session - this is what AGENT_MAX_COST_USD
+        # caps, and it's stored in the index file, not any one session file.
         self.total_cost_usd = 0.0
+        # Just the active session - reset to 0.0 by /reset, stored inside
+        # that session's own file. Purely informational, no cap of its own.
+        self.session_cost_usd = 0.0
         self.tools = build_tools()
 
     def _system_prompt(self) -> str:
@@ -392,9 +401,10 @@ class Agent:
         while True:
             if self.total_cost_usd >= MAX_COST_USD:
                 raise BudgetExceededError(
-                    f"Session cost ${self.total_cost_usd:.4f} has reached the "
+                    f"Lifetime cost ${self.total_cost_usd:.4f} has reached the "
                     f"${MAX_COST_USD:.4f} cap (AGENT_MAX_COST_USD). Raise the "
-                    "cap or clear the state file to continue."
+                    "cap to continue - this is a lifetime total, not scoped "
+                    "to the current session, so /reset won't clear it."
                 )
 
             response = self.client.messages.create(
@@ -404,10 +414,12 @@ class Agent:
                 tools=self.tools,
                 messages=self.messages,
             )
-            self.total_cost_usd += (
+            cost_delta = (
                 response.usage.input_tokens * INPUT_COST_PER_MTOK
                 + response.usage.output_tokens * OUTPUT_COST_PER_MTOK
             ) / 1_000_000
+            self.total_cost_usd += cost_delta
+            self.session_cost_usd += cost_delta
             self.messages.append({"role": "assistant", "content": response.content})
 
             if response.stop_reason == "pause_turn":
@@ -447,12 +459,14 @@ class Agent:
 #
 # Two kinds of file:
 #   STATE_PATH (the "index")   - {"active_session_id", "total_cost_usd",
-#                                 "update_offset"} - shared across every
-#                                 session, never holds conversation content.
-#   SESSIONS_DIR/<id>.json     - {"messages": [...]} for exactly one
-#                                 session. /reset starts a new id and
-#                                 therefore a new file; nothing ever
-#                                 overwrites an older session's file.
+#                                 "update_offset"} - total_cost_usd here is
+#                                 the LIFETIME total across every session;
+#                                 never holds conversation content.
+#   SESSIONS_DIR/<id>.json     - {"messages": [...], "session_cost_usd"}
+#                                 for exactly one session - cost spent
+#                                 just in that session. /reset starts a
+#                                 new id and therefore a new file; nothing
+#                                 ever overwrites an older session's file.
 
 def _serialize_content(content):
     if isinstance(content, list):
@@ -470,12 +484,16 @@ def _session_path(session_id: str) -> str:
     return os.path.join(SESSIONS_DIR, f"{session_id}.json")
 
 
-def _load_session_messages(session_id: str) -> list:
+def _load_session(session_id: str) -> dict:
     path = _session_path(session_id)
     if not os.path.exists(path):
-        return []
+        return {"messages": [], "session_cost_usd": 0.0}
     with open(path) as f:
-        return json.load(f).get("messages", [])
+        data = json.load(f)
+    return {
+        "messages": data.get("messages", []),
+        "session_cost_usd": data.get("session_cost_usd", 0.0),
+    }
 
 
 def load_state() -> dict:
@@ -484,6 +502,7 @@ def load_state() -> dict:
         return {
             "active_session_id": session_id,
             "messages": [],
+            "session_cost_usd": 0.0,
             "total_cost_usd": 0.0,
             "update_offset": 0,
         }
@@ -493,36 +512,56 @@ def load_state() -> dict:
 
     if "active_session_id" in index:
         session_id = index["active_session_id"]
+        session = _load_session(session_id)
         return {
             "active_session_id": session_id,
-            "messages": _load_session_messages(session_id),
+            "messages": session["messages"],
+            "session_cost_usd": session["session_cost_usd"],
             "total_cost_usd": index.get("total_cost_usd", 0.0),
             "update_offset": index.get("update_offset", 0),
         }
 
     # One-time migration: STATE_PATH is still in the old single-file format
-    # (messages stored directly in the index). Move its history into a new
-    # session file and keep cost/offset intact, so upgrading doesn't lose
-    # spend tracking or replay already-answered Telegram messages.
+    # (messages stored directly in the index, no per-session cost). Move
+    # its history into a new session file, crediting all cost so far to
+    # it (it was the only conversation that ever existed), and keep the
+    # lifetime total/offset intact so upgrading doesn't lose spend
+    # tracking or replay already-answered Telegram messages.
     session_id = new_session_id("migrated")
+    lifetime_cost_so_far = index.get("total_cost_usd", 0.0)
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     with open(_session_path(session_id), "w") as f:
-        json.dump({"messages": index.get("messages", [])}, f)
+        json.dump(
+            {
+                "messages": index.get("messages", []),
+                "session_cost_usd": lifetime_cost_so_far,
+            },
+            f,
+        )
     return {
         "active_session_id": session_id,
         "messages": index.get("messages", []),
-        "total_cost_usd": index.get("total_cost_usd", 0.0),
+        "session_cost_usd": lifetime_cost_so_far,
+        "total_cost_usd": lifetime_cost_so_far,
         "update_offset": index.get("update_offset", 0),
     }
 
 
-def save_state(session_id: str, messages: list, total_cost_usd: float, update_offset: int) -> None:
+def save_state(
+    session_id: str,
+    messages: list,
+    session_cost_usd: float,
+    total_cost_usd: float,
+    update_offset: int,
+) -> None:
     serializable_messages = [
         {"role": m["role"], "content": _serialize_content(m["content"])} for m in messages
     ]
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     with open(_session_path(session_id), "w") as f:
-        json.dump({"messages": serializable_messages}, f)
+        json.dump(
+            {"messages": serializable_messages, "session_cost_usd": session_cost_usd}, f
+        )
     with open(STATE_PATH, "w") as f:
         json.dump(
             {
@@ -566,6 +605,7 @@ def main() -> None:
     state = load_state()
     agent = Agent()
     agent.messages = state["messages"]
+    agent.session_cost_usd = state["session_cost_usd"]
     agent.total_cost_usd = state["total_cost_usd"]
     offset = state.get("update_offset", 0)
     session_id = state["active_session_id"]
@@ -598,13 +638,16 @@ def main() -> None:
                 print(f"You: {text}")
 
                 if text.strip().lower() in RESET_COMMANDS:
+                    prev_session_cost = agent.session_cost_usd
                     session_id = new_session_id(update["update_id"])
                     agent.messages = []
+                    agent.session_cost_usd = 0.0
                     print(f"New session: {session_id}")
                     reply = (
-                        "Started a new conversation - previous session saved "
-                        "separately, not deleted. (Long-term memory from "
-                        "'remember' is unaffected.)"
+                        f"Started a new conversation - previous session "
+                        f"(cost ${prev_session_cost:.4f}) saved separately, "
+                        "not deleted. (Long-term memory from 'remember' is "
+                        "unaffected.)"
                     )
                     print(f"Agent: {reply}")
                     send_telegram_reply(api_base, chat_id, reply)
@@ -625,7 +668,13 @@ def main() -> None:
                 # API error) makes the process reload an older offset on
                 # restart and replay messages it already replied to (and, for
                 # send_email, already acted on).
-                save_state(session_id, agent.messages, agent.total_cost_usd, offset)
+                save_state(
+                    session_id,
+                    agent.messages,
+                    agent.session_cost_usd,
+                    agent.total_cost_usd,
+                    offset,
+                )
 
 
 if __name__ == "__main__":
