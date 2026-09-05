@@ -33,6 +33,16 @@ Commands:
                  you can see it (Telegram doesn't let a bot filter its own
                  chat history, so this is how you get a recap instead of
                  needing separate threads/chats per session).
+  /cost          Report the current session's cost and the lifetime total
+                 against the AGENT_MAX_COST_USD cap, on demand - no need to
+                 wait for the hard-stop message to check spend. Replies also
+                 carry an automatic warning once lifetime cost crosses 80%
+                 of the cap.
+
+Long-term memory: 'remember' skips a fact that's already stored (exact
+match, case-insensitive) instead of piling up duplicates. 'recall' lists
+facts numbered; 'forget <number>' (a tool the model calls, not a Telegram
+command) removes one by that number.
 
 Session files:
   BOT_STATE_PATH is an *index* - which session is currently active, plus
@@ -99,6 +109,20 @@ OUTPUT_COST_PER_MTOK = 5.00
 # own between messages.
 MAX_COST_USD = float(os.environ.get("AGENT_MAX_COST_USD", "1.00"))
 
+# Once lifetime spend crosses this fraction of MAX_COST_USD, replies carry
+# a warning so you see it coming instead of being cut off by the hard cap
+# with no notice.
+COST_WARNING_RATIO = 0.8
+
+
+def cost_warning(total_cost_usd: float, cap: float) -> str:
+    if total_cost_usd < cap * COST_WARNING_RATIO:
+        return ""
+    return (
+        f"\n\n[Note: lifetime cost ${total_cost_usd:.4f} is approaching the "
+        f"${cap:.2f} cap (AGENT_MAX_COST_USD). Check /cost for details.]"
+    )
+
 # STATE_PATH is now the *index* file: which session is active, plus the
 # state that's shared across all sessions (cost total, Telegram offset).
 # Each session's own conversation lives in its own file under SESSIONS_DIR,
@@ -161,10 +185,14 @@ def _request_with_retry(method: str, url: str, attempts: int = 2, timeout: int =
 # ---- tools ------------------------------------------------------------
 
 def load_memory() -> list:
-    if os.path.exists(MEMORY_PATH):
+    if not os.path.exists(MEMORY_PATH):
+        return []
+    try:
         with open(MEMORY_PATH) as f:
             return json.load(f)
-    return []
+    except json.JSONDecodeError:
+        print(f"Warning: {MEMORY_PATH} is corrupted; ignoring it.")
+        return []
 
 
 def save_memory(memory: list) -> None:
@@ -174,6 +202,8 @@ def save_memory(memory: list) -> None:
 
 def remember(fact: str) -> str:
     memory = load_memory()
+    if any(existing.strip().lower() == fact.strip().lower() for existing in memory):
+        return f"Already remembered: {fact}"
     memory.append(fact)
     save_memory(memory)
     return f"Remembered: {fact}"
@@ -183,7 +213,16 @@ def recall() -> str:
     memory = load_memory()
     if not memory:
         return "No memories stored yet."
-    return "\n".join(f"- {fact}" for fact in memory)
+    return "\n".join(f"{i}. {fact}" for i, fact in enumerate(memory, start=1))
+
+
+def forget(index: int) -> str:
+    memory = load_memory()
+    if not 1 <= index <= len(memory):
+        return f"Error: no fact numbered {index}. Use 'recall' to see valid numbers."
+    removed = memory.pop(index - 1)
+    save_memory(memory)
+    return f"Forgot: {removed}"
 
 
 def get_weather(location: str) -> str:
@@ -296,8 +335,22 @@ def build_tools() -> list:
         },
         {
             "name": "recall",
-            "description": "List everything currently stored in long-term memory.",
+            "description": "List everything currently stored in long-term memory, numbered.",
             "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "forget",
+            "description": "Remove a fact from long-term memory by its number, as shown by 'recall'.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "The 1-based number of the fact to remove, from 'recall'.",
+                    },
+                },
+                "required": ["index"],
+            },
         },
         {
             "name": "get_weather",
@@ -352,6 +405,8 @@ def execute_tool(name: str, tool_input: dict) -> str:
         return remember(tool_input["fact"])
     if name == "recall":
         return recall()
+    if name == "forget":
+        return forget(tool_input["index"])
     if name == "get_weather":
         return get_weather(tool_input["location"])
     if name == "web_search":
@@ -403,10 +458,7 @@ class Agent:
             parts.append(f"Things you remember about the user:\n{facts_block}")
         return "\n\n".join(parts)
 
-    def send(self, user_input: str) -> str:
-        turn_start = len(self.messages)
-        self.messages.append({"role": "user", "content": user_input})
-
+    def _run_turn(self):
         resumes = 0
         while True:
             if self.total_cost_usd >= MAX_COST_USD:
@@ -435,11 +487,11 @@ class Agent:
             if response.stop_reason == "pause_turn":
                 resumes += 1
                 if resumes > MAX_PAUSE_RESUMES:
-                    break
+                    return response
                 continue
 
             if response.stop_reason != "tool_use":
-                break
+                return response
 
             tool_results = []
             for block in response.content:
@@ -452,6 +504,20 @@ class Agent:
                         {"type": "tool_result", "tool_use_id": block.id, "content": result}
                     )
             self.messages.append({"role": "user", "content": tool_results})
+
+    def send(self, user_input: str) -> str:
+        turn_start = len(self.messages)
+        self.messages.append({"role": "user", "content": user_input})
+
+        try:
+            response = self._run_turn()
+        except Exception:
+            # Roll back the unanswered user turn so a failed call (budget
+            # cap, API error, etc.) never leaves messages ending on
+            # "user" - the next send() would otherwise append a second
+            # consecutive user message, which the API rejects outright.
+            self.messages = self.messages[:turn_start]
+            raise
 
         reply = "".join(block.text for block in response.content if block.type == "text")
 
@@ -731,6 +797,15 @@ def main() -> None:
                     send_telegram_reply(api_base, chat_id, reply)
                     continue
 
+                if text.strip().lower() == "/cost":
+                    reply = (
+                        f"Session cost: ${agent.session_cost_usd:.4f}\n"
+                        f"Lifetime cost: ${agent.total_cost_usd:.4f} / ${MAX_COST_USD:.2f} cap"
+                    )
+                    print(f"Agent: {reply}")
+                    send_telegram_reply(api_base, chat_id, reply)
+                    continue
+
                 if text.strip().lower().startswith("/switch"):
                     args = text.strip().split(maxsplit=1)
                     entries = list_sessions()
@@ -758,6 +833,7 @@ def main() -> None:
 
                 try:
                     reply = agent.send(text)
+                    reply += cost_warning(agent.total_cost_usd, MAX_COST_USD)
                 except BudgetExceededError as exc:
                     reply = f"[stopped] {exc}"
                 except Exception as exc:
