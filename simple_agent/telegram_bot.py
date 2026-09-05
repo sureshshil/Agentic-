@@ -42,6 +42,14 @@ from email.mime.text import MIMEText
 
 import anthropic
 import requests
+from dotenv import load_dotenv
+
+# Loads telegram_bot.env from this script's own directory, regardless of
+# the process's working directory - so the bot picks up secrets the same
+# way whether it's started by systemd (which already injects them via
+# EnvironmentFile=) or run manually from a shell. Existing environment
+# variables always win; this only fills in what isn't already set.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "telegram_bot.env"))
 
 MODEL = "claude-haiku-4-5"
 MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "1024"))

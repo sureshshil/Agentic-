@@ -7,9 +7,9 @@
 #   systemctl daemon-reload
 #   systemctl enable --now telegram-bot
 #
-# Defaults assume you're logged in as root at /root/Agentic- (the default
-# on Hetzner/DigitalOcean/Vultr Ubuntu images). Adjust User/WorkingDirectory
-# /ExecStart/EnvironmentFile below to match your actual setup.
+# Defaults assume the repo is cloned to /home/projects/Agentic-, running as
+# root. Adjust User/WorkingDirectory/ExecStart/EnvironmentFile below to
+# match your actual setup.
 
 [Unit]
 Description=Telegram bot for the simple_agent project
@@ -19,9 +19,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/Agentic-/simple_agent
-EnvironmentFile=/root/Agentic-/simple_agent/telegram_bot.env
-ExecStart=/root/Agentic-/simple_agent/.venv/bin/python telegram_bot.py
+WorkingDirectory=/home/projects/Agentic-/simple_agent
+EnvironmentFile=/home/projects/Agentic-/simple_agent/telegram_bot.env
+ExecStart=/home/projects/Agentic-/simple_agent/.venv/bin/python telegram_bot.py
 Restart=always
 RestartSec=5
 

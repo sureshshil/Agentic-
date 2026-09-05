@@ -241,6 +241,7 @@ ssh -i /path/to/your/private_key root@<instance-public-ip>
 
 apt update && apt install -y python3-venv git
 
+mkdir -p /home/projects && cd /home/projects
 git clone https://github.com/sureshshil/Agentic-.git
 cd Agentic-
 git checkout claude/simple-agent-creation-qys564
@@ -259,9 +260,9 @@ nano telegram_bot.env   # fill in your real values
 
 **4. Install it as a systemd service**, so it survives you logging out and
 restarts automatically on crash or VM reboot. `deploy/telegram-bot.service`
-defaults to a `root` user at `/root/Agentic-` (the common default on these
-providers) - if your setup differs, edit `User=`, `WorkingDirectory=`,
-`EnvironmentFile=`, and `ExecStart=` first to match:
+defaults to a `root` user at `/home/projects/Agentic-` - if your setup
+differs, edit `User=`, `WorkingDirectory=`, `EnvironmentFile=`, and
+`ExecStart=` first to match:
 ```bash
 nano deploy/telegram-bot.service   # fix the paths/User= for your setup
 cp deploy/telegram-bot.service /etc/systemd/system/telegram-bot.service
