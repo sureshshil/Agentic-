@@ -146,6 +146,12 @@ chars/snippet), and a short synthesized `answer` field instead of raw
 pages. Trade-off: it needs its own API key and account instead of riding
 on your existing Anthropic key.
 
+`telegram_bot.py`'s `web_search` tool exposes `search_depth` as a
+per-call argument, not just the `TAVILY_SEARCH_DEPTH` env var — the model
+can ask for `"advanced"` on a specific query (recent events, niche topics,
+precise numbers/dates) while everything else stays on the cheaper
+`"basic"` default, instead of every search paying the ~2x credit cost.
+
 ## `telegram_bot.py` — a real, two-way personal assistant
 
 Every notebook above (and the `scheduled/` scripts below) either only

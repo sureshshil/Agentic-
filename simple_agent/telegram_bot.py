@@ -64,8 +64,10 @@ Env vars:
                             once, then check notebook 08's discover_chat_id
                             or https://api.telegram.org/bot<token>/getUpdates)
   TAVILY_API_KEY            optional - enables the web_search tool
-  TAVILY_SEARCH_DEPTH       optional, default "basic" - set to "advanced"
-                            for deeper (and ~2x credit cost) Tavily search
+  TAVILY_SEARCH_DEPTH       optional, default "basic" - the *default* Tavily
+                            search depth; the model can override it per call
+                            to "advanced" (~2x credit cost) when a query
+                            needs a deeper crawl (see the web_search tool)
   EMAIL_ADDRESS             optional - enables send_email (Gmail address)
   EMAIL_APP_PASSWORD        optional - Gmail App Password, see notebook 05
   AGENT_MAX_COST_USD        optional, default 1.00 - a running total that
@@ -180,7 +182,10 @@ SYSTEM_PROMPT_BASE = (
     "Memory: only call 'remember' for durable facts or preferences that "
     "should still matter in a future conversation (e.g. dietary "
     "restrictions, timezone, ongoing projects) - not incidental details "
-    "from a single one-off question."
+    "from a single one-off question.\n\n"
+    "Answering style: lead with the direct answer in your first sentence, "
+    "then add at most one or two supporting details - don't bury the "
+    "answer in preamble, throat-clearing, or unnecessary hedging."
 )
 
 
@@ -282,10 +287,16 @@ def get_weather(location: str) -> str:
     )
 
 
-def web_search(query: str) -> str:
+def web_search(query: str, search_depth: str | None = None) -> str:
     """Client-side search via Tavily - see notebook 03 for why (plain JSON,
-    no per-result verification blob to worry about)."""
+    no per-result verification blob to worry about).
+
+    search_depth lets the model ask for a deeper crawl on a per-query basis
+    (e.g. recent events, niche topics) instead of every search being stuck
+    at the TAVILY_SEARCH_DEPTH default. Falls back to that default for
+    anything the model doesn't set or gets wrong."""
     api_key = os.environ["TAVILY_API_KEY"]
+    depth = search_depth if search_depth in ("basic", "advanced") else TAVILY_SEARCH_DEPTH
     try:
         resp = _request_with_retry(
             "POST",
@@ -295,8 +306,10 @@ def web_search(query: str) -> str:
                 "query": query,
                 "max_results": TAVILY_MAX_RESULTS,
                 "chunks_per_source": 1,
-                "include_answer": "basic",
-                "search_depth": TAVILY_SEARCH_DEPTH,
+                # Matches the answer's synthesis depth to the search depth -
+                # a deeper crawl is wasted if the generated answer stays shallow.
+                "include_answer": depth,
+                "search_depth": depth,
             },
         )
     except requests.RequestException as exc:
@@ -307,7 +320,8 @@ def web_search(query: str) -> str:
     if data.get("answer"):
         lines.append("Answer: " + data["answer"])
     for r in data.get("results", []):
-        lines.append("- " + r["title"] + " (" + r["url"] + "): " + r["content"])
+        date = f" [{r['published_date']}]" if r.get("published_date") else ""
+        lines.append("- " + r["title"] + date + " (" + r["url"] + "): " + r["content"])
     return "\n".join(lines) if lines else "No results found."
 
 
@@ -391,6 +405,17 @@ def build_tools() -> list:
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "The search query."},
+                        "search_depth": {
+                            "type": "string",
+                            "enum": ["basic", "advanced"],
+                            "description": (
+                                f"Optional, defaults to '{TAVILY_SEARCH_DEPTH}'. Use "
+                                "'advanced' for recent events, niche/technical topics, "
+                                "or precise numbers/dates where a shallow crawl risks "
+                                "missing or garbling the answer - it costs ~2x search "
+                                "credits. Use 'basic' for simple, well-known facts."
+                            ),
+                        },
                     },
                     "required": ["query"],
                 },
@@ -425,7 +450,7 @@ def execute_tool(name: str, tool_input: dict) -> str:
     if name == "get_weather":
         return get_weather(tool_input["location"])
     if name == "web_search":
-        return web_search(tool_input["query"])
+        return web_search(tool_input["query"], tool_input.get("search_depth"))
     if name == "send_email":
         return send_email(tool_input["to"], tool_input["subject"], tool_input["body"])
     return f"Error: unknown tool '{name}'"
@@ -460,7 +485,18 @@ class Agent:
                 "current, or that you're not fully sure about - reach for "
                 "it before answering from memory or guessing. Use "
                 "'get_weather' and 'send_email' only for what they're each "
-                "explicitly for, not as a substitute for web_search."
+                "explicitly for, not as a substitute for web_search.\n\n"
+                "Summarizing search results: synthesize across the returned "
+                "sources into one coherent answer - don't just repeat the "
+                "'Answer' line verbatim if the individual sources add useful "
+                "detail it left out. If sources disagree, prefer the one "
+                "with the more recent published date and say the facts are "
+                "disputed rather than picking silently. Don't mention URLs "
+                "or source names unless the user asks for sources or the "
+                "claim is contentious enough to need one. If the first "
+                "search's results are thin, contradictory, or clearly "
+                "outdated, re-run it with search_depth='advanced' instead "
+                "of answering from a weak result."
             )
         if os.environ.get("EMAIL_ADDRESS") and os.environ.get("EMAIL_APP_PASSWORD"):
             parts.append(
