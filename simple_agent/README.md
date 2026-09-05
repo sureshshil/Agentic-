@@ -196,18 +196,33 @@ replies with a "[stopped]" message instead of calling the model — delete
 `BOT_STATE_PATH` (default `.telegram_bot_state.json`) or raise the cap to
 continue.
 
-**Managing conversation history.** `agent.messages` is saved to
-`BOT_STATE_PATH` after every message and reloaded on every restart —
-including a systemd restart — so the conversation survives crashes and
-redeploys. But nothing trims it automatically: every turn you've ever sent
-stays in there, and each new reply resends that *entire* history to the
-API (it's a stateless API - there's no server-side session to trim). Two
-consequences of that: input cost creeps up over time, and eventually the
-history can exceed the model's context window, after which every message
-fails the same way until the history shrinks. Send `/reset` or `/new`
-from Telegram at any time to clear it and start fresh — it doesn't touch
-long-term memory (`remember`/`recall`) or the running cost total, both of
-which are meant to persist.
+**Managing conversation history — sessions.** Conversation state is split
+across two kinds of file. `BOT_STATE_PATH` (default
+`.telegram_bot_state.json`) is just an *index*: which session is
+currently active, plus the two things shared across all of them
+(`total_cost_usd`, the Telegram `update_offset`). The actual messages for
+each session live in their own file under `BOT_SESSIONS_DIR` (default
+`.telegram_bot_sessions/`), named by session id.
+
+This matters because nothing trims a session's history automatically —
+every turn you've sent in it stays there, and each reply resends that
+*entire* history to the API (it's stateless — there's no server-side
+session to trim for you). Input cost creeps up as a session goes on, and
+eventually its history can exceed the model's context window, after
+which every message in *that* session fails the same way.
+
+Send `/reset` or `/new` from Telegram at any time to start a fresh
+session — a new, empty session file, with the old one left exactly as it
+was (nothing is deleted, so you can look back at past conversations by
+reading the file under `BOT_SESSIONS_DIR` directly). Long-term memory
+(`remember`/`recall`) and the running cost total aren't session-scoped —
+both carry over regardless of how many times you reset.
+
+*Upgrading from an older version:* if `BOT_STATE_PATH` still has the old
+flat format (messages stored directly in it, no `active_session_id`),
+the bot migrates it automatically on first run — that history becomes
+your first session file, and `total_cost_usd`/`update_offset` carry over
+unchanged so you don't lose spend tracking or replay old messages.
 
 **Hosting — this needs to stay running, unlike everything else in this
 repo.** GitHub Actions (used for `scheduled/` below) only runs on a

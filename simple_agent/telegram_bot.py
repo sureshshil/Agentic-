@@ -14,13 +14,23 @@ side effects (sending email, spending your Anthropic budget), so the bot
 must not act on messages from strangers who find its username.
 
 Commands:
-  /reset, /new   Clear conversation history and start fresh. Conversation
-                 history only ever grows otherwise (every reply resends
-                 the full history to the API - see README's "Managing
-                 conversation history" section), so this is how you bound
-                 it day to day without SSHing in to edit the state file.
-                 Doesn't affect long-term memory (remember/recall) or the
-                 running cost total.
+  /reset, /new   Start a new session - a fresh conversation with empty
+                 history. Conversation history only ever grows otherwise
+                 (every reply resends the full history to the API - see
+                 README's "Managing conversation history" section), so
+                 this is how you bound it day to day. The previous
+                 session's file is kept, not deleted - see "Session
+                 files" below. Doesn't affect long-term memory
+                 (remember/recall) or the running cost total.
+
+Session files:
+  BOT_STATE_PATH is an *index* - which session is currently active, plus
+  state shared across all sessions (total_cost_usd, the Telegram
+  update_offset). It never holds conversation content. Each session's
+  actual messages live in their own file under BOT_SESSIONS_DIR, named
+  by session id - so /reset starts a new file instead of overwriting the
+  old one, and old conversations stay on disk if you want to look back
+  (nothing currently prunes BOT_SESSIONS_DIR automatically).
 
 Env vars:
   ANTHROPIC_API_KEY         required
@@ -37,6 +47,9 @@ Env vars:
                             keeps running; delete BOT_STATE_PATH or raise
                             this to keep going once it's hit
   BOT_STATE_PATH            optional, default ".telegram_bot_state.json"
+                            - the session index, see "Session files" above
+  BOT_SESSIONS_DIR          optional, default ".telegram_bot_sessions"
+                            - one JSON file per session's messages
 
 Run: python telegram_bot.py
 This has to keep running somewhere to be useful - see README for hosting
@@ -72,7 +85,12 @@ OUTPUT_COST_PER_MTOK = 5.00
 # own between messages.
 MAX_COST_USD = float(os.environ.get("AGENT_MAX_COST_USD", "1.00"))
 
+# STATE_PATH is now the *index* file: which session is active, plus the
+# state that's shared across all sessions (cost total, Telegram offset).
+# Each session's own conversation lives in its own file under SESSIONS_DIR,
+# so /reset starting a new session never overwrites an older one.
 STATE_PATH = os.environ.get("BOT_STATE_PATH", ".telegram_bot_state.json")
+SESSIONS_DIR = os.environ.get("BOT_SESSIONS_DIR", ".telegram_bot_sessions")
 MEMORY_PATH = os.environ.get("BOT_MEMORY_PATH", ".telegram_bot_memory.json")
 MAX_PAUSE_RESUMES = 10
 TAVILY_MAX_RESULTS = 3
@@ -80,8 +98,8 @@ TAVILY_MAX_RESULTS = 3
 # Typed in Telegram to start a new conversation - conversation history only
 # ever grows otherwise (see README's "Managing conversation history"
 # section), so this is the way to bound it without SSHing in to delete
-# .telegram_bot_state.json by hand. Doesn't touch long-term memory
-# (remember/recall) or the running cost total - those are meant to persist.
+# session files by hand. Doesn't touch long-term memory (remember/recall)
+# or the running cost total - those are meant to persist across sessions.
 RESET_COMMANDS = {"/reset", "/new"}
 
 WMO_CODES = {
@@ -425,7 +443,16 @@ class Agent:
         return reply
 
 
-# ---- persistence --------------------------------------------------------
+# ---- persistence ---------------------------------------------------------
+#
+# Two kinds of file:
+#   STATE_PATH (the "index")   - {"active_session_id", "total_cost_usd",
+#                                 "update_offset"} - shared across every
+#                                 session, never holds conversation content.
+#   SESSIONS_DIR/<id>.json     - {"messages": [...]} for exactly one
+#                                 session. /reset starts a new id and
+#                                 therefore a new file; nothing ever
+#                                 overwrites an older session's file.
 
 def _serialize_content(content):
     if isinstance(content, list):
@@ -433,21 +460,73 @@ def _serialize_content(content):
     return content
 
 
+def new_session_id(update_id) -> str:
+    # update_id (from the triggering Telegram update) makes this unique
+    # even if two resets land in the same second.
+    return f"sess_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{update_id}"
+
+
+def _session_path(session_id: str) -> str:
+    return os.path.join(SESSIONS_DIR, f"{session_id}.json")
+
+
+def _load_session_messages(session_id: str) -> list:
+    path = _session_path(session_id)
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return json.load(f).get("messages", [])
+
+
 def load_state() -> dict:
     if not os.path.exists(STATE_PATH):
-        return {"messages": [], "total_cost_usd": 0.0, "update_offset": 0}
+        session_id = new_session_id("init")
+        return {
+            "active_session_id": session_id,
+            "messages": [],
+            "total_cost_usd": 0.0,
+            "update_offset": 0,
+        }
+
     with open(STATE_PATH) as f:
-        return json.load(f)
+        index = json.load(f)
+
+    if "active_session_id" in index:
+        session_id = index["active_session_id"]
+        return {
+            "active_session_id": session_id,
+            "messages": _load_session_messages(session_id),
+            "total_cost_usd": index.get("total_cost_usd", 0.0),
+            "update_offset": index.get("update_offset", 0),
+        }
+
+    # One-time migration: STATE_PATH is still in the old single-file format
+    # (messages stored directly in the index). Move its history into a new
+    # session file and keep cost/offset intact, so upgrading doesn't lose
+    # spend tracking or replay already-answered Telegram messages.
+    session_id = new_session_id("migrated")
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    with open(_session_path(session_id), "w") as f:
+        json.dump({"messages": index.get("messages", [])}, f)
+    return {
+        "active_session_id": session_id,
+        "messages": index.get("messages", []),
+        "total_cost_usd": index.get("total_cost_usd", 0.0),
+        "update_offset": index.get("update_offset", 0),
+    }
 
 
-def save_state(messages: list, total_cost_usd: float, update_offset: int) -> None:
+def save_state(session_id: str, messages: list, total_cost_usd: float, update_offset: int) -> None:
     serializable_messages = [
         {"role": m["role"], "content": _serialize_content(m["content"])} for m in messages
     ]
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    with open(_session_path(session_id), "w") as f:
+        json.dump({"messages": serializable_messages}, f)
     with open(STATE_PATH, "w") as f:
         json.dump(
             {
-                "messages": serializable_messages,
+                "active_session_id": session_id,
                 "total_cost_usd": total_cost_usd,
                 "update_offset": update_offset,
             },
@@ -489,8 +568,10 @@ def main() -> None:
     agent.messages = state["messages"]
     agent.total_cost_usd = state["total_cost_usd"]
     offset = state.get("update_offset", 0)
+    session_id = state["active_session_id"]
 
     print(f"Telegram bot ready (cap ${MAX_COST_USD:.2f}, allowed chat_id {allowed_chat_id}).")
+    print(f"Active session: {session_id}")
     print("Listening for messages (Ctrl+C to stop)...")
 
     while True:
@@ -517,10 +598,13 @@ def main() -> None:
                 print(f"You: {text}")
 
                 if text.strip().lower() in RESET_COMMANDS:
+                    session_id = new_session_id(update["update_id"])
                     agent.messages = []
+                    print(f"New session: {session_id}")
                     reply = (
-                        "Started a new conversation - previous history cleared. "
-                        "(Long-term memory from 'remember' is unaffected.)"
+                        "Started a new conversation - previous session saved "
+                        "separately, not deleted. (Long-term memory from "
+                        "'remember' is unaffected.)"
                     )
                     print(f"Agent: {reply}")
                     send_telegram_reply(api_base, chat_id, reply)
@@ -541,7 +625,7 @@ def main() -> None:
                 # API error) makes the process reload an older offset on
                 # restart and replay messages it already replied to (and, for
                 # send_email, already acted on).
-                save_state(agent.messages, agent.total_cost_usd, offset)
+                save_state(session_id, agent.messages, agent.total_cost_usd, offset)
 
 
 if __name__ == "__main__":
