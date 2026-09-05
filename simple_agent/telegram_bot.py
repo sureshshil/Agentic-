@@ -68,11 +68,8 @@ Env vars:
   TELEGRAM_ALLOWED_CHAT_ID  required - your own chat_id (message the bot
                             once, then check notebook 08's discover_chat_id
                             or https://api.telegram.org/bot<token>/getUpdates)
-  TAVILY_API_KEY            optional - enables the web_search tool
-  TAVILY_SEARCH_DEPTH       optional, default "basic" - the *default* Tavily
-                            search depth; the model can override it per call
-                            to "advanced" (~2x credit cost) when a query
-                            needs a deeper crawl (see the web_search tool)
+  BRAVE_API_KEY             optional - enables the web_search tool (Brave
+                            Web Search API, https://api.search.brave.com)
   EMAIL_ADDRESS             optional - enables send_email (Gmail address)
   EMAIL_APP_PASSWORD        optional - Gmail App Password, see notebook 05
   AGENT_MAX_COST_USD        optional, default 1.00 - a running total that
@@ -113,12 +110,20 @@ from dotenv import load_dotenv
 # variables always win; this only fills in what isn't already set.
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "telegram_bot.env"))
 
-MODEL = "claude-haiku-4-5"
-MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "1024"))
+MODEL = "claude-sonnet-5"
+# claude-sonnet-5 thinks adaptively by default, and thinking tokens are
+# billed as - and capped by - the same max_tokens budget as the visible
+# reply. A hard enough request (e.g. "plan this in detail") can spend the
+# *entire* budget on invisible reasoning and leave zero tokens for the
+# actual answer, truncating with stop_reason="max_tokens" and empty text.
+# 4096 leaves real headroom for that on top of a normal short reply;
+# effort="low" below (chat/tool-use work, not deep coding-style reasoning)
+# also keeps the model from reaching for heavy thinking in the first place.
+MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 
-# claude-haiku-4-5 pricing, $/1M tokens - update if you switch models.
-INPUT_COST_PER_MTOK = 1.00
-OUTPUT_COST_PER_MTOK = 5.00
+# claude-sonnet-5 pricing, $/1M tokens - update if you switch models.
+INPUT_COST_PER_MTOK = 2.00
+OUTPUT_COST_PER_MTOK = 10.00
 
 # Unlike the notebooks (one cap per kernel session), this cap covers the
 # entire lifetime of the running process, since it never restarts on its
@@ -157,11 +162,7 @@ MAX_PAUSE_RESUMES = 10
 # cap, which is both slow (real, blocking API calls) and unfair to future
 # turns that had nothing to do with the loop.
 MAX_TOOL_ITERATIONS = int(os.environ.get("AGENT_MAX_TOOL_ITERATIONS", "15"))
-TAVILY_MAX_RESULTS = 3
-# "basic" (default, 1 credit/search) is fine for quick lookups; "advanced"
-# (2 credits/search) digs deeper and tends to help with recent or niche
-# topics a shallow crawl misses. Tavily rejects any other value.
-TAVILY_SEARCH_DEPTH = os.environ.get("TAVILY_SEARCH_DEPTH", "basic")
+BRAVE_MAX_RESULTS = 5
 
 # Typed in Telegram to start a new conversation - conversation history only
 # ever grows otherwise (see README's "Managing conversation history"
@@ -193,12 +194,19 @@ class ToolLoopLimitError(RuntimeError):
     pass
 
 
+class EmptyReplyError(RuntimeError):
+    pass
+
+
 SYSTEM_PROMPT_BASE = (
     "You are the user's personal assistant, reachable over Telegram. You "
     "have tools for long-term memory (remember/recall/forget) and current "
     "weather (get_weather). Only call 'get_weather' when the user explicitly "
     "asks about weather or conditions somewhere - don't reach for it for "
-    "anything else. Keep replies short - they're read on a phone.\n\n"
+    "anything else. Keep replies short - they're read on a phone: one to "
+    "three sentences by default. Only go longer if the user explicitly "
+    "asks for more detail, a list, step-by-step instructions, or an "
+    "explanation.\n\n"
     "Default to answering directly: most messages - greetings, small talk, "
     "opinions, general knowledge you're confident hasn't changed, "
     "explanations of how something works - need no tool at all. Calling a "
@@ -206,9 +214,13 @@ SYSTEM_PROMPT_BASE = (
     "task genuinely needs it. When your own knowledge is stable and "
     "non-time-sensitive, just answer from it - don't call a tool 'to be "
     "safe'.\n\n"
-    "Formatting: reply in plain text only. Telegram will show Markdown or "
-    "HTML syntax (*bold*, _italic_, <b>, etc.) as literal characters, not "
-    "rendered formatting, so don't use it.\n\n"
+    "Formatting: reply in plain text only - no Markdown, no HTML. Telegram "
+    "shows that syntax as literal characters, not rendered formatting, so "
+    "asterisks, underscores, backticks, '#' headers, and tags like <b> all "
+    "show up as visible clutter instead of bold/italic/headings. This "
+    "applies even in longer, multi-part answers - use plain sentences, "
+    "line breaks, or a hyphen for a list item instead of '**bold**' or "
+    "'# heading' formatting.\n\n"
     "Tool errors: if a tool result starts with 'Error:', tell the user what "
     "went wrong in plain language - never guess, invent, or paper over a "
     "failed lookup as if it succeeded.\n\n"
@@ -217,16 +229,30 @@ SYSTEM_PROMPT_BASE = (
     "restrictions, timezone, ongoing projects) - not incidental details "
     "from a single one-off question.\n\n"
     "Reasoning before acting: whenever you're about to call a tool, first "
-    "write one short sentence explaining why (e.g. 'Checking the weather "
-    "since the user asked about conditions in Paris.'), then make the "
-    "call. This is scratch reasoning for your own grounding between tool "
-    "calls, not a reply - it's never shown to the user and never saved, so "
-    "keep it brief and don't address the user in it.\n\n"
+    "write one short sentence stating what's actually missing from your "
+    "own knowledge that the tool provides - not just what the tool does "
+    "(e.g. 'Checking live conditions since I don't have today's weather.' "
+    "not 'Calling get_weather.'). If you can't articulate a real gap, "
+    "you don't need the tool - answer directly instead. This is scratch "
+    "reasoning for your own grounding between tool calls, not a reply - "
+    "it's never shown to the user and never saved, so keep it brief and "
+    "don't address the user in it.\n\n"
     "Answering style: once you're done calling tools and are giving your "
     "actual answer, don't carry the 'Reasoning before acting' narration "
-    "into it - lead with the direct answer in your first sentence, then "
-    "add at most one or two supporting details. Don't bury the answer in "
-    "preamble, throat-clearing, or unnecessary hedging."
+    "into it. Lead with the direct answer in your very first sentence and "
+    "stop there unless it's genuinely incomplete without one more "
+    "sentence of support. Don't restate the question, don't hedge, and "
+    "don't add caveats nobody asked for - default to the shortest reply "
+    "that fully answers what was asked.\n\n"
+    "Repeating earlier content: if the user asks to see, repeat, or resend "
+    "something you already wrote earlier in this same conversation (a "
+    "plan, a list, an answer) and it's still visible above in the message "
+    "history, copy that earlier reply back verbatim instead of "
+    "regenerating it from scratch - it's the same content either way, but "
+    "regenerating it burns real tokens and cost for no benefit, and risks "
+    "quietly drifting from what you said the first time. Only actually "
+    "redo the work if the user is asking for a change to it, not just "
+    "another look at it."
 )
 
 
@@ -354,41 +380,37 @@ def get_weather(location: str) -> str:
     )
 
 
-def web_search(query: str, search_depth: str | None = None) -> str:
-    """Client-side search via Tavily - see notebook 03 for why (plain JSON,
-    no per-result verification blob to worry about).
+FRESHNESS_CODES = {"pd": "past day", "pw": "past week", "pm": "past month", "py": "past year"}
 
-    search_depth lets the model ask for a deeper crawl on a per-query basis
-    (e.g. recent events, niche topics) instead of every search being stuck
-    at the TAVILY_SEARCH_DEPTH default. Falls back to that default for
-    anything the model doesn't set or gets wrong."""
-    api_key = os.environ["TAVILY_API_KEY"]
-    depth = search_depth if search_depth in ("basic", "advanced") else TAVILY_SEARCH_DEPTH
+
+def web_search(query: str, freshness: str | None = None) -> str:
+    """Client-side search via the Brave Web Search API - returns raw
+    title/url/description results (no synthesized answer field the way
+    Tavily's include_answer worked), so the model does its own synthesis
+    across snippets per the system prompt's search guidance.
+
+    freshness narrows results to a recent time window (see FRESHNESS_CODES)
+    for queries that are genuinely time-sensitive - left unset, Brave's
+    normal relevance ranking across all time applies."""
+    api_key = os.environ["BRAVE_API_KEY"]
+    params = {"q": query, "count": BRAVE_MAX_RESULTS}
+    if freshness in FRESHNESS_CODES:
+        params["freshness"] = freshness
     try:
         resp = _request_with_retry(
-            "POST",
-            "https://api.tavily.com/search",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "query": query,
-                "max_results": TAVILY_MAX_RESULTS,
-                "chunks_per_source": 1,
-                # Matches the answer's synthesis depth to the search depth -
-                # a deeper crawl is wasted if the generated answer stays shallow.
-                "include_answer": depth,
-                "search_depth": depth,
-            },
+            "GET",
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+            params=params,
         )
     except requests.RequestException as exc:
         return f"Error: web search failed ({exc})"
 
-    data = resp.json()
-    lines = []
-    if data.get("answer"):
-        lines.append("Answer: " + data["answer"])
-    for r in data.get("results", []):
-        date = f" [{r['published_date']}]" if r.get("published_date") else ""
-        lines.append("- " + r["title"] + date + " (" + r["url"] + "): " + r["content"])
+    results = resp.json().get("web", {}).get("results", [])
+    lines = [
+        "- " + r["title"] + " (" + r["url"] + "): " + r.get("description", "")
+        for r in results
+    ]
     return "\n".join(lines) if lines else "No results found."
 
 
@@ -468,24 +490,26 @@ def build_tools() -> list:
             },
         },
     ]
-    if os.environ.get("TAVILY_API_KEY"):
+    if os.environ.get("BRAVE_API_KEY"):
         tools.append(
             {
                 "name": "web_search",
-                "description": "Search the web for current information. Returns a short synthesized answer plus a few source snippets.",
+                "description": "Search the web for current information. Returns titles, URLs, and short snippets - synthesize the answer yourself from these.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "The search query."},
-                        "search_depth": {
+                        "freshness": {
                             "type": "string",
-                            "enum": ["basic", "advanced"],
+                            "enum": list(FRESHNESS_CODES),
                             "description": (
-                                f"Optional, defaults to '{TAVILY_SEARCH_DEPTH}'. Use "
-                                "'advanced' for recent events, niche/technical topics, "
-                                "or precise numbers/dates where a shallow crawl risks "
-                                "missing or garbling the answer - it costs ~2x search "
-                                "credits. Use 'basic' for simple, well-known facts."
+                                "Optional. Narrow results to a recent time window - "
+                                "'pd' (past day), 'pw' (past week), 'pm' (past month), "
+                                "'py' (past year). Set this for anything genuinely "
+                                "time-sensitive (who currently holds/won something, "
+                                "recent news, live prices) so stale pages don't "
+                                "outrank current ones. Leave unset for queries where "
+                                "recency doesn't matter."
                             ),
                         },
                     },
@@ -522,7 +546,7 @@ def execute_tool(name: str, tool_input: dict) -> str:
     if name == "get_weather":
         return get_weather(tool_input["location"])
     if name == "web_search":
-        return web_search(tool_input["query"], tool_input.get("search_depth"))
+        return web_search(tool_input["query"], tool_input.get("freshness"))
     if name == "send_email":
         return send_email(tool_input["to"], tool_input["subject"], tool_input["body"])
     return f"Error: unknown tool '{name}'"
@@ -549,50 +573,104 @@ class Agent:
         self.session_cost_usd = 0.0
         self.tools = build_tools()
 
-    def _system_prompt(self) -> str:
-        parts = [SYSTEM_PROMPT_BASE]
-        if os.environ.get("TAVILY_API_KEY"):
-            parts.append(
+    def _system_prompt(self) -> list:
+        """Returns system content as cache-friendly blocks rather than a
+        plain string: everything that's identical on every single call this
+        process makes (base prompt, tool-specific guidance - all fixed once
+        env vars are read at startup) goes in one block with a cache_control
+        breakpoint, so the API only bills it in full once per TTL window
+        instead of on every message. Only what actually varies per turn
+        (today's date, long-term memory facts) goes in a second, uncached
+        block after it - caching before content that changes would defeat
+        the cache on the very next call."""
+        stable_parts = [SYSTEM_PROMPT_BASE]
+        if os.environ.get("BRAVE_API_KEY"):
+            stable_parts.append(
                 "'web_search' is for things your training data can't be "
                 "trusted for: current events, recent changes, prices, "
                 "schedules, live scores, or a specific fact you're "
-                "genuinely unsure about. It is not the default for every "
-                "factual question - stable facts (history, science, how "
-                "something works, well-known people or places) should come "
-                "straight from what you already know, not a search. Use "
+                "genuinely unsure about and that actually changes over "
+                "time. Before calling it, check: would this exact answer "
+                "have been just as true a year ago? If yes, it's stable - "
+                "answer from what you know, don't search. It is not the "
+                "default for every factual question - stable facts "
+                "(history, science, how something works, well-known "
+                "people or places, general how-to/advice) come straight "
+                "from what you already know.\n\n"
+                "Watch out for questions that sound like stable trivia but "
+                "aren't: 'who won/holds/is the current X' for anything "
+                "recurring or ongoing (sports championships, awards, "
+                "elections, office holders, records, rankings) changes "
+                "over time even when you feel confident about a past "
+                "answer - your training data has a cutoff, so a "
+                "remembered winner may no longer be the *current* one. "
+                "Treat 'last/latest/current/most recent <recurring "
+                "thing>' as a search trigger by default, not something to "
+                "answer from memory just because you recall a specific "
+                "instance of it - and set 'freshness' (e.g. 'pw' or 'pm') "
+                "on that call so recent pages actually outrank old ones. "
+                "When you're genuinely unsure whether something is "
+                "time-sensitive, search rather than assume your "
+                "training-data instance is still the latest one. Use "
                 "'get_weather' and 'send_email' only for what they're each "
                 "explicitly for, not as a substitute for web_search.\n\n"
-                "Summarizing search results: synthesize across the returned "
-                "sources into one coherent answer - don't just repeat the "
-                "'Answer' line verbatim if the individual sources add useful "
-                "detail it left out. If sources disagree, prefer the one "
-                "with the more recent published date and say the facts are "
-                "disputed rather than picking silently. Don't mention URLs "
-                "or source names unless the user asks for sources or the "
-                "claim is contentious enough to need one. If the first "
-                "search's results are thin, contradictory, or clearly "
-                "outdated, re-run it with search_depth='advanced' instead "
-                "of answering from a weak result."
+                "Summarizing search results: the tool returns raw titles, "
+                "URLs, and short snippets - there's no pre-written answer "
+                "to lean on, so synthesize across the snippets yourself "
+                "into one coherent, short answer. Don't pad the reply out "
+                "with everything every snippet said. If snippets disagree "
+                "and neither is clearly newer, say the facts are disputed "
+                "rather than picking silently. If the first search's "
+                "results are thin or contradictory, re-run it with a "
+                "narrower or different 'freshness' setting instead of "
+                "answering from a weak result.\n\n"
+                "Citing sources: whenever a reply uses 'web_search' "
+                "results, list every URL the tool returned at the end of "
+                "the reply, one per line as 'Title: URL' - don't trim this "
+                "to just one link or leave it out to keep the reply "
+                "shorter. This source list is exempt from the usual "
+                "brevity default; the rest of the answer above it should "
+                "still stay short."
             )
         if os.environ.get("EMAIL_ADDRESS") and os.environ.get("EMAIL_APP_PASSWORD"):
-            parts.append(
+            stable_parts.append(
                 "Only call 'send_email' when the user explicitly asks you to "
                 "send or email something - never on your own initiative."
             )
+
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        dynamic_parts = [
+            f"Today's date is {today}. Your training data has a fixed cutoff "
+            "well before that - possibly a year or more. Don't assume "
+            "whoever/whatever was true 'currently' as of your training "
+            "cutoff is still true now: office holders, champions, prices, "
+            "and current versions of things may all have changed in that "
+            "gap, even ones you feel confident about."
+        ]
         facts = load_memory()
         if facts:
             facts_block = "\n".join(
                 f"- ({entry['remembered_at'] or 'date unknown'}) {entry['fact']}"
                 for entry in facts
             )
-            parts.append(
+            dynamic_parts.append(
                 "Things you remember about the user (dated):\n"
                 f"{facts_block}\n\n"
                 "If two remembered facts appear to conflict, trust the one "
                 "with the more recent date and treat the older one as "
                 "possibly outdated rather than silently picking one."
             )
-        return "\n\n".join(parts)
+
+        return [
+            {
+                "type": "text",
+                "text": "\n\n".join(stable_parts),
+                # 1h so a personal bot used a few times an hour still hits
+                # cache, not just rapid-fire messages within the 5min default.
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
+            {"type": "text", "text": "\n\n".join(dynamic_parts)},
+        ]
 
     def _run_turn(self):
         resumes = 0
@@ -609,6 +687,11 @@ class Agent:
             response = self.client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
+                # This is a short-reply chat/tool-use bot, not long-horizon
+                # coding/agentic work - low effort keeps adaptive thinking
+                # from over-spending the max_tokens budget on hard-sounding
+                # but not actually deep requests (see MAX_TOKENS comment).
+                output_config={"effort": "low"},
                 system=self._system_prompt(),
                 tools=self.tools,
                 messages=self.messages,
@@ -667,6 +750,21 @@ class Agent:
             raise
 
         reply = "".join(block.text for block in response.content if block.type == "text")
+
+        if not reply.strip():
+            # Happens when adaptive thinking (see MAX_TOKENS comment above)
+            # spends the whole max_tokens budget on invisible reasoning and
+            # stop_reason="max_tokens" cuts the response off before any
+            # visible text block exists. Silently sending "" to Telegram
+            # would look like the bot just didn't respond - roll back the
+            # turn (same as any other failed call) and surface it instead.
+            self.messages = self.messages[:turn_start]
+            raise EmptyReplyError(
+                f"Got no reply text back (stop_reason={response.stop_reason!r}) "
+                "- likely spent the whole AGENT_MAX_TOKENS budget on internal "
+                "reasoning before writing an answer. Try again, ask for a "
+                "shorter/more scoped version, or raise AGENT_MAX_TOKENS."
+            )
 
         # Same turn-collapsing as the notebooks - keeps the resent history
         # small since the API is stateless and this process never restarts
@@ -823,19 +921,55 @@ def get_updates(api_base: str, offset: int) -> list:
     return resp.json().get("result", [])
 
 
+# Telegram's hard per-message cap. sendMessage returns an HTTP error above
+# this and nothing before this fix ever split a reply, so an agent answer
+# just long enough to be genuinely useful (a detailed plan, a long
+# explanation the user explicitly asked for) would silently fail to
+# deliver - it still got persisted to the session file (that happens
+# independently in the main loop's `finally`), so it looked like the bot
+# "answered" but the user never saw it in Telegram at all.
+TELEGRAM_MESSAGE_CHAR_LIMIT = 4096
+
+
+def _chunk_for_telegram(text: str, limit: int = TELEGRAM_MESSAGE_CHAR_LIMIT) -> list:
+    """Split text into <=limit-char pieces, preferring a paragraph/line/word
+    boundary near the limit so a split doesn't land mid-sentence or mid-word.
+    Every split point keeps its separator attached to the end of the chunk
+    before it (rather than stripping it from the start of the next one), so
+    "".join(chunks) always reconstructs the original text exactly - no
+    separator dropped, no two words silently fused together at a split."""
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    while len(text) > limit:
+        split_at = limit
+        for sep in ("\n\n", "\n", " "):
+            idx = text.rfind(sep, 0, limit)
+            if idx > 0:
+                split_at = idx + len(sep)
+                break
+        chunks.append(text[:split_at])
+        text = text[split_at:]
+    if text:
+        chunks.append(text)
+    return chunks
+
+
 def send_telegram_reply(api_base: str, chat_id: str, text: str) -> None:
-    try:
-        _request_with_retry(
-            "POST",
-            f"{api_base}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-        )
-    except requests.RequestException as exc:
-        print(f"Warning: failed to send Telegram reply ({exc})")
+    for chunk in _chunk_for_telegram(text):
+        try:
+            _request_with_retry(
+                "POST",
+                f"{api_base}/sendMessage",
+                json={"chat_id": chat_id, "text": chunk},
+            )
+        except requests.RequestException as exc:
+            print(f"Warning: failed to send Telegram reply ({exc})")
+            return  # don't send later chunks out of order after a failure
 
 
-# Telegram caps a single sendMessage's text at 4096 chars; leave headroom
-# for whatever prefix (e.g. "Switched to session N...") gets prepended.
+# Leaves headroom under TELEGRAM_MESSAGE_CHAR_LIMIT for whatever prefix
+# (e.g. "Switched to session N...") gets prepended to a recap.
 RECAP_CHAR_LIMIT = 3500
 
 
@@ -981,7 +1115,7 @@ def main() -> None:
                 try:
                     reply = agent.send(text)
                     reply += cost_warning(agent.total_cost_usd, MAX_COST_USD)
-                except (BudgetExceededError, ToolLoopLimitError) as exc:
+                except (BudgetExceededError, ToolLoopLimitError, EmptyReplyError) as exc:
                     reply = f"[stopped] {exc}"
                 except Exception as exc:
                     print(f"Warning: agent.send failed unexpectedly ({exc})")

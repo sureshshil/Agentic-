@@ -16,7 +16,7 @@ real environment variables always win; these files just fill in what
 isn't already set):
   ANTHROPIC_API_KEY        required - from ../telegram_bot.env
   ANTHROPIC_WORKSPACE_ID   optional - see telegram_bot.py's docstring
-  TAVILY_API_KEY           required, from ../telegram_bot.env - without
+  BRAVE_API_KEY            required, from ../telegram_bot.env - without
                            it the agent has no web_search tool and can't
                            look up today's actual news instead of
                            guessing from stale training knowledge
@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 _SIMPLE_AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _SIMPLE_AGENT_DIR)
 
-# telegram_bot.env covers ANTHROPIC_API_KEY/TAVILY_API_KEY (also loaded
+# telegram_bot.env covers ANTHROPIC_API_KEY/BRAVE_API_KEY (also loaded
 # again, harmlessly, when `from telegram_bot import Agent` runs below);
 # scheduled.env covers the vars only this script and rain_alert.py need.
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
@@ -51,7 +51,7 @@ NEWS_QUERY = os.environ.get("NEWS_QUERY") or "top world news today"
 def main() -> None:
     missing = [
         name
-        for name in ("ANTHROPIC_API_KEY", "TAVILY_API_KEY", "NTFY_TOPIC")
+        for name in ("ANTHROPIC_API_KEY", "BRAVE_API_KEY", "NTFY_TOPIC")
         if not os.environ.get(name)
     ]
     if missing:

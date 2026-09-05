@@ -27,7 +27,7 @@ Both new scripts load env vars from two files, same fill-in-what's-unset
 behavior as `telegram_bot.py`'s own `load_dotenv()` call (real
 environment variables always win):
 
-- `../telegram_bot.env` - reuses `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`,
+- `../telegram_bot.env` - reuses `ANTHROPIC_API_KEY`, `BRAVE_API_KEY`,
   etc. that are already there for the bot.
 - `../deploy/scheduled.env` - the handful of vars only these scripts
   need (`NTFY_TOPIC`, `ALERT_LOCATION`, `RAIN_THRESHOLD_MM`,
@@ -60,13 +60,13 @@ environment variables always win):
 
    ```cron
    # Weather alert - every 30 minutes
-   */30 * * * * cd /path/to/Agentic-/simple_agent/scheduled && python3 rain_alert_cron.py >> /var/log/weather-alert.log 2>&1
+   cron */30 * * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 rain_alert_cron.py >> /var/log/weather-alert.log 2>&1
 
    # News digest - once a day at 08:00 (agent-generated; swap in
    # news_digest.py for the simpler, cheaper, non-agent version instead -
    # but that one still needs the shell-export approach below since it
    # doesn't call load_dotenv())
-   0 8 * * * cd /path/to/Agentic-/simple_agent/scheduled && python3 news_digest_agent.py >> /var/log/news-digest.log 2>&1
+   0 8 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 news_digest_agent.py >> /var/log/news-digest.log 2>&1
    ```
 
    Replace `/path/to/Agentic-` with the repo's actual path on the VPS,

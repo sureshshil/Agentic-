@@ -137,20 +137,25 @@ something in the world. Two things worth knowing:
   as you add more tools with side effects (file writes, calendar events,
   purchases, etc.).
 
-**Why Tavily instead of Anthropic's built-in `web_search`:** the built-in
-tool is zero-setup (same API key, no extra account) but its results carry
-that large verification blob you can't shrink or opt out of. Tavily is a
-plain client-side tool (like the calculator) — we get plain JSON back and
-control the size directly: `max_results=3`, `chunks_per_source=1` (≤500
-chars/snippet), and a short synthesized `answer` field instead of raw
-pages. Trade-off: it needs its own API key and account instead of riding
-on your existing Anthropic key.
+**Why Brave Search instead of Anthropic's built-in `web_search`:** the
+built-in tool is zero-setup (same API key, no extra account) but its
+results carry that large verification blob you can't shrink or opt out
+of. Brave's Web Search API is a plain client-side tool (like the
+calculator) — plain JSON back, and we control the size directly:
+`count=5` short title/url/description results per search. Trade-off: it
+needs its own API key and account instead of riding on your existing
+Anthropic key. (An earlier version of this bot used Tavily instead, which
+adds a synthesized `answer` field on top of the same kind of snippets;
+Brave has a larger free tier and lower per-call cost at this bot's
+volume, at the cost of doing the synthesis yourself in the prompt instead
+of getting one field to lean on.)
 
-`telegram_bot.py`'s `web_search` tool exposes `search_depth` as a
-per-call argument, not just the `TAVILY_SEARCH_DEPTH` env var — the model
-can ask for `"advanced"` on a specific query (recent events, niche topics,
-precise numbers/dates) while everything else stays on the cheaper
-`"basic"` default, instead of every search paying the ~2x credit cost.
+`telegram_bot.py`'s `web_search` tool exposes `freshness` as a per-call
+argument — the model can ask for `"pd"`/`"pw"`/`"pm"`/`"py"` (past
+day/week/month/year) on a query that's genuinely time-sensitive (current
+office holders, recent results, live prices) so recent pages actually
+outrank old ones, while everything else searches with no time filter at
+all.
 
 ## `telegram_bot.py` — a real, two-way personal assistant
 
@@ -178,7 +183,7 @@ webhook. The loop just asks again immediately after each response.
    export TELEGRAM_BOT_TOKEN=...
    export TELEGRAM_ALLOWED_CHAT_ID=...   # your chat_id - see below
    # optional:
-   export TAVILY_API_KEY=...             # enables web_search
+   export BRAVE_API_KEY=...              # enables web_search
    export EMAIL_ADDRESS=you@gmail.com    # enables send_email
    export EMAIL_APP_PASSWORD=...
    ```
@@ -282,7 +287,7 @@ Any of these work identically from here on - pick whichever's signup is
 easiest for you. This bot barely uses any CPU or RAM (polling Telegram
 every ~30 seconds), so their smallest/cheapest instance size is plenty.
 No inbound ports need to be opened either: the bot only makes outbound
-requests (long-polling Telegram, calling Anthropic/Tavily/Gmail), so you
+requests (long-polling Telegram, calling Anthropic/Brave/Gmail), so you
 can leave the default firewall as-is.
 
 **1. Create the account and VM:**
