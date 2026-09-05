@@ -81,10 +81,10 @@ class BudgetExceededError(RuntimeError):
 
 SYSTEM_PROMPT_BASE = (
     "You are the user's personal assistant, reachable over Telegram. You "
-    "have tools for a calculator, the current time, long-term memory "
-    "(remember/recall), and current weather (get_weather). When the user "
-    "shares a fact or preference worth keeping for future conversations, "
-    "call 'remember'. Keep replies short - they're read on a phone."
+    "have tools for long-term memory (remember/recall) and current weather "
+    "(get_weather). When the user shares a fact or preference worth keeping "
+    "for future conversations, call 'remember'. Keep replies short - "
+    "they're read on a phone."
 )
 
 
@@ -101,22 +101,6 @@ def _request_with_retry(method: str, url: str, attempts: int = 2, timeout: int =
 
 
 # ---- tools ------------------------------------------------------------
-
-def get_current_time() -> str:
-    import datetime
-
-    return datetime.datetime.now().isoformat()
-
-
-def calculator(expression: str) -> str:
-    allowed = set("0123456789+-*/(). ")
-    if not set(expression) <= allowed:
-        return "Error: expression contains disallowed characters."
-    try:
-        return str(eval(expression, {"__builtins__": {}}, {}))
-    except Exception as exc:
-        return f"Error: {exc}"
-
 
 def load_memory() -> list:
     if os.path.exists(MEMORY_PATH):
@@ -232,31 +216,12 @@ def send_email(to: str, subject: str, body: str) -> str:
             server.login(sender, app_password)
             server.sendmail(sender, [to], msg.as_string())
         return f"Email sent to {to}."
-    except smtplib.SMTPException as exc:
+    except (smtplib.SMTPException, OSError) as exc:
         return f"Error: failed to send email ({exc})"
 
 
 def build_tools() -> list:
     tools = [
-        {
-            "name": "get_current_time",
-            "description": "Get the current date and time.",
-            "input_schema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "calculator",
-            "description": "Evaluate a basic arithmetic expression, e.g. '2 + 2 * 3'.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "An arithmetic expression using +, -, *, /, and parentheses.",
-                    },
-                },
-                "required": ["expression"],
-            },
-        },
         {
             "name": "remember",
             "description": "Save a fact or preference about the user to long-term memory.",
@@ -325,10 +290,6 @@ def build_tools() -> list:
 
 
 def execute_tool(name: str, tool_input: dict) -> str:
-    if name == "get_current_time":
-        return get_current_time()
-    if name == "calculator":
-        return calculator(tool_input["expression"])
     if name == "remember":
         return remember(tool_input["fact"])
     if name == "recall":
@@ -411,7 +372,10 @@ class Agent:
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    result = execute_tool(block.name, block.input)
+                    try:
+                        result = execute_tool(block.name, block.input)
+                    except Exception as exc:
+                        result = f"Error: tool '{block.name}' failed ({exc})"
                     tool_results.append(
                         {"type": "tool_result", "tool_use_id": block.id, "content": result}
                     )
@@ -507,25 +471,34 @@ def main() -> None:
 
         for update in updates:
             offset = update["update_id"] + 1
-            message = update.get("message")
-            if not message or "text" not in message:
-                continue
-
-            chat_id = str(message["chat"]["id"])
-            if chat_id != allowed_chat_id:
-                print(f"Ignored message from unauthorized chat_id {chat_id}")
-                continue
-
-            text = message["text"]
-            print(f"You: {text}")
             try:
-                reply = agent.send(text)
-            except BudgetExceededError as exc:
-                reply = f"[stopped] {exc}"
-            print(f"Agent: {reply}")
-            send_telegram_reply(api_base, chat_id, reply)
+                message = update.get("message")
+                if not message or "text" not in message:
+                    continue
 
-        save_state(agent.messages, agent.total_cost_usd, offset)
+                chat_id = str(message["chat"]["id"])
+                if chat_id != allowed_chat_id:
+                    print(f"Ignored message from unauthorized chat_id {chat_id}")
+                    continue
+
+                text = message["text"]
+                print(f"You: {text}")
+                try:
+                    reply = agent.send(text)
+                except BudgetExceededError as exc:
+                    reply = f"[stopped] {exc}"
+                except Exception as exc:
+                    print(f"Warning: agent.send failed unexpectedly ({exc})")
+                    reply = "Sorry, something went wrong processing that message. Please try again."
+                print(f"Agent: {reply}")
+                send_telegram_reply(api_base, chat_id, reply)
+            finally:
+                # Save after every message, not just at the end of the batch -
+                # otherwise a crash partway through a batch (e.g. a transient
+                # API error) makes the process reload an older offset on
+                # restart and replay messages it already replied to (and, for
+                # send_email, already acted on).
+                save_state(agent.messages, agent.total_cost_usd, offset)
 
 
 if __name__ == "__main__":
