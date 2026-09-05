@@ -21,7 +21,7 @@ Type=simple
 User=root
 WorkingDirectory=/home/projects/Agentic-/simple_agent
 EnvironmentFile=/home/projects/Agentic-/simple_agent/telegram_bot.env
-ExecStart=/home/projects/Agentic-/simple_agent/.venv/bin/python telegram_bot.py
+ExecStart=/home/projects/Agentic-/simple_agent/myenv/bin/python telegram_bot.py
 Restart=always
 RestartSec=5
 
