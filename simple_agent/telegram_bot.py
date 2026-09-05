@@ -23,6 +23,16 @@ Commands:
                  deleted - see "Session files" below. Doesn't affect
                  long-term memory (remember/recall) or the lifetime cost
                  total that AGENT_MAX_COST_USD caps.
+  /sessions      List past sessions (most recently active first), numbered,
+                 with a preview of their first message, their cost, and
+                 when they were last active. Marks the current one.
+  /switch <n>    Switch to session <n> from the last /sessions list - its
+                 history becomes what gets sent to Claude from now on
+                 (replacing what's in memory), and the bot immediately
+                 replays that session's conversation back into the chat so
+                 you can see it (Telegram doesn't let a bot filter its own
+                 chat history, so this is how you get a recap instead of
+                 needing separate threads/chats per session).
 
 Session files:
   BOT_STATE_PATH is an *index* - which session is currently active, plus
@@ -496,6 +506,20 @@ def _load_session(session_id: str) -> dict:
     }
 
 
+def list_sessions() -> list:
+    """Session ids ordered most-recently-active first, by file mtime."""
+    if not os.path.isdir(SESSIONS_DIR):
+        return []
+    entries = []
+    for fname in os.listdir(SESSIONS_DIR):
+        if fname.endswith(".json"):
+            session_id = fname[: -len(".json")]
+            mtime = os.path.getmtime(os.path.join(SESSIONS_DIR, fname))
+            entries.append((session_id, mtime))
+    entries.sort(key=lambda entry: entry[1], reverse=True)
+    return entries
+
+
 def load_state() -> dict:
     if not os.path.exists(STATE_PATH):
         session_id = new_session_id("init")
@@ -597,6 +621,53 @@ def send_telegram_reply(api_base: str, chat_id: str, text: str) -> None:
         print(f"Warning: failed to send Telegram reply ({exc})")
 
 
+# Telegram caps a single sendMessage's text at 4096 chars; leave headroom
+# for whatever prefix (e.g. "Switched to session N...") gets prepended.
+RECAP_CHAR_LIMIT = 3500
+
+
+MAX_SESSIONS_LISTED = 30
+
+
+def format_session_list(entries: list, current_session_id: str) -> str:
+    if not entries:
+        return "No sessions yet."
+    total_count = len(entries)
+    entries = entries[:MAX_SESSIONS_LISTED]
+    lines = []
+    for i, (session_id, mtime) in enumerate(entries, start=1):
+        session = _load_session(session_id)
+        messages = session["messages"]
+        preview = messages[0]["content"] if messages else "(empty)"
+        if len(preview) > 40:
+            preview = preview[:40] + "..."
+        when = time.strftime("%b %d %H:%M", time.localtime(mtime))
+        marker = " (current)" if session_id == current_session_id else ""
+        lines.append(f"{i}. {when} - \"{preview}\" - ${session['session_cost_usd']:.4f}{marker}")
+    if total_count > MAX_SESSIONS_LISTED:
+        lines.append(f"\n...and {total_count - MAX_SESSIONS_LISTED} older session(s) not shown.")
+    lines.append("\nUse /switch <number> to switch to one.")
+    return "\n".join(lines)
+
+
+def format_recap(messages: list, limit: int = RECAP_CHAR_LIMIT) -> str:
+    if not messages:
+        return "(this session has no messages yet)"
+    lines = [f"{'You' if m['role'] == 'user' else 'Bot'}: {m['content']}" for m in messages]
+    recap = "\n".join(lines)
+    if len(recap) <= limit:
+        return recap
+
+    kept, total = [], 0
+    for line in reversed(lines):
+        total += len(line) + 1
+        if total > limit:
+            break
+        kept.append(line)
+    kept.reverse()
+    return f"[{len(lines) - len(kept)} earlier lines omitted]\n" + "\n".join(kept)
+
+
 def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     allowed_chat_id = str(os.environ["TELEGRAM_ALLOWED_CHAT_ID"])
@@ -649,6 +720,38 @@ def main() -> None:
                         "not deleted. (Long-term memory from 'remember' is "
                         "unaffected.)"
                     )
+                    print(f"Agent: {reply}")
+                    send_telegram_reply(api_base, chat_id, reply)
+                    continue
+
+                if text.strip().lower() == "/sessions":
+                    entries = list_sessions()
+                    reply = format_session_list(entries, session_id)
+                    print(f"Agent: {reply}")
+                    send_telegram_reply(api_base, chat_id, reply)
+                    continue
+
+                if text.strip().lower().startswith("/switch"):
+                    args = text.strip().split(maxsplit=1)
+                    entries = list_sessions()
+                    n = args[1].strip() if len(args) == 2 else ""
+                    if not n.isdigit() or not (1 <= int(n) <= len(entries)):
+                        reply = f"Usage: /switch <number> - see /sessions for the list (1-{len(entries)})."
+                    else:
+                        target_session_id, _ = entries[int(n) - 1]
+                        if target_session_id == session_id:
+                            reply = "Already on that session."
+                        else:
+                            session_id = target_session_id
+                            target = _load_session(session_id)
+                            agent.messages = target["messages"]
+                            agent.session_cost_usd = target["session_cost_usd"]
+                            print(f"Switched session: {session_id}")
+                            recap = format_recap(agent.messages)
+                            reply = (
+                                f"Switched to session {n} (cost so far "
+                                f"${agent.session_cost_usd:.4f}). Recap:\n\n{recap}"
+                            )
                     print(f"Agent: {reply}")
                     send_telegram_reply(api_base, chat_id, reply)
                     continue

@@ -223,6 +223,25 @@ also reports what the session you just left cost). Long-term memory
 (`remember`/`recall`) and the lifetime cost total aren't session-scoped —
 both carry over regardless of how many times you reset.
 
+**Switching back to a past session.** Send `/sessions` to list every
+session file (most recently active first), numbered, with a preview of
+its first message, its cost, and when it was last active — the current
+one is marked. Send `/switch <n>` to make session `n` the active one:
+its history replaces what's currently in memory (and what gets sent to
+the API from then on), and its own `session_cost_usd` picks up where it
+left off rather than resetting.
+
+Telegram doesn't give a bot any way to filter or hide its own chat's
+scrollback, so switching can't make old messages disappear from what
+you see in the app the way separate tabs/threads would. Instead,
+`/switch` immediately replays the target session's conversation back
+into the chat as a recap, so you can see what it contains right after
+switching without scrolling back through everything. A genuinely
+separate visual history per session would require moving to a Telegram
+group with Forum Topics enabled — a much larger change (topic creation,
+`message_thread_id` handling, a different security model) that this bot
+doesn't currently implement.
+
 *Upgrading from an older version:* if `BOT_STATE_PATH` still has the old
 flat format (messages and cost stored directly in it, no
 `active_session_id`), the bot migrates it automatically on first run —
