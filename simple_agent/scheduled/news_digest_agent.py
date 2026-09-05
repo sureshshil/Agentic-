@@ -11,22 +11,35 @@ state and lifetime AGENT_MAX_COST_USD cap.
 
 See ../deploy/cron-notifications.md for VPS cron setup.
 
-Env vars:
-  ANTHROPIC_API_KEY        required
+Env vars (loaded via python-dotenv, same pattern as telegram_bot.py -
+real environment variables always win; these files just fill in what
+isn't already set):
+  ANTHROPIC_API_KEY        required - from ../telegram_bot.env
   ANTHROPIC_WORKSPACE_ID   optional - see telegram_bot.py's docstring
-  TAVILY_API_KEY           required - without it the agent has no
-                           web_search tool and can't look up today's
-                           actual news instead of guessing from stale
-                           training knowledge
-  NTFY_TOPIC               required - same ntfy.sh topic as news_digest.py
-  NEWS_QUERY               optional, default "top world news today"
+  TAVILY_API_KEY           required, from ../telegram_bot.env - without
+                           it the agent has no web_search tool and can't
+                           look up today's actual news instead of
+                           guessing from stale training knowledge
+  NTFY_TOPIC               required, from ../deploy/scheduled.env - same
+                           ntfy.sh topic as news_digest.py
+  NEWS_QUERY               optional, default "top world news today",
+                           from ../deploy/scheduled.env
 """
 
 import os
 import sys
 
+from dotenv import load_dotenv
+
 # telegram_bot.py lives one directory up from this scheduled/ script.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_SIMPLE_AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _SIMPLE_AGENT_DIR)
+
+# telegram_bot.env covers ANTHROPIC_API_KEY/TAVILY_API_KEY (also loaded
+# again, harmlessly, when `from telegram_bot import Agent` runs below);
+# scheduled.env covers the vars only this script and rain_alert.py need.
+load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
+load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
 from telegram_bot import Agent  # noqa: E402 - needs the sys.path insert above
 

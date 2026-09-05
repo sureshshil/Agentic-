@@ -6,27 +6,32 @@ runs them as cron jobs on the same VPS that already hosts
 `telegram_bot.py` instead - same ntfy.sh notification channel as before,
 nothing about delivery has changed.
 
-Two new scripts, neither touching the originals:
+Two new files, neither touching the originals:
 
-- `rain_alert.py` runs completely unmodified - it's deterministic (no
-  LLM call), so there was nothing to gain from routing it through the
-  agent.
-- `news_digest_agent.py` is a new script that generates the digest using
-  the real `telegram_bot.Agent` (same tools, same system prompt as your
+- `rain_alert_cron.py` - a thin entry point that calls `rain_alert.py`'s
+  unmodified `main()`, after loading env vars via `load_dotenv()` (same
+  pattern `telegram_bot.py` itself uses) instead of requiring the
+  crontab command to `source` a file into the shell.
+- `news_digest_agent.py` - generates the digest using the real
+  `telegram_bot.Agent` (same tools, same system prompt as your
   interactive bot) instead of `news_digest.py`'s bespoke Tavily+Claude
   call, but still delivers over ntfy.sh via `news_digest.py`'s own
-  `send_notification()`, imported unmodified. `news_digest.py` itself is
-  left as-is and untouched - use it directly instead if you'd rather
-  keep the simpler, cheaper, non-agent version; either works.
+  `send_notification()`, imported unmodified. Also uses `load_dotenv()`
+  directly - no shell sourcing needed. `news_digest.py` itself is left
+  as-is and untouched - run it directly instead (with the same
+  shell-export approach as GitHub Actions used, since it doesn't call
+  `load_dotenv()`) if you'd rather keep the simpler, cheaper, non-agent
+  version.
 
-Neither script calls `load_dotenv()` itself (they expect real env vars,
-the way GitHub Actions' `env:` block provides them), so on a VPS the
-crontab command needs to export them into the shell before running
-Python. Reuse credentials already in `telegram_bot.env`
-(`ANTHROPIC_API_KEY`, `ANTHROPIC_WORKSPACE_ID`, `TAVILY_API_KEY`) plus a
-new `scheduled.env` for the handful of vars only these scripts need
-(`NTFY_TOPIC`, `ALERT_LOCATION`, `RAIN_THRESHOLD_MM`, `NEWS_QUERY`) - see
-`scheduled.env.example`.
+Both new scripts load env vars from two files, same fill-in-what's-unset
+behavior as `telegram_bot.py`'s own `load_dotenv()` call (real
+environment variables always win):
+
+- `../telegram_bot.env` - reuses `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`,
+  etc. that are already there for the bot.
+- `../deploy/scheduled.env` - the handful of vars only these scripts
+  need (`NTFY_TOPIC`, `ALERT_LOCATION`, `RAIN_THRESHOLD_MM`,
+  `NEWS_QUERY`) - see `scheduled.env.example`.
 
 ## Setup
 
@@ -37,20 +42,17 @@ new `scheduled.env` for the handful of vars only these scripts need
    # then edit simple_agent/deploy/scheduled.env
    ```
 
-2. Test both manually first, from the `simple_agent/scheduled/`
-   directory, sourcing both env files:
+2. Test both manually first - no need to source anything, `load_dotenv()`
+   handles it:
    ```bash
    cd /path/to/Agentic-/simple_agent/scheduled
-   set -a
-   source ../telegram_bot.env
-   source ../deploy/scheduled.env
-   set +a
-   python3 rain_alert.py
+   python3 rain_alert_cron.py
    python3 news_digest_agent.py
    ```
-   `rain_alert.py` only sends a notification if current conditions are
-   actually above threshold - lower `RAIN_THRESHOLD_MM` temporarily if
-   you want to force a test push. `news_digest_agent.py` always sends.
+   `rain_alert_cron.py` only sends a notification if current conditions
+   are actually above threshold - lower `RAIN_THRESHOLD_MM` temporarily
+   in `scheduled.env` if you want to force a test push.
+   `news_digest_agent.py` always sends.
 
 3. Add cron entries. Edit the crontab for whichever user runs
    `telegram_bot.py` (`crontab -e`, or `sudo -u <user> crontab -e` if it
@@ -58,19 +60,18 @@ new `scheduled.env` for the handful of vars only these scripts need
 
    ```cron
    # Weather alert - every 30 minutes
-   */30 * * * * /bin/bash -lc 'set -a; source /path/to/Agentic-/simple_agent/telegram_bot.env; source /path/to/Agentic-/simple_agent/deploy/scheduled.env; set +a; cd /path/to/Agentic-/simple_agent/scheduled && python3 rain_alert.py' >> /var/log/weather-alert.log 2>&1
+   */30 * * * * cd /path/to/Agentic-/simple_agent/scheduled && python3 rain_alert_cron.py >> /var/log/weather-alert.log 2>&1
 
    # News digest - once a day at 08:00 (agent-generated; swap in
-   # news_digest.py in place of news_digest_agent.py below for the
-   # simpler, cheaper, non-agent version instead)
-   0 8 * * * /bin/bash -lc 'set -a; source /path/to/Agentic-/simple_agent/telegram_bot.env; source /path/to/Agentic-/simple_agent/deploy/scheduled.env; set +a; cd /path/to/Agentic-/simple_agent/scheduled && python3 news_digest_agent.py' >> /var/log/news-digest.log 2>&1
+   # news_digest.py for the simpler, cheaper, non-agent version instead -
+   # but that one still needs the shell-export approach below since it
+   # doesn't call load_dotenv())
+   0 8 * * * cd /path/to/Agentic-/simple_agent/scheduled && python3 news_digest_agent.py >> /var/log/news-digest.log 2>&1
    ```
 
    Replace `/path/to/Agentic-` with the repo's actual path on the VPS,
    and `python3` with a full interpreter path (`which python3`) if
-   you're using a virtualenv. `-lc` (not just `-c`) so bash reads a login
-   profile - matters if `python3`/`pip` packages are only on `PATH`
-   inside one.
+   you're using a virtualenv.
 
 Cron has no journal the way systemd does - that's what the `>> ... 2>&1`
 redirect above is for; check those log files if an expected run doesn't
