@@ -90,9 +90,11 @@ class BudgetExceededError(RuntimeError):
 SYSTEM_PROMPT_BASE = (
     "You are the user's personal assistant, reachable over Telegram. You "
     "have tools for long-term memory (remember/recall) and current weather "
-    "(get_weather). When the user shares a fact or preference worth keeping "
-    "for future conversations, call 'remember'. Keep replies short - "
-    "they're read on a phone."
+    "(get_weather). Only call 'get_weather' when the user explicitly asks "
+    "about weather or conditions somewhere - don't reach for it for "
+    "anything else. When the user shares a fact or preference worth "
+    "keeping for future conversations, call 'remember'. Keep replies "
+    "short - they're read on a phone."
 )
 
 
@@ -330,7 +332,13 @@ class Agent:
     def _system_prompt(self) -> str:
         parts = [SYSTEM_PROMPT_BASE]
         if os.environ.get("TAVILY_API_KEY"):
-            parts.append("Use 'web_search' for current events or anything you're not sure about.")
+            parts.append(
+                "'web_search' is your default tool for anything factual, "
+                "current, or that you're not fully sure about - reach for "
+                "it before answering from memory or guessing. Use "
+                "'get_weather' and 'send_email' only for what they're each "
+                "explicitly for, not as a substitute for web_search."
+            )
         if os.environ.get("EMAIL_ADDRESS") and os.environ.get("EMAIL_APP_PASSWORD"):
             parts.append(
                 "Only call 'send_email' when the user explicitly asks you to "
