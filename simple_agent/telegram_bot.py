@@ -40,9 +40,14 @@ Commands:
                  of the cap.
 
 Long-term memory: 'remember' skips a fact that's already stored (exact
-match, case-insensitive) instead of piling up duplicates. 'recall' lists
-facts numbered; 'forget <number>' (a tool the model calls, not a Telegram
-command) removes one by that number.
+match, case-insensitive) instead of piling up duplicates, and stamps each
+fact with the date it was remembered so the model can tell which is more
+current if two ever conflict. Capped at AGENT_MAX_MEMORY_FACTS facts -
+once full, the oldest fact is dropped automatically so memory can't grow
+the system prompt (and therefore the cost of every single turn) without
+bound. 'recall' lists facts numbered with their date; 'forget <number>'
+(a tool the model calls, not a Telegram command) removes one by that
+number.
 
 Session files:
   BOT_STATE_PATH is an *index* - which session is currently active, plus
@@ -78,6 +83,9 @@ Env vars:
                             round trips within a single reply, independent
                             of AGENT_MAX_COST_USD; stops a runaway tool
                             loop fast instead of only via the cost cap
+  AGENT_MAX_MEMORY_FACTS    optional, default 50 - caps long-term memory;
+                            once full, 'remember' drops the oldest fact to
+                            make room for the new one
   BOT_STATE_PATH            optional, default ".telegram_bot_state.json"
                             - the session index, see "Session files" above
   BOT_SESSIONS_DIR          optional, default ".telegram_bot_sessions"
@@ -138,6 +146,10 @@ def cost_warning(total_cost_usd: float, cap: float) -> str:
 STATE_PATH = os.environ.get("BOT_STATE_PATH", ".telegram_bot_state.json")
 SESSIONS_DIR = os.environ.get("BOT_SESSIONS_DIR", ".telegram_bot_sessions")
 MEMORY_PATH = os.environ.get("BOT_MEMORY_PATH", ".telegram_bot_memory.json")
+# Bounds long-term memory so it can't grow the system prompt (and the cost
+# of every single future turn) without limit - once full, 'remember' drops
+# the oldest fact to make room, rather than accumulating forever.
+MAX_MEMORY_FACTS = int(os.environ.get("AGENT_MAX_MEMORY_FACTS", "50"))
 MAX_PAUSE_RESUMES = 10
 # Hard cap on tool_use round trips within a single turn, independent of
 # MAX_COST_USD - a runaway tool loop (model never reaching end_turn) would
@@ -218,14 +230,24 @@ def _request_with_retry(method: str, url: str, attempts: int = 2, timeout: int =
 # ---- tools ------------------------------------------------------------
 
 def load_memory() -> list:
+    """Each entry is {"fact": str, "remembered_at": "YYYY-MM-DD" or None}."""
     if not os.path.exists(MEMORY_PATH):
         return []
     try:
         with open(MEMORY_PATH) as f:
-            return json.load(f)
+            raw = json.load(f)
     except json.JSONDecodeError:
         print(f"Warning: {MEMORY_PATH} is corrupted; ignoring it.")
         return []
+
+    if raw and isinstance(raw[0], str):
+        # One-time migration from the old format (a bare list of fact
+        # strings, no date). Existing facts get remembered_at=None ("known
+        # before dating was added") rather than a fabricated date.
+        migrated = [{"fact": fact, "remembered_at": None} for fact in raw]
+        save_memory(migrated)
+        return migrated
+    return raw
 
 
 def save_memory(memory: list) -> None:
@@ -235,10 +257,23 @@ def save_memory(memory: list) -> None:
 
 def remember(fact: str) -> str:
     memory = load_memory()
-    if any(existing.strip().lower() == fact.strip().lower() for existing in memory):
+    if any(entry["fact"].strip().lower() == fact.strip().lower() for entry in memory):
         return f"Already remembered: {fact}"
-    memory.append(fact)
+    memory.append({"fact": fact, "remembered_at": time.strftime("%Y-%m-%d", time.gmtime())})
+
+    evicted = None
+    if len(memory) > MAX_MEMORY_FACTS:
+        evicted = memory.pop(0)
     save_memory(memory)
+
+    if evicted:
+        return (
+            f"Remembered: {fact}\n"
+            f"(Memory was at the {MAX_MEMORY_FACTS}-fact cap, so the oldest "
+            f"fact was dropped to make room: \"{evicted['fact']}\". Call "
+            "'forget' proactively on facts you no longer need if you want "
+            "to control what gets dropped.)"
+        )
     return f"Remembered: {fact}"
 
 
@@ -246,7 +281,10 @@ def recall() -> str:
     memory = load_memory()
     if not memory:
         return "No memories stored yet."
-    return "\n".join(f"{i}. {fact}" for i, fact in enumerate(memory, start=1))
+    return "\n".join(
+        f"{i}. [{entry['remembered_at'] or 'date unknown'}] {entry['fact']}"
+        for i, entry in enumerate(memory, start=1)
+    )
 
 
 def forget(index: int) -> str:
@@ -255,7 +293,7 @@ def forget(index: int) -> str:
         return f"Error: no fact numbered {index}. Use 'recall' to see valid numbers."
     removed = memory.pop(index - 1)
     save_memory(memory)
-    return f"Forgot: {removed}"
+    return f"Forgot: {removed['fact']}"
 
 
 def get_weather(location: str) -> str:
@@ -519,8 +557,17 @@ class Agent:
             )
         facts = load_memory()
         if facts:
-            facts_block = "\n".join(f"- {fact}" for fact in facts)
-            parts.append(f"Things you remember about the user:\n{facts_block}")
+            facts_block = "\n".join(
+                f"- ({entry['remembered_at'] or 'date unknown'}) {entry['fact']}"
+                for entry in facts
+            )
+            parts.append(
+                "Things you remember about the user (dated):\n"
+                f"{facts_block}\n\n"
+                "If two remembered facts appear to conflict, trust the one "
+                "with the more recent date and treat the older one as "
+                "possibly outdated rather than silently picking one."
+            )
         return "\n\n".join(parts)
 
     def _run_turn(self):
