@@ -13,6 +13,15 @@ messages the bot is silently ignored - several of these tools have real
 side effects (sending email, spending your Anthropic budget), so the bot
 must not act on messages from strangers who find its username.
 
+Commands:
+  /reset, /new   Clear conversation history and start fresh. Conversation
+                 history only ever grows otherwise (every reply resends
+                 the full history to the API - see README's "Managing
+                 conversation history" section), so this is how you bound
+                 it day to day without SSHing in to edit the state file.
+                 Doesn't affect long-term memory (remember/recall) or the
+                 running cost total.
+
 Env vars:
   ANTHROPIC_API_KEY         required
   ANTHROPIC_WORKSPACE_ID    optional - see README's workspace-id section
@@ -67,6 +76,13 @@ STATE_PATH = os.environ.get("BOT_STATE_PATH", ".telegram_bot_state.json")
 MEMORY_PATH = os.environ.get("BOT_MEMORY_PATH", ".telegram_bot_memory.json")
 MAX_PAUSE_RESUMES = 10
 TAVILY_MAX_RESULTS = 3
+
+# Typed in Telegram to start a new conversation - conversation history only
+# ever grows otherwise (see README's "Managing conversation history"
+# section), so this is the way to bound it without SSHing in to delete
+# .telegram_bot_state.json by hand. Doesn't touch long-term memory
+# (remember/recall) or the running cost total - those are meant to persist.
+RESET_COMMANDS = {"/reset", "/new"}
 
 WMO_CODES = {
     0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
@@ -499,6 +515,17 @@ def main() -> None:
 
                 text = message["text"]
                 print(f"You: {text}")
+
+                if text.strip().lower() in RESET_COMMANDS:
+                    agent.messages = []
+                    reply = (
+                        "Started a new conversation - previous history cleared. "
+                        "(Long-term memory from 'remember' is unaffected.)"
+                    )
+                    print(f"Agent: {reply}")
+                    send_telegram_reply(api_base, chat_id, reply)
+                    continue
+
                 try:
                     reply = agent.send(text)
                 except BudgetExceededError as exc:

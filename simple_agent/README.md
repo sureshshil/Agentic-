@@ -196,6 +196,19 @@ replies with a "[stopped]" message instead of calling the model — delete
 `BOT_STATE_PATH` (default `.telegram_bot_state.json`) or raise the cap to
 continue.
 
+**Managing conversation history.** `agent.messages` is saved to
+`BOT_STATE_PATH` after every message and reloaded on every restart —
+including a systemd restart — so the conversation survives crashes and
+redeploys. But nothing trims it automatically: every turn you've ever sent
+stays in there, and each new reply resends that *entire* history to the
+API (it's a stateless API - there's no server-side session to trim). Two
+consequences of that: input cost creeps up over time, and eventually the
+history can exceed the model's context window, after which every message
+fails the same way until the history shrinks. Send `/reset` or `/new`
+from Telegram at any time to clear it and start fresh — it doesn't touch
+long-term memory (`remember`/`recall`) or the running cost total, both of
+which are meant to persist.
+
 **Hosting — this needs to stay running, unlike everything else in this
 repo.** GitHub Actions (used for `scheduled/` below) only runs on a
 schedule/trigger and can't host a persistent process. Quickest way to try
