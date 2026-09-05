@@ -64,6 +64,8 @@ Env vars:
                             once, then check notebook 08's discover_chat_id
                             or https://api.telegram.org/bot<token>/getUpdates)
   TAVILY_API_KEY            optional - enables the web_search tool
+  TAVILY_SEARCH_DEPTH       optional, default "basic" - set to "advanced"
+                            for deeper (and ~2x credit cost) Tavily search
   EMAIL_ADDRESS             optional - enables send_email (Gmail address)
   EMAIL_APP_PASSWORD        optional - Gmail App Password, see notebook 05
   AGENT_MAX_COST_USD        optional, default 1.00 - a running total that
@@ -132,6 +134,10 @@ SESSIONS_DIR = os.environ.get("BOT_SESSIONS_DIR", ".telegram_bot_sessions")
 MEMORY_PATH = os.environ.get("BOT_MEMORY_PATH", ".telegram_bot_memory.json")
 MAX_PAUSE_RESUMES = 10
 TAVILY_MAX_RESULTS = 3
+# "basic" (default, 1 credit/search) is fine for quick lookups; "advanced"
+# (2 credits/search) digs deeper and tends to help with recent or niche
+# topics a shallow crawl misses. Tavily rejects any other value.
+TAVILY_SEARCH_DEPTH = os.environ.get("TAVILY_SEARCH_DEPTH", "basic")
 
 # Typed in Telegram to start a new conversation - conversation history only
 # ever grows otherwise (see README's "Managing conversation history"
@@ -161,12 +167,20 @@ class BudgetExceededError(RuntimeError):
 
 SYSTEM_PROMPT_BASE = (
     "You are the user's personal assistant, reachable over Telegram. You "
-    "have tools for long-term memory (remember/recall) and current weather "
-    "(get_weather). Only call 'get_weather' when the user explicitly asks "
-    "about weather or conditions somewhere - don't reach for it for "
-    "anything else. When the user shares a fact or preference worth "
-    "keeping for future conversations, call 'remember'. Keep replies "
-    "short - they're read on a phone."
+    "have tools for long-term memory (remember/recall/forget) and current "
+    "weather (get_weather). Only call 'get_weather' when the user explicitly "
+    "asks about weather or conditions somewhere - don't reach for it for "
+    "anything else. Keep replies short - they're read on a phone.\n\n"
+    "Formatting: reply in plain text only. Telegram will show Markdown or "
+    "HTML syntax (*bold*, _italic_, <b>, etc.) as literal characters, not "
+    "rendered formatting, so don't use it.\n\n"
+    "Tool errors: if a tool result starts with 'Error:', tell the user what "
+    "went wrong in plain language - never guess, invent, or paper over a "
+    "failed lookup as if it succeeded.\n\n"
+    "Memory: only call 'remember' for durable facts or preferences that "
+    "should still matter in a future conversation (e.g. dietary "
+    "restrictions, timezone, ongoing projects) - not incidental details "
+    "from a single one-off question."
 )
 
 
@@ -282,6 +296,7 @@ def web_search(query: str) -> str:
                 "max_results": TAVILY_MAX_RESULTS,
                 "chunks_per_source": 1,
                 "include_answer": "basic",
+                "search_depth": TAVILY_SEARCH_DEPTH,
             },
         )
     except requests.RequestException as exc:
