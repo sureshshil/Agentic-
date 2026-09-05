@@ -74,6 +74,10 @@ Env vars:
                             never resets on its own since this process
                             keeps running; delete BOT_STATE_PATH or raise
                             this to keep going once it's hit
+  AGENT_MAX_TOOL_ITERATIONS optional, default 15 - hard cap on tool_use
+                            round trips within a single reply, independent
+                            of AGENT_MAX_COST_USD; stops a runaway tool
+                            loop fast instead of only via the cost cap
   BOT_STATE_PATH            optional, default ".telegram_bot_state.json"
                             - the session index, see "Session files" above
   BOT_SESSIONS_DIR          optional, default ".telegram_bot_sessions"
@@ -135,6 +139,12 @@ STATE_PATH = os.environ.get("BOT_STATE_PATH", ".telegram_bot_state.json")
 SESSIONS_DIR = os.environ.get("BOT_SESSIONS_DIR", ".telegram_bot_sessions")
 MEMORY_PATH = os.environ.get("BOT_MEMORY_PATH", ".telegram_bot_memory.json")
 MAX_PAUSE_RESUMES = 10
+# Hard cap on tool_use round trips within a single turn, independent of
+# MAX_COST_USD - a runaway tool loop (model never reaching end_turn) would
+# otherwise only ever be stopped by burning through the *lifetime* cost
+# cap, which is both slow (real, blocking API calls) and unfair to future
+# turns that had nothing to do with the loop.
+MAX_TOOL_ITERATIONS = int(os.environ.get("AGENT_MAX_TOOL_ITERATIONS", "15"))
 TAVILY_MAX_RESULTS = 3
 # "basic" (default, 1 credit/search) is fine for quick lookups; "advanced"
 # (2 credits/search) digs deeper and tends to help with recent or niche
@@ -164,6 +174,10 @@ WMO_CODES = {
 
 
 class BudgetExceededError(RuntimeError):
+    pass
+
+
+class ToolLoopLimitError(RuntimeError):
     pass
 
 
@@ -511,6 +525,7 @@ class Agent:
 
     def _run_turn(self):
         resumes = 0
+        tool_iterations = 0
         while True:
             if self.total_cost_usd >= MAX_COST_USD:
                 raise BudgetExceededError(
@@ -543,6 +558,16 @@ class Agent:
 
             if response.stop_reason != "tool_use":
                 return response
+
+            tool_iterations += 1
+            if tool_iterations > MAX_TOOL_ITERATIONS:
+                raise ToolLoopLimitError(
+                    f"Stopped after {MAX_TOOL_ITERATIONS} tool calls in one "
+                    "reply without reaching a final answer (AGENT_MAX_TOOL_"
+                    "ITERATIONS) - this guards against a runaway tool loop, "
+                    "independent of the cost cap. Try rephrasing or "
+                    "breaking your request into smaller steps."
+                )
 
             tool_results = []
             for block in response.content:
@@ -885,7 +910,7 @@ def main() -> None:
                 try:
                     reply = agent.send(text)
                     reply += cost_warning(agent.total_cost_usd, MAX_COST_USD)
-                except BudgetExceededError as exc:
+                except (BudgetExceededError, ToolLoopLimitError) as exc:
                     reply = f"[stopped] {exc}"
                 except Exception as exc:
                     print(f"Warning: agent.send failed unexpectedly ({exc})")
