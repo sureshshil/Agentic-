@@ -393,7 +393,11 @@ def web_search(query: str, search_depth: str | None = None) -> str:
 
 
 def send_email(to: str, subject: str, body: str) -> str:
-    """Send via Gmail SMTP using an App Password - see notebook 05."""
+    """Send via Gmail SMTP using an App Password - see notebook 05.
+
+    Uses port 587 (STARTTLS) rather than 465 (implicit SSL): many VPS
+    providers (Hetzner in particular, by default on new accounts) block
+    outbound 465 as an anti-spam measure but leave 587 open."""
     sender = os.environ.get("EMAIL_ADDRESS")
     app_password = os.environ.get("EMAIL_APP_PASSWORD")
     if not sender or not app_password:
@@ -405,7 +409,8 @@ def send_email(to: str, subject: str, body: str) -> str:
     msg["To"] = to
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+            server.starttls()
             server.login(sender, app_password)
             server.sendmail(sender, [to], msg.as_string())
         return f"Email sent to {to}."
