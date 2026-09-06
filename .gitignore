@@ -11,6 +11,7 @@ gmail_token.json
 .telegram_bot_state.json
 .telegram_bot_memory.json
 telegram_bot.env
+scheduled.env
 simple_agent/abc
 simple_agent/abc.pub
 simple_agent/add

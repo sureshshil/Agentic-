@@ -571,6 +571,11 @@ class Agent:
         # Just the active session - reset to 0.0 by /reset, stored inside
         # that session's own file. Purely informational, no cap of its own.
         self.session_cost_usd = 0.0
+        # Raw token counts behind session_cost_usd above - not persisted
+        # anywhere, just readable after send() for scripts (e.g.
+        # scheduled/vocab_drip.py) that want token counts, not just $.
+        self.session_input_tokens = 0
+        self.session_output_tokens = 0
         self.tools = build_tools()
 
     def _system_prompt(self) -> list:
@@ -702,6 +707,8 @@ class Agent:
             ) / 1_000_000
             self.total_cost_usd += cost_delta
             self.session_cost_usd += cost_delta
+            self.session_input_tokens += response.usage.input_tokens
+            self.session_output_tokens += response.usage.output_tokens
             self.messages.append({"role": "assistant", "content": response.content})
 
             if response.stop_reason == "pause_turn":

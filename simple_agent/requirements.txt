@@ -1,3 +1,4 @@
 anthropic
 requests
 python-dotenv
+google-auth  # only for scheduled/vocab_sinks.py's optional Google Doc sink
