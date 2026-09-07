@@ -17,5 +17,13 @@ jobs:
       - run: python simple_agent/scheduled/rain_alert.py
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          ALERT_LAT: ${{ vars.ALERT_LAT }}
+          ALERT_LON: ${{ vars.ALERT_LON }}
+          ALERT_LABEL: ${{ vars.ALERT_LABEL }}
           ALERT_LOCATION: ${{ vars.ALERT_LOCATION || secrets.ALERT_LOCATION }}
+          ALERT_CONTACT: ${{ vars.ALERT_CONTACT }}
           RAIN_THRESHOLD_MM: ${{ vars.RAIN_THRESHOLD_MM || secrets.RAIN_THRESHOLD_MM }}
+          ALERT_LOOKAHEAD_HOURS: ${{ vars.ALERT_LOOKAHEAD_HOURS }}
+          # Actions runners are ephemeral, so the cooldown state file
+          # never survives between runs - dedupe has to be off here.
+          ALERT_COOLDOWN_MIN: "0"

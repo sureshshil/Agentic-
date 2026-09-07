@@ -67,9 +67,13 @@ call (real environment variables always win):
    ```bash
    python3 vocab_drip.py
    ```
-   `rain_alert_cron.py` only sends a notification if current conditions
-   are actually above threshold - lower `RAIN_THRESHOLD_MM` temporarily
-   in `scheduled.env` if you want to force a test push.
+   `rain_alert_cron.py` only sends a notification if rain above
+   threshold is actually forecast within the next
+   `ALERT_LOOKAHEAD_HOURS` - lower `RAIN_THRESHOLD_MM` temporarily in
+   `scheduled.env` if you want to force a test push. Note that a
+   successful send starts the `ALERT_COOLDOWN_MIN` cooldown (default 180
+   min), so a second test run right afterwards will deliberately stay
+   quiet; delete `../.rain_alert_state.json` to clear it.
    `news_digest_agent.py` and `vocab_drip.py` always send.
 
 3. Add cron entries. Edit the crontab for whichever user runs
@@ -86,8 +90,8 @@ call (real environment variables always win):
    # doesn't call load_dotenv())
    0 8 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 news_digest_agent.py >> /var/log/news-digest.log 2>&1
 
-   # Japanese vocab drip - every 4 hours
-   0 */4 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 vocab_drip.py >> /var/log/vocab-drip.log 2>&1
+   # Japanese vocab drip - every 2 hours
+   0 */2 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 vocab_drip.py >> /var/log/vocab-drip.log 2>&1
    ```
 
    Replace `/path/to/Agentic-` with the repo's actual path on the VPS,

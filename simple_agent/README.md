@@ -356,21 +356,46 @@ tier).
 
 | Script | Runs | Uses Claude? | Approx. cost/run |
 |---|---|---|---|
-| `scheduled/rain_alert.py` | Every 30 min (`*/30 * * * *`) | No | $0 — plain Open-Meteo + ntfy.sh, no LLM call at all |
+| `scheduled/rain_alert.py` | Every 30 min (`*/30 * * * *`) | No | $0 — plain MET Norway + ntfy.sh, no LLM call at all |
 | `scheduled/news_digest.py` | Daily, 23:00 UTC = 08:00 JST (`0 23 * * *`) | Yes, once per run | ~$0.001–0.003 (one fixed Tavily search + one Claude summarization call, not an open-ended agent loop) |
 
-**Why `rain_alert.py` skips Claude entirely:** "is it raining heavily"
-is a deterministic check (a WMO weather code or precipitation reading
-crossing a threshold), not something that needs judgment. Reaching for
-an LLM here would just add cost and a point of failure for zero benefit
-— plain Python is the correct tool. It only sends a notification when
-conditions actually cross the "heavy" threshold (`RAIN_THRESHOLD_MM`,
-default 7.5mm/hour, or specific storm/thunderstorm codes) — checking
-every 30 minutes doesn't mean 48 notifications a day, only sporadic ones
-when something is actually happening. Note: as written, it re-alerts on
-every run while heavy conditions persist (no dedup/cooldown) - fine for
-"tell me it's still storming," easy to add a cooldown later if it gets
-noisy.
+**Why `rain_alert.py` skips Claude entirely:** "is heavy rain coming"
+is a deterministic check (a forecast precipitation figure crossing a
+threshold), not something that needs judgment. Reaching for an LLM here
+would just add cost and a point of failure for zero benefit — plain
+Python is the correct tool.
+
+**Why it reads the forecast, not current conditions:** the first version
+of this script checked what was falling *right now*, which meant the
+notification arrived once you were already out in it. It now asks MET
+Norway for the next `ALERT_LOOKAHEAD_HOURS` (default 6) and reports the
+worst hour in that window with its lead time — "Heavy rain in ~3h
+(around 04:00) - 14.1 mm expected" — which is early enough to be worth
+acting on.
+
+**Why MET Norway rather than Open-Meteo:** the notebooks use Open-Meteo
+for current conditions and it's fine at that. The alert needs hourly
+precipitation forecasts with a severity symbol per hour, which MET
+Norway's `locationforecast` returns directly, still with no API key or
+signup. Their terms ask for a `User-Agent` naming the app and a contact
+address — that's `ALERT_CONTACT`. Geocoding is still Open-Meteo's
+geocoder, which is a separate service from their forecast API.
+
+**Two things that made the original useless, worth knowing about:**
+
+- `geocode()` returned `results[0]` with no disambiguation. "Hanahata"
+  matches both a neighbourhood in Adachi-ku, Tokyo *and* one in Fukuoka
+  900 km away — so the alert quietly reported the wrong city's weather.
+  Set `ALERT_LAT`/`ALERT_LON` to pin a location exactly; the script now
+  also prints a warning when a name is ambiguous.
+- `RAIN_THRESHOLD_MM=0` made `precipitation >= threshold` true on clear,
+  dry days, so it pushed a notification on every single run. A threshold
+  of 0 now means "any measurable rain" (0.1 mm), not "always".
+
+It also keeps a cooldown (`ALERT_COOLDOWN_MIN`, default 180) in a small
+gitignored state file, so a storm parked over the city for three hours
+is one push rather than six. GitHub Actions runners are ephemeral and
+can't persist that file between runs, so the workflow sets it to `0`.
 
 **Why `news_digest.py` does use Claude:** summarizing search results
 into a readable digest is exactly what an LLM is good at, unlike the
@@ -387,7 +412,14 @@ notebooks' `BudgetExceededError` machinery.
      (news digest only)
    - `TAVILY_API_KEY` (news digest only)
 3. Under **Variables** (not secret, but optional overrides):
-   - `ALERT_LOCATION` (default `Tokyo, Japan` if unset)
+   - `ALERT_LAT` + `ALERT_LON` — exact coordinates, and `ALERT_LABEL` for
+     what to call the place in the message. Prefer these over
+     `ALERT_LOCATION` for any place name more than one town shares.
+   - `ALERT_LOCATION` (default `Tokyo, Japan` if unset) — geocoded, and
+     only used when `ALERT_LAT`/`ALERT_LON` aren't set
+   - `ALERT_CONTACT` — contact address for the MET Norway `User-Agent`
+   - `RAIN_THRESHOLD_MM` (default `7.5`), `ALERT_LOOKAHEAD_HOURS`
+     (default `6`)
    - `NEWS_QUERY` (default `top world news today` if unset)
 4. Commit and push — the workflows activate automatically once they're on
    the repo's default branch. (Scheduled workflows only run from the
