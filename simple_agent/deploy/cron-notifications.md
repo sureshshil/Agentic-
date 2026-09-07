@@ -22,19 +22,22 @@ Three new files, neither touching the originals:
   shell-export approach as GitHub Actions used, since it doesn't call
   `load_dotenv()`) if you'd rather keep the simpler, cheaper, non-agent
   version.
-- `vocab_drip.py` - generates a batch of JLPT-level Japanese vocabulary
-  (word, part of speech, nuance, confusable pairs, particle affinity, 3
-  example sentences each) using a fresh `telegram_bot.Agent` instance,
-  and delivers it via `telegram_bot.send_telegram_reply()` straight to
-  your Telegram chat - *not* over ntfy.sh, since this content is long-form
-  and reads better as a chat message than a push notification. It calls
-  `send_telegram_reply()` directly rather than going through the
-  interactive bot's session loop, so these drips never touch
-  `.telegram_bot_state.json` or any session file - they show up as their
-  own messages and don't interrupt or mix into whatever you're chatting
-  about with the bot. Keeps a small history file
+- `vocab_drip.py` - sends a batch of JLPT-level Japanese vocabulary (word,
+  reading, English + Nepali gloss, 助詞 particle patterns, 3 example
+  sentences each) drawn from the hand-curated TSV files in `simple_agent/`
+  (`N3_vocab_batch*.tsv` by default, override with `VOCAB_TSV_GLOB`) -
+  *no* LLM call. It delivers via `telegram_bot.send_telegram_reply()`
+  straight to your Telegram chat - *not* over ntfy.sh, since this content
+  is long-form and reads better as a chat message than a push
+  notification. It calls `send_telegram_reply()` directly rather than
+  going through the interactive bot's session loop, so these drips never
+  touch `.telegram_bot_state.json` or any session file - they show up as
+  their own messages and don't interrupt or mix into whatever you're
+  chatting about with the bot. Keeps a small history file
   (`../.vocab_sent_words.json`, gitignored like the other state files) of
-  words already sent so it doesn't repeat itself.
+  headwords already sent: never-sent words go out first in rank order,
+  then once every word has been sent the least-recently-sent come back
+  around for review (history capped at 300 entries).
 
 All three new scripts load env vars from two files, same
 fill-in-what's-unset behavior as `telegram_bot.py`'s own `load_dotenv()`
@@ -114,10 +117,9 @@ message, handled by `scheduled/vocab_sinks.py`:
 - **Notion database** - a browsable archive: one row **per word**, with
   `Reading` / `Meaning` / `Particle` (助詞) / `Type` / `JLPT` columns and
   the 3 example sentences in `Example 1` / `Example 2` / `Example 3`. The
-  data comes from a hidden JSON block the model appends after the vocab
-  text (`---DATA---`), which also drives the local history file; a
-  formatting slip there just skips that run's rows, the Telegram drip is
-  unaffected.
+  data comes straight from the TSV columns for that run's words; if the
+  Notion API call fails the run's rows are just skipped and the Telegram
+  drip is unaffected.
 - **Google Doc** - a single ever-growing doc to use as a **NotebookLM**
   source for audio overviews, flashcards, infographics. NotebookLM
   re-syncs a Drive doc on demand, so this is one source you refresh, not
