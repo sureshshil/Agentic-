@@ -4,10 +4,17 @@ instead of news_digest.py's bespoke Tavily+Claude call. Delivered over
 the same ntfy.sh channel as news_digest.py - reuses its
 send_notification() directly, unmodified.
 
-Cost: one full agent turn (a web_search call plus a synthesis reply) at
-claude-haiku-4-5 rates - a few cents at most. Uses a fresh Agent()
-instance, entirely separate from telegram_bot.py's persisted session
-state and lifetime AGENT_MAX_COST_USD cap.
+Cost: one full agent turn - a web_search call plus a synthesis reply - on
+whatever MODEL telegram_bot.py uses (currently claude-sonnet-5). In
+practice ~$0.02/run; each run appends its own token counts and a running
+lifetime total to ../.news_digest_usage.json and prints them to the cron
+log, so `cat ../.news_digest_usage.json` shows exactly what this job has
+spent. Uses a fresh Agent() instance, entirely separate from
+telegram_bot.py's persisted session state and lifetime
+AGENT_MAX_COST_USD cap - that $1.00 cap therefore acts as a per-run
+ceiling here. AGENT_MAX_TOOL_ITERATIONS is pinned to 10 below (vs. the
+interactive default of 15): this job should only ever need one search,
+occasionally two, so a tighter cap bounds a misfiring search loop.
 
 See ../deploy/cron-notifications.md for VPS cron setup.
 
@@ -24,8 +31,12 @@ isn't already set):
                            ntfy.sh topic as news_digest.py
   NEWS_QUERY               optional, default "top world news today",
                            from ../deploy/scheduled.env
+  AGENT_MAX_TOOL_ITERATIONS optional - defaults to 10 for this script if
+                           unset (see above); a real env var or a value
+                           in scheduled.env still overrides it
 """
 
+import json
 import os
 import sys
 
@@ -41,11 +52,35 @@ sys.path.insert(0, _SIMPLE_AGENT_DIR)
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
+# Must be set before `import telegram_bot` - it reads AGENT_MAX_TOOL_
+# ITERATIONS into a module-level constant at import time. setdefault, so
+# an explicit env var or a scheduled.env entry still wins.
+os.environ.setdefault("AGENT_MAX_TOOL_ITERATIONS", "10")
+
 from telegram_bot import Agent  # noqa: E402 - needs the sys.path insert above
 
 import news_digest  # noqa: E402 - reuses its send_notification() unmodified
 
 NEWS_QUERY = os.environ.get("NEWS_QUERY") or "top world news today"
+
+# Cumulative token/cost usage across all runs of this script - separate
+# from telegram_bot.py's own lifetime AGENT_MAX_COST_USD tracking, since
+# this always uses a fresh, throwaway Agent() with no persisted cost.
+# Same pattern as scheduled/vocab_drip.py's .vocab_usage.json.
+USAGE_PATH = os.path.join(_SIMPLE_AGENT_DIR, ".news_digest_usage.json")
+
+
+def _load_usage() -> dict:
+    try:
+        with open(USAGE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"runs": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+
+
+def _save_usage(usage: dict) -> None:
+    with open(USAGE_PATH, "w", encoding="utf-8") as f:
+        json.dump(usage, f, ensure_ascii=False, indent=2)
 
 
 def main() -> None:
@@ -59,12 +94,29 @@ def main() -> None:
 
     agent = Agent()
     digest = agent.send(
-        f"Search the web for {NEWS_QUERY} and summarize it into a short "
-        "digest, 5-8 points max, suitable for a push notification read on "
-        "a phone lock screen. Plain text only, one dash-prefixed point per "
-        "line, no markdown."
+        f"Search the web for {NEWS_QUERY} and write a short digest of the "
+        "top distinct stories: 5-8 points, 8 absolute maximum. Combine "
+        "related headlines into a single point and never list the same "
+        "story or company twice - a tight list of 6 beats a padded list "
+        "of 13. One search is normally enough. Plain text for a phone "
+        "lock screen: one point per line starting with '- ', no markdown, "
+        "no bold, no headings."
     )
     print(digest)
+
+    usage = _load_usage()
+    usage["runs"] += 1
+    usage["input_tokens"] += agent.session_input_tokens
+    usage["output_tokens"] += agent.session_output_tokens
+    usage["cost_usd"] += agent.session_cost_usd
+    _save_usage(usage)
+    print(
+        f"\n[usage] this run: {agent.session_input_tokens} in / "
+        f"{agent.session_output_tokens} out tokens, ${agent.session_cost_usd:.4f} "
+        f"| lifetime ({usage['runs']} runs): {usage['input_tokens']} in / "
+        f"{usage['output_tokens']} out tokens, ${usage['cost_usd']:.4f}"
+    )
+
     news_digest.send_notification("Daily News Digest", digest)
 
 
