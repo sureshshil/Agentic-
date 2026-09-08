@@ -66,7 +66,6 @@ NEWS_QUERY = os.environ.get("NEWS_QUERY") or "top world news today"
 # Cumulative token/cost usage across all runs of this script - separate
 # from telegram_bot.py's own lifetime AGENT_MAX_COST_USD tracking, since
 # this always uses a fresh, throwaway Agent() with no persisted cost.
-# Same pattern as scheduled/vocab_drip.py's .vocab_usage.json.
 USAGE_PATH = os.path.join(_SIMPLE_AGENT_DIR, ".news_digest_usage.json")
 
 
