@@ -1,0 +1,190 @@
+<div class="ex">
+        <span class="ex-no">__N__</span>
+        <span class="ex-jp">{ruby(jp)}</span>
+        <span class="ex-en">{esc(en)}</span>
+      </div>"""
+
+
+def entry_html(r: dict) -> str:
+    search = " ".join([
+        plain(r["word"]), r["reading"], r["english"].lower(),
+        r["frame"], plain(r["sentence1"]),
+    ]).lower()
+    note = esc(r["note"])
+    more = f'\n    <div class="more"><p class="nt">{note}</p></div>' if r["note"].strip() else ""
+    cue = '<span class="e-cue">+</span>' if r["note"].strip() else ""
+    sentences = "\n      ".join([
+        sentence_block(1, r["sentence1"], r["sentence1_en"]),
+        sentence_block(2, r["sentence2"], r["sentence2_en"]),
+        sentence_block(3, r["sentence3"], r["sentence3_en"]),
+    ])
+    return f"""<article class="e{' has-note' if r['note'].strip() else ''}" data-w="{esc(r['word'])}" data-s="{esc(search)}">
+  <button class="pip" type="button" aria-label="I know this - advance" title="I know this - advance"></button>
+  <div class="e-body">
+    <div class="e-head">
+      <span class="w">{ruby(r['word_furigana'])}</span>
+      <span class="rd">{esc(r['reading'])}</span>
+      <button class="say" type="button" data-w="{esc(r['word'])}" aria-label="pronounce {esc(r['word'])}" title="say it">&#9654;</button>
+      <button class="draw" type="button" data-w="{esc(r['word'])}" aria-label="stroke order for {esc(r['word'])}" title="stroke order">&#9998;</button>
+      <span class="pos">{esc(r['pos'])}</span>
+    </div>
+    <p class="mn">{esc(r['english'])}</p>
+    <p class="pt"><span class="pt-k">型</span>{esc(r['frame'])}</p>
+    <div class="ex-grid">
+      {sentences}
+    </div>{more}
+  </div>
+  <span class="e-tags" aria-hidden="true"><span class="e-due">due</span>{cue}</span>
+</article>"""
+
+
+def day_html(day: int, items: list) -> str:
+    counts = {}
+    for r in items:
+        counts[r["type"]] = counts.get(r["type"], 0) + 1
+    mix = " · ".join(f"{counts[t]} {t}" for t in TYPE_ORDER if counts.get(t))
+    entries = "\n".join(entry_html(r) for r in items)
+    fid = DRIVE_AUDIO.get(day, "")
+    return f"""<section class="day" id="day{day:02d}" data-day="{day}">
+  <div class="day-head">
+    <span class="day-no">DAY {day:02d}</span>
+    <span class="day-meta">{len(items)} words &nbsp;/&nbsp; {mix}</span>
+    <span class="day-tally" data-day-tally="{day}"></span>
+    <button class="day-audio" type="button" data-day="{day}" data-fid="{fid}"
+      aria-expanded="false" aria-controls="dp{day}">&#9654; full track</button>
+  </div>
+  <div class="day-player" id="dp{day}" hidden></div>
+  <div class="grid">
+{entries}
+  </div>
+</section>"""
+
+
+def build(data: list) -> str:
+    days = sorted({r["day"] for r in data})
+    by_day = {d: [r for r in data if r["day"] == d] for d in days}
+    total_types = {t: sum(1 for r in data if r["type"] == t) for t in TYPE_ORDER}
+    n = len(data)
+    dleft = (EXAM - TODAY).days
+    wa_json = "{}"
+    if WORD_AUDIO_JSON.exists():
+        wa_json = WORD_AUDIO_JSON.read_text(encoding="utf-8").strip() or "{}"
+    has_word_audio = wa_json != "{}"
+
+    kvg_json = "{}"
+    if KANJIVG_JSON.exists():
+        kvg_json = KANJIVG_JSON.read_text(encoding="utf-8").strip() or "{}"
+    has_kvg = kvg_json != "{}"
+
+    type_bar = "".join(
+        f'<span class="tb-seg tb-{t}" style="flex:{total_types[t]}">'
+        f'<span class="tb-lab">{TYPE_LABEL[t]}</span>'
+        f'<span class="tb-n">{total_types[t]}</span></span>'
+        for t in TYPE_ORDER
+    )
+    nav = "".join(f'<a href="#day{d:02d}">{d:02d}</a>' for d in days)
+    sections = "\n".join(day_html(d, by_day[d]) for d in days)
+
+    return f"""<title>N3 語彙 400</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@500;600;700&family=Newsreader:ital,wght@0,400;0,500;1,400&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>__CSS__</style>
+
+<div class="wrap">
+<header>
+  <div class="inner">
+    <h1>N3 語彙 <span class="lat">400 WORDS · 16 DAYS · JLPT N3 VOCABULARY</span></h1>
+  </div>
+  <p class="sub">Every word from the drip deck. Furigana in <span class="k-furi">blue</span>,
+    the dictionary reading in <span class="k-seal">vermilion</span>, the English gloss, the
+    collocation frame (型), and three example sentences &mdash; click a card with a
+    <b>+</b> for its usage note. Each word carries a spaced-repetition box; <b>Review</b> walks what is due.
+    Hit <b>&#9654;</b> on any card to hear the word, <b>&#9998;</b> for the animated stroke order;
+    <b>&#9654; full track</b> in a day header streams that day's example-sentence recording from Drive.</p>
+  <div class="dcount">EXAM 2026·12·03 &nbsp;<b>D&minus;__DLEFT__</b></div>
+  <div class="tbar">__TYPE_BAR__</div>
+</header>
+
+<nav class="controls">
+  <div class="search">
+    <input id="q" type="search" placeholder="search word · reading · meaning · 型" autocomplete="off" spellcheck="false">
+    <button class="x" id="q-x" type="button" aria-label="clear search" hidden>&times;</button>
+  </div>
+  <button class="review-btn" id="review-open">Review</button>
+  <div class="stat" title="mature = box 5+ · due = ready to review">
+    <span class="bar"><i id="stat-fill"></i></span>
+    <span><b class="s-mat" id="s-mat">0</b> mature · <b id="s-lrn">0</b> learning ·
+      <b id="s-new">__N__</b> new · <b class="s-due" id="s-due">0</b> due</span>
+  </div>
+  <select class="filter" id="filter" aria-label="filter words">
+    <option value="all">all words</option>
+    <option value="due">due now</option>
+    <option value="new">new</option>
+    <option value="learning">learning</option>
+    <option value="mature">mature</option>
+  </select>
+  <div class="toggles">
+    <button id="t-furi" aria-pressed="false">hide furigana</button>
+    <button id="t-mn" aria-pressed="false">hide meanings</button>
+    <button id="t-pt" aria-pressed="false">hide 型</button>
+  </div>
+  <div class="navdays">__NAV__</div>
+</nav>
+
+<main>
+<p class="nores" id="nores">No word matches that.</p>
+</main>
+
+<footer>
+  N3 語彙 400 &nbsp;·&nbsp; __N__ entries &nbsp;·&nbsp; generated __TODAY__
+  &nbsp;·&nbsp; <b>/</b> search &nbsp; <b>R</b> review &nbsp; <b>P</b> replay audio &nbsp; <b>W</b> stroke order &nbsp;
+  click a card for its note, click the ring to promote a word, hit <b>&#9998;</b> for the animated
+  stroke order &nbsp;·&nbsp; SRS boxes 0-6
+  at 1·2·4·8·16·35-day steps, saved in this browser &nbsp;·&nbsp; word audio embedded;
+  day tracks fetched live through your Google&nbsp;Drive connector &nbsp;·&nbsp;
+  stroke order from <a href="https://kanjivg.tagaini.net" target="_blank" rel="noopener">KanjiVG</a>
+  (CC&nbsp;BY-SA&nbsp;3.0).
+  <details>
+    <summary>back up / restore progress</summary>
+    <textarea id="io" spellcheck="false" placeholder="your SRS progress as JSON"></textarea>
+    <div class="io-btns">
+      <button id="io-export">show current</button>
+      <button id="io-import">restore from box</button>
+      <button id="io-reset">reset all progress</button>
+    </div>
+  </details>
+</footer>
+</div>
+
+<div class="rv" id="rv" hidden>
+  <div class="rv-card" role="dialog" aria-modal="true" aria-label="review">
+    <div class="rv-top"><span id="rv-count">0 / 0</span>
+      <label class="rv-auto"><input type="checkbox" id="rv-auto"> &#9654; auto</label>
+      <button id="rv-close" type="button">esc</button></div>
+    <div id="rv-stage"></div>
+  </div>
+</div>
+
+<div class="so" id="so" hidden>
+  <div class="so-card" role="dialog" aria-modal="true" aria-label="stroke order">
+    <div class="so-top">
+      <span class="sw" id="so-w"></span><span class="srd" id="so-rd"></span>
+      <button class="so-x" id="so-close" type="button">esc</button>
+    </div>
+    <div class="so-chars" id="so-chars"></div>
+    <div class="so-actions">
+      <button id="so-replay" type="button">&#8635; replay</button>
+      <button id="so-play" type="button" aria-pressed="true">&#10073;&#10073; pause</button>
+      <button id="so-back" type="button">&#8249; step</button>
+      <button id="so-fwd" type="button">step &#8250;</button>
+      <button id="so-speed" type="button">speed &times;1</button>
+      <button id="so-all" type="button" aria-pressed="false">show all</button>
+      <button id="so-num" type="button" aria-pressed="true">&#9839; numbers</button>
+      <span class="so-hint" id="so-hint"></span>
+    </div>
+  </div>
+</div>
+
+<script>__DATA__</script>
+<script>__JS__</script>

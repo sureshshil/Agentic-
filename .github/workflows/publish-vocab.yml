@@ -1,0 +1,53 @@
+name: Publish N3 Vocab Reference
+
+on:
+  push:
+    branches: [claude/simple-agent-creation-qys564]
+    paths:
+      - 'simple_agent/N3_vocab_batch*.tsv'
+      - 'simple_agent/artifact_creation/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build kanjivg stroke data
+        run: python simple_agent/artifact_creation/build_kanjivg_strokes.py simple_agent/vocab_artifacts/kanjivg_strokes.json
+
+      - name: Build reference HTML
+        run: python simple_agent/artifact_creation/build_vocab_infographic.py simple_agent/vocab_artifacts/n3_vocab_reference.html
+
+      - name: Prepare site
+        run: |
+          mkdir -p _site
+          cp simple_agent/vocab_artifacts/n3_vocab_reference.html _site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

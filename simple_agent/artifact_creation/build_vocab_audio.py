@@ -78,9 +78,13 @@ async def word_part(r: dict, parts_dir: Path) -> Path | None:
     try:
         jp_text = (f"{r['word']}。 {r['reading']}。 "
                    f"{strip_furigana(r['sentence1'])}。 "
-                   f"{strip_furigana(r['sentence2'])}。")
+                   f"{strip_furigana(r['sentence2'])}。 "
+                   f"{strip_furigana(r['sentence3'])}。")
         await tts(jp_text, JP_VOICE, jp)
-        en_text = f"{r['english'].replace(';', ',')}。 {r['sentence1_en']}"
+        en_text = (f"{r['english'].replace(';', ',')}。 "
+                   f"{r['sentence1_en']} "
+                   f"{r['sentence2_en']} "
+                   f"{r['sentence3_en']}")
         await tts(en_text, EN_VOICE, en)
         dest.write_bytes(jp.read_bytes() + en.read_bytes())
         jp.unlink(missing_ok=True)
