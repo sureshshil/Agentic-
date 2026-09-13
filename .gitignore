@@ -18,6 +18,7 @@ simple_agent/add
 simple_agent/add.pub
 *.json
 # Un-ignore build artefacts needed by Vercel
+!vercel.json
 !simple_agent/vocab_artifacts/vocab_audio_urls.json
 !simple_agent/vocab_artifacts/vocab_day_audio_urls.json
 !simple_agent/vocab_artifacts/vocab_kvg_url.json

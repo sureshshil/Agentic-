@@ -116,9 +116,11 @@ def build(data: list) -> str:
     # Day track URLs (GitHub Releases); empty object falls back to Drive in JS
     da_json = DAY_AUDIO_URLS_JSON.read_text(encoding="utf-8").strip() if DAY_AUDIO_URLS_JSON.exists() else "{}"
 
-    # Prefer streaming URL over embedded JSON for KVG stroke data
+    # Prefer streaming URL over embedded JSON for KVG stroke data.
+    # Always use a same-origin proxy path (/kanjivg_strokes.json) so the browser
+    # avoids CORS — Vercel rewrites that path to the real GitHub Release URL.
     if KVG_URL_JSON.exists():
-        kvg_url = json.loads(KVG_URL_JSON.read_text(encoding="utf-8")).get("url", "")
+        kvg_url = "/kanjivg_strokes.json"
         kvg_init = f'window.KVG_URL = {json.dumps(kvg_url)};\nwindow.KVG   = {{}};'
     elif KANJIVG_JSON.exists():
         kvg_init = f'window.KVG_URL = null;\nwindow.KVG   = {KANJIVG_JSON.read_text(encoding="utf-8").strip()};'
