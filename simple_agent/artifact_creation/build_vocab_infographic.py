@@ -23,9 +23,10 @@ OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "vocab_artifacts" / "n3
 EXAM = dt.date(2026, 12, 3)
 TODAY = dt.date.today()
 
-WORD_AUDIO_JSON = ROOT / "vocab_artifacts" / "vocab_word_audio.json"
-KANJIVG_JSON    = ROOT / "vocab_artifacts" / "kanjivg_strokes.json"
-VOCAB_DATA_JSON = ROOT / "vocab_artifacts" / "vocab_data.json"
+WORD_AUDIO_JSON  = ROOT / "vocab_artifacts" / "vocab_word_audio.json"
+AUDIO_URLS_JSON  = ROOT / "vocab_artifacts" / "vocab_audio_urls.json"
+KANJIVG_JSON     = ROOT / "vocab_artifacts" / "kanjivg_strokes.json"
+VOCAB_DATA_JSON  = ROOT / "vocab_artifacts" / "vocab_data.json"
 
 TYPE_ORDER = ["verb", "noun", "adj", "adv"]
 TYPE_LABEL = {"verb": "verbs", "noun": "nouns", "adj": "adjectives", "adv": "adverbs"}
@@ -102,8 +103,14 @@ def nav_links(data: list) -> str:
 def build(data: list) -> str:
     vocab_json = to_vocab_json(data)
 
-    wa_json  = WORD_AUDIO_JSON.read_text(encoding="utf-8").strip() if WORD_AUDIO_JSON.exists() else "{}"
-    kvg_json = KANJIVG_JSON.read_text(encoding="utf-8").strip()    if KANJIVG_JSON.exists()    else "{}"
+    # Prefer streaming URLs (Blob) over embedded base64; fall back to base64 if no URLs file
+    if AUDIO_URLS_JSON.exists():
+        wa_json = AUDIO_URLS_JSON.read_text(encoding="utf-8").strip()
+    elif WORD_AUDIO_JSON.exists():
+        wa_json = WORD_AUDIO_JSON.read_text(encoding="utf-8").strip()
+    else:
+        wa_json = "{}"
+    kvg_json = KANJIVG_JSON.read_text(encoding="utf-8").strip() if KANJIVG_JSON.exists() else "{}"
 
     css      = (HERE / "infographic_style.css").read_text(encoding="utf-8")
     js       = (HERE / "infographic_script.js").read_text(encoding="utf-8")

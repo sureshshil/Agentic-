@@ -17,4 +17,9 @@ simple_agent/abc.pub
 simple_agent/add
 simple_agent/add.pub
 *.json
+# Un-ignore build artefacts needed by Vercel
+!simple_agent/vocab_artifacts/vocab_audio_urls.json
+!simple_agent/vocab_artifacts/kanjivg_strokes.json
+!simple_agent/vocab_artifacts/n3_vocab_reference.html
 
+.vercel

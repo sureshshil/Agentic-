@@ -1,13 +1,13 @@
 /* ---- client-side rendering from window.VOCAB ------------------------- */
 var DRIVE_AUDIO = {
-  1:"12hZEPhZIj7YwZojl8TvyuROhdbJqsH9F",2:"1vACRAolRPOYlO2210NFS9tl5HMZmiXzs",
-  3:"18GFKmqLiN7xuiptQ3hTFV1kSb6L8fOoM",4:"156Mr6VUE_f6RFjRwgg_p79vwMms1BW5_",
-  5:"1zThfEWXZIDfU103DNJypLBTY9jmRaZsE",6:"1EdZDAbko8pghisnoQ9-FaEa3x3MMPm86",
-  7:"1oVQ9xZF_oj_iZFmvRm1v395cMCBxuj4r",8:"1B00nbuBHHf7t-krx8rY5bGE83FncMMf8",
-  9:"1S1_kbx7itiCP5FPY0lRIRlwphCGxlZUo",10:"1OMs9p8Wm-8efRd6z6owzC8Iy3RX4MGak",
-  11:"1EnctlT2m2q3zpsRPaOcAB4IMHJxTzweh",12:"12AiPOG6lPhcjEJUkSANoo5rW4VKgmT4s",
-  13:"13IFsaWr8fEbpsVc5PL5IGhPDcyqIgvsT",14:"1j-dPvBJbCpXPTnLq7t9DMU5amu_ZcqVG",
-  15:"1aWKBQsVPifcAbb_CMGkte_6nNRAnzXDL",16:"1EOg_uUHR4CyYxew5y2fk2JLykV-NJHkz"
+  1:"130D_2EErw-q5F3Lr8j9ARN8Xc33zIszz",2:"1QLdmWucHRWsbhpZfx_KkSGH7c6A6GvD_",
+  3:"1XYPIKjZDh_uaPwcVyuZVj1RyBEtvgLTL",4:"1zYn-MYhqDxTu76URbIXagQiQ-cabNcmH",
+  5:"145nNHdU505XyZUd-YV1gNYTUGlMSgyB5",6:"1CKePE8r_iFUa8L00o_khSvu-9E3ZNCXJ",
+  7:"1zPUfaZVcW9C7ismIF9VzX-gK6wRb30tR",8:"1MOPbLPNXlDLyoGNpbBaBSeRXY45ZMGlt",
+  9:"1At-Th7OPxJDd9__cDDFNzm-K1WvDak32",10:"1DnCr9MicQbTVdiQ_f_MAqiAagdIo6G7D",
+  11:"1tZ9T1mWdGLmF1EhVTuq-lNMFgeTdwKk2",12:"1igDKVkzrj2iLr_Pac1i5rpgRLaEUHt5S",
+  13:"10e52d-aQwe5FYjS52KE1IFYzvfoL_j1G",14:"1zOS_tL0tsFFI57O15wjiZuWX18R3Qq1-",
+  15:"1tX-5dn3O1cg7sXjtmlcKgcQQt5wBghVp",16:"1BPS4quimdoWOhy0a1l-wZmrdtqeY2On4"
 };
 function _esc(s) {
   return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -69,16 +69,16 @@ function _renderDay(day,items){
     set: function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
   };
 
-  /* ---- audio: per-word clips (embedded) + per-day tracks (Drive/mcp) --- */
+  /* ---- audio: per-word clips (base64 from window.WA) + per-day tracks (Drive) --- */
   var WA = window.WA || {};
   var _wa = new Audio();
   var _wasrc = null;
   function playWord(w, btn) {
-    var b64 = WA[w];
-    if (!b64) return false;
+    var src = WA[w];
+    if (!src) return false;
     try { _wa.pause(); } catch (e) {}
-    if (_wasrc) _wa.currentTime = 0;
-    _wa.src = "data:audio/mpeg;base64," + b64;
+    // src is either a https:// Blob URL or a legacy data:audio/mpeg;base64,... URI
+    _wa.src = src.startsWith("http") ? src : "data:audio/mpeg;base64," + src;
     _wasrc = w;
     document.querySelectorAll(".say.playing").forEach(function (s) { s.classList.remove("playing"); });
     if (btn) {
