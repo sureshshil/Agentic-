@@ -69,8 +69,9 @@ function _renderDay(day,items){
     set: function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
   };
 
-  /* ---- audio: per-word clips (base64 from window.WA) + per-day tracks (Drive) --- */
+  /* ---- audio: per-word clips (window.WA) + per-day tracks (window.DA / Drive fallback) --- */
   var WA = window.WA || {};
+  var DA = window.DA || {};
   var _wa = new Audio();
   var _wasrc = null;
   function playWord(w, btn) {
@@ -135,7 +136,10 @@ function _renderDay(day,items){
   }
   async function loadDayTrack(day, fid, box) {
     if (_dayData[day]) { mountAudio(box, _dayData[day]); return; }
-    box.innerHTML = '<span class="dp-load">fetching track from Drive&hellip;</span>';
+    // Prefer GitHub Releases URL; fall back to Google Drive via MCP
+    var ghUrl = DA[String(day)];
+    if (ghUrl) { mountAudio(box, ghUrl); return; }
+    box.innerHTML = '<span class="dp-load">fetching track&hellip;</span>';
     var mcp = await getMcp();
     if (!mcp) { fallback(box, fid); return; }
     try {
@@ -478,9 +482,24 @@ function _renderDay(day,items){
     }
   };
 
-  /* ---- stroke-order animation (embedded KanjiVG paths) ------------- */
+  /* ---- stroke-order animation (KanjiVG paths — streamed or embedded) --- */
   var KVG = window.KVG || {};
   var haveKvg = !!Object.keys(KVG).length;
+
+  if (!haveKvg && window.KVG_URL) {
+    fetch(window.KVG_URL)
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        KVG = data;
+        haveKvg = !!Object.keys(KVG).length;
+        if (haveKvg) {
+          Array.prototype.forEach.call(document.querySelectorAll(".draw"), function (b) {
+            b.disabled = false; b.title = "stroke order";
+          });
+        }
+      })
+      .catch(function (err) { console.warn("KVG fetch failed:", err); });
+  }
   var SVGNS = "http://www.w3.org/2000/svg";
   var so = document.getElementById("so");
   var soChars = document.getElementById("so-chars");
@@ -702,8 +721,9 @@ function _renderDay(day,items){
   });
 
   if (!haveKvg) {
+    var kvgMsg = window.KVG_URL ? "loading stroke data…" : "stroke data not built";
     Array.prototype.forEach.call(document.querySelectorAll(".draw"), function (b) {
-      b.disabled = true; b.title = "stroke data not built";
+      b.disabled = true; b.title = kvgMsg;
     });
   }
 

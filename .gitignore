@@ -19,7 +19,12 @@ simple_agent/add.pub
 *.json
 # Un-ignore build artefacts needed by Vercel
 !simple_agent/vocab_artifacts/vocab_audio_urls.json
+!simple_agent/vocab_artifacts/vocab_day_audio_urls.json
+!simple_agent/vocab_artifacts/vocab_kvg_url.json
 !simple_agent/vocab_artifacts/kanjivg_strokes.json
 !simple_agent/vocab_artifacts/n3_vocab_reference.html
+
+# Local KanjiVG SVG cache — not needed in repo
+simple_agent/vocab_artifacts/.kanjivg_cache/
 
 .vercel

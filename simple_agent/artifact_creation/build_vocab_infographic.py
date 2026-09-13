@@ -25,7 +25,9 @@ TODAY = dt.date.today()
 
 WORD_AUDIO_JSON  = ROOT / "vocab_artifacts" / "vocab_word_audio.json"
 AUDIO_URLS_JSON  = ROOT / "vocab_artifacts" / "vocab_audio_urls.json"
+DAY_AUDIO_URLS_JSON = ROOT / "vocab_artifacts" / "vocab_day_audio_urls.json"
 KANJIVG_JSON     = ROOT / "vocab_artifacts" / "kanjivg_strokes.json"
+KVG_URL_JSON     = ROOT / "vocab_artifacts" / "vocab_kvg_url.json"
 VOCAB_DATA_JSON  = ROOT / "vocab_artifacts" / "vocab_data.json"
 
 TYPE_ORDER = ["verb", "noun", "adj", "adv"]
@@ -103,14 +105,25 @@ def nav_links(data: list) -> str:
 def build(data: list) -> str:
     vocab_json = to_vocab_json(data)
 
-    # Prefer streaming URLs (Blob) over embedded base64; fall back to base64 if no URLs file
+    # Prefer streaming URLs over embedded base64 for per-word audio
     if AUDIO_URLS_JSON.exists():
         wa_json = AUDIO_URLS_JSON.read_text(encoding="utf-8").strip()
     elif WORD_AUDIO_JSON.exists():
         wa_json = WORD_AUDIO_JSON.read_text(encoding="utf-8").strip()
     else:
         wa_json = "{}"
-    kvg_json = KANJIVG_JSON.read_text(encoding="utf-8").strip() if KANJIVG_JSON.exists() else "{}"
+
+    # Day track URLs (GitHub Releases); empty object falls back to Drive in JS
+    da_json = DAY_AUDIO_URLS_JSON.read_text(encoding="utf-8").strip() if DAY_AUDIO_URLS_JSON.exists() else "{}"
+
+    # Prefer streaming URL over embedded JSON for KVG stroke data
+    if KVG_URL_JSON.exists():
+        kvg_url = json.loads(KVG_URL_JSON.read_text(encoding="utf-8")).get("url", "")
+        kvg_init = f'window.KVG_URL = {json.dumps(kvg_url)};\nwindow.KVG   = {{}};'
+    elif KANJIVG_JSON.exists():
+        kvg_init = f'window.KVG_URL = null;\nwindow.KVG   = {KANJIVG_JSON.read_text(encoding="utf-8").strip()};'
+    else:
+        kvg_init = 'window.KVG_URL = null;\nwindow.KVG   = {};'
 
     css      = (HERE / "infographic_style.css").read_text(encoding="utf-8")
     js       = (HERE / "infographic_script.js").read_text(encoding="utf-8")
@@ -119,7 +132,8 @@ def build(data: list) -> str:
     data_script = (
         f"window.VOCAB = {json.dumps(vocab_json, ensure_ascii=False)};\n"
         f"window.WA    = {wa_json};\n"
-        f"window.KVG   = {kvg_json};"
+        f"window.DA    = {da_json};\n"
+        f"{kvg_init}"
     )
 
     dleft = (EXAM - TODAY).days
