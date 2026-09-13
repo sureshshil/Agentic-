@@ -24,7 +24,11 @@ simple_agent/add.pub
 !simple_agent/vocab_artifacts/kanjivg_strokes.json
 !simple_agent/vocab_artifacts/n3_vocab_reference.html
 
-# Local KanjiVG SVG cache — not needed in repo
+# Local caches and audio files — all hosted on GitHub Releases
 simple_agent/vocab_artifacts/.kanjivg_cache/
+simple_agent/vocab_artifacts/_wparts/
+simple_agent/vocab_artifacts/audio/words/
+simple_agent/vocab_artifacts/audio/_parts/
+simple_agent/vocab_artifacts/audio/n3_day*.mp3
 
 .vercel
