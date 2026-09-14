@@ -22,24 +22,46 @@ Three new files, neither touching the originals:
   shell-export approach as GitHub Actions used, since it doesn't call
   `load_dotenv()`) if you'd rather keep the simpler, cheaper, non-agent
   version.
-- `vocab_drip.py` - sends a batch of JLPT-level Japanese vocabulary (word,
-  reading, English + Nepali gloss, 助詞 particle patterns, 3 example
-  sentences each) drawn from the hand-curated TSV files in `simple_agent/`
-  (`N3_vocab_batch*.tsv` by default, override with `VOCAB_TSV_GLOB`) -
-  *no* LLM call. It delivers via `telegram_bot.send_telegram_reply()`
-  straight to your Telegram chat - *not* over ntfy.sh, since this content
-  is long-form and reads better as a chat message than a push
-  notification. It calls `send_telegram_reply()` directly rather than
-  going through the interactive bot's session loop, so these drips never
-  touch `.telegram_bot_state.json` or any session file - they show up as
-  their own messages and don't interrupt or mix into whatever you're
-  chatting about with the bot. Keeps a small history file
-  (`../.vocab_sent_words.json`, gitignored like the other state files) of
-  headwords already sent: never-sent words go out first in rank order,
-  then once every word has been sent the least-recently-sent come back
-  around for review (history capped at 300 entries).
+- `vocab_drip.py` / `kanji_drip.py` / `grammar_drip.py` - active-recall
+  cards drawn from the hand-curated TSV/CSV files in `simple_agent/` (no
+  LLM call), all three sharing one Leitner-style engine
+  (`scheduled/srs.py`): the word/character/pattern is shown plain,
+  everything else (reading, meaning, mnemonic, compounds/nuance,
+  examples) hidden under a Telegram spoiler tag so you have to actually
+  try to recall it before revealing, plus inline button(s) to rate it.
+  Due reviews always go out before any brand-new item, and at most
+  `VOCAB_NEW_PER_DAY` / `KANJI_NEW_PER_DAY` / `GRAMMAR_NEW_PER_DAY` new
+  items get introduced per UTC day so the due-queue can't outrun what
+  the cadence can actually clear. If a card is never rated it doesn't
+  vanish - after `*_UNRATED_RESURFACE_HOURS` (default 3h each) it
+  resurfaces as a reminder card instead of silently wasting that day's
+  new-item slot.
 
-All three new scripts load env vars from two files, same
+  The one difference between them: kanji/grammar send **one** item per
+  push; vocab's 700-word deck is much bigger and a single word per push
+  would take far too long to cycle through, so `vocab_drip.py` sends
+  `VOCAB_BATCH_SIZE` words (default 7) per run instead - but each word
+  still goes out as its OWN Telegram message (a short header message
+  announces the batch first). Telegram only ever attaches a keyboard to
+  the bottom of the message it's sent with, so bundling several words
+  into one message would pile every word's buttons into one block below
+  all the text, forcing a scroll back up/down to match a button to its
+  word. One message per word instead puts each word's Again/Hard/Good/
+  Easy row right under it - no scrolling. Skip a word entirely and it
+  resurfaces later as a reminder, same mechanism as above.
+
+  (`../.vocab_sent_words.json`, the old plain-round-robin history file
+  from before this SRS rewrite, is no longer read - delete it whenever.)
+  There's no quiet-hours logic in the scripts themselves - that's a cron
+  scheduling choice (see step 3 below); the example crontab only fires
+  during 07:00-23:00 JST. State lives in `../.vocab_srs.json` /
+  `../.kanji_srs.json` / `../.grammar_srs.json` (gitignored). **The
+  button taps are handled by `telegram_bot.py`'s own long-polling loop**
+  (`handle_srs_callback`), not by these scripts - `telegram_bot.py` must
+  actually be running (e.g. as `telegram-bot.service`) for ratings to be
+  recorded; the drip scripts themselves only ever send.
+
+All new scripts load env vars from two files, same
 fill-in-what's-unset behavior as `telegram_bot.py`'s own `load_dotenv()`
 call (real environment variables always win):
 
@@ -69,6 +91,8 @@ call (real environment variables always win):
    ```
    ```bash
    python3 vocab_drip.py
+   python3 kanji_drip.py
+   python3 grammar_drip.py
    ```
    `rain_alert_cron.py` only sends a notification if rain above
    threshold is actually forecast within the next
@@ -77,7 +101,12 @@ call (real environment variables always win):
    successful send starts the `ALERT_COOLDOWN_MIN` cooldown (default 180
    min), so a second test run right afterwards will deliberately stay
    quiet; delete `../.rain_alert_state.json` to clear it.
-   `news_digest_agent.py` and `vocab_drip.py` always send.
+   `news_digest_agent.py` always sends. `vocab_drip.py` / `kanji_drip.py`
+   / `grammar_drip.py` send unless nothing is due AND today's new-item
+   cap is already used up (rare on a fresh deck - delete
+   `../.vocab_srs.json` / `../.kanji_srs.json` / `../.grammar_srs.json`
+   to reset and force a send). Tapping their inline buttons only does
+   anything if `telegram_bot.py` is already running and listening.
 
 3. Add cron entries. Edit the crontab for whichever user runs
    `telegram_bot.py` (`crontab -e`, or `sudo -u <user> crontab -e` if it
@@ -93,8 +122,18 @@ call (real environment variables always win):
    # doesn't call load_dotenv())
    0 8 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 news_digest_agent.py >> /var/log/news-digest.log 2>&1
 
-   # Japanese vocab drip - every 2 hours
-   0 */2 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 vocab_drip.py >> /var/log/vocab-drip.log 2>&1
+   # Vocab active-recall drip (7-word batch) - every 2 hours, but only
+   # 07:00-23:00 JST (0,2,4,...,22 minus the overnight hours) - adjust
+   # this hour list to your own waking hours/timezone; there's no
+   # quiet-hours logic in the script itself.
+   0 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 vocab_drip.py >> /var/log/vocab-drip.log 2>&1
+
+   # Kanji active-recall drip (one card) - every hour within that same window
+   0 22,23,0-14 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 kanji_drip.py >> /var/log/kanji-drip.log 2>&1
+
+   # Grammar active-recall drip (one card) - every 2 hours, offset 30min
+   # from vocab so the two never land in the same minute
+   30 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 grammar_drip.py >> /var/log/grammar-drip.log 2>&1
    ```
 
    Replace `/path/to/Agentic-` with the repo's actual path on the VPS,
@@ -109,66 +148,76 @@ status`/`journalctl` visibility instead (consistent with
 just noticeably more boilerplate for two short-lived scripts than plain
 cron.
 
-## Optional: archive the vocab drip to Notion and a Google Doc
+## Optional: archive each drip to Notion and a Google Doc
 
-`vocab_drip.py` can push each drip to two more places after the Telegram
-message, handled by `scheduled/vocab_sinks.py`:
+Each of `vocab_drip.py` / `kanji_drip.py` / `grammar_drip.py` can push its
+drip to two more places after the Telegram message, handled by its own
+sink module (`scheduled/vocab_sinks.py` / `kanji_sinks.py` /
+`grammar_sinks.py` - same shape, one per deck since each has its own
+fields and its own Notion database, but they all share one
+`NOTION_API_KEY` and one `GOOGLE_SERVICE_ACCOUNT_JSON`):
 
-- **Notion database** - a browsable archive: one row **per word**, with
-  `Reading` / `Meaning` / `Particle` (助詞) / `Type` / `JLPT` columns and
-  the 3 example sentences in `Example 1` / `Example 2` / `Example 3`. The
-  data comes straight from the TSV columns for that run's words; if the
-  Notion API call fails the run's rows are just skipped and the Telegram
-  drip is unaffected.
-- **Google Doc** - a single ever-growing doc to use as a **NotebookLM**
-  source for audio overviews, flashcards, infographics. NotebookLM
-  re-syncs a Drive doc on demand, so this is one source you refresh, not
-  a file you re-upload. When you only want the latest batch, steer the
-  generation at "today's entries". The doc is formatted for the model,
-  not a person: a one-time preamble paragraph (added when the doc is
-  empty) explaining what the document is and what it's for, a real
-  `Heading 2` per word, explicit English labels (`Meaning:`,
-  `Part of speech:`, `Particle patterns:`), and every example sentence
-  three ways - normal Japanese, kana-only for pronunciation, English.
+- **Notion database** - a browsable archive: one row **per item**, columns
+  matching that deck's own fields (JLPT set on all three). The data comes
+  straight from that run's TSV/CSV row(s); if the Notion API call fails
+  the run's row(s) are just skipped and the Telegram drip is unaffected.
+  - vocab: `Reading` / `Meaning` / `Particle` (助詞) / `Example 1-3` / `Type` / `JLPT`
+  - kanji: `Reading` / `Meaning` / `Component` (構成) / `Confusable` (似ている) / `Words` / `Example` / `JLPT`
+  - grammar: `Formation` (形) / `Meaning` / `Nuance` / `Contrast` (対比) / `Example 1-3` / `JLPT`
+- **Google Doc** - one ever-growing doc per deck to use as a
+  **NotebookLM** source for audio overviews, flashcards, infographics.
+  NotebookLM re-syncs a Drive doc on demand, so this is one source you
+  refresh, not a file you re-upload. When you only want the latest batch,
+  steer the generation at "today's entries". Each doc is formatted for
+  the model, not a person: a one-time preamble paragraph (added when the
+  doc is empty) explaining what the document is and what it's for, a real
+  `Heading 2` per item, and explicit English field labels. Vocab's
+  example sentences are written three ways (normal Japanese, kana-only
+  for pronunciation, English); kanji/grammar keep the furigana stripped
+  but don't split out a kana-only line.
 
-Both are **best-effort and independent**: each is skipped unless its env
-vars are set, and if one fails it's logged to the cron log while the
-Telegram drip (and the other sink) still go through. Nothing here touches
-`telegram_bot.py` or the other scheduled scripts.
+All six sinks are **best-effort and independent**: each is skipped unless
+its own deck's env vars are set, and if one fails it's logged to the cron
+log while the Telegram drip (and every other sink) still go through.
+Nothing here touches `telegram_bot.py` or the other scheduled scripts.
 
 Add the vars to `scheduled.env` (see `scheduled.env.example`).
 
-### Notion setup (one-time)
+### Notion setup (one-time, per deck)
 
 1. Create an internal integration at
    <https://www.notion.so/my-integrations> - copy its token into
-   `NOTION_API_KEY` (starts `secret_`).
-2. Create a database (a full-page database is easiest). It needs a title
-   property named **`Word`**; add any of these you want populated, with
-   exactly these names/types (missing ones are just skipped):
-   - `Reading` - rich_text
-   - `Meaning` - rich_text
-   - `Particle` - rich_text  (助詞 patterns)
-   - `Example 1`, `Example 2`, `Example 3` - rich_text  (one sentence each)
-   - `Type` - select  (part of speech; new options are created as needed)
-   - `JLPT` - select  (set to `VOCAB_LEVEL`)
+   `NOTION_API_KEY` (starts `secret_`). One integration/token covers all
+   three decks.
+2. Create a database (a full-page database is easiest) with the title
+   property and columns listed above for that deck - exact names, any
+   missing ones are just skipped. `select` columns (`Type`, `JLPT`) get
+   their options created automatically as needed.
 3. Open the database as a full page → `•••` menu → **Connections** →
-   add your integration.
+   add your integration. Note: an internal integration's API token can
+   only create a *new* database via the API under a page it already has
+   access to - since these were created and shared from the Notion UI
+   directly, that's not a blocker here, it just means a brand-new deck's
+   database has to be created and shared the same way (UI first), not
+   spun up by asking Claude to call the API cold.
 4. Copy the database id from its URL - the 32-hex-char chunk before the
-   `?v=` (the view id), with or without hyphens - into `NOTION_VOCAB_DB_ID`.
+   `?v=` (the view id), with or without hyphens - into `NOTION_VOCAB_DB_ID`
+   / `NOTION_KANJI_DB_ID` / `NOTION_GRAMMAR_DB_ID`.
 
-### Google Doc setup (one-time)
+### Google Doc setup (one-time, per deck)
 
 1. In a Google Cloud project, enable the **Google Docs API**.
 2. Create a **service account** and download a JSON key. Put the file on
    the VPS somewhere the cron user can read (e.g.
    `/home/deploy/vocab-gdoc-sa.json`) - it's a secret, keep it out of
    git (the repo's `*.json` ignore rule already covers it if it lands
-   under the repo). Point `GOOGLE_SERVICE_ACCOUNT_JSON` at it.
-3. Create the target Google Doc. **Share** it with the service account's
-   `client_email` (from the JSON key) as **Editor**.
-4. Copy the doc id from its URL
-   (`docs.google.com/document/d/<id>/edit`) into `VOCAB_GDOC_ID`.
+   under the repo). Point `GOOGLE_SERVICE_ACCOUNT_JSON` at it - one
+   service account covers all three decks.
+3. Create each target Google Doc (blank is fine - the preamble is added
+   automatically on its first append). **Share** each with the service
+   account's `client_email` (from the JSON key) as **Editor**.
+4. Copy each doc id from its URL (`docs.google.com/document/d/<id>/edit`)
+   into `VOCAB_GDOC_ID` / `KANJI_GDOC_ID` / `GRAMMAR_GDOC_ID`.
 5. `pip install google-auth` (it's in `requirements.txt`) - this is the
    only extra dependency, and only this sink needs it.
 
@@ -179,4 +228,12 @@ cd /home/projects/Agentic-/simple_agent/scheduled && python3 vocab_drip.py
 # ...
 # Notion: added 4/4 word rows
 # Google Doc: appended 4 words (2410 chars) at index 5120
+
+python3 kanji_drip.py
+# Notion: added 1/1 kanji rows
+# Google Doc: appended 1 kanji (612 chars) at index 812
+
+python3 grammar_drip.py
+# Notion: added 1/1 grammar rows
+# Google Doc: appended 1 pattern(s) (740 chars) at index 940
 ```

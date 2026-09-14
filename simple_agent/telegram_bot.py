@@ -110,6 +110,8 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+import srs
+
 # Loads telegram_bot.env from this script's own directory, regardless of
 # the process's working directory - so the bot picks up secrets the same
 # way whether it's started by systemd (which already injects them via
@@ -187,6 +189,17 @@ BRAVE_MAX_RESULTS = 5
 # session files by hand. Doesn't touch long-term memory (remember/recall)
 # or the running cost total - those are meant to persist across sessions.
 RESET_COMMANDS = {"/reset", "/new"}
+
+# kanji_drip.py / grammar_drip.py send their cards with an inline
+# Again/Hard/Good/Easy keyboard (callback_data "srs|<kind>|<item key>|
+# <action>"); this bot's long-polling loop is the only process listening
+# for the resulting callback_query, so it owns updating each deck's SRS
+# state file (see srs.py) when you tap a button.
+SRS_KIND_PATHS = {
+    "k": (os.environ.get("KANJI_SRS_PATH") or ".kanji_srs.json", srs.BOX_HOURS_KANJI),
+    "g": (os.environ.get("GRAMMAR_SRS_PATH") or ".grammar_srs.json", srs.BOX_HOURS_GRAMMAR),
+    "v": (os.environ.get("VOCAB_SRS_PATH") or ".vocab_srs.json", srs.BOX_HOURS_VOCAB),
+}
 
 WMO_CODES = {
     0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
@@ -1010,6 +1023,108 @@ def send_telegram_reply(api_base: str, chat_id: str, text: str) -> None:
             return  # don't send later chunks out of order after a failure
 
 
+# ---- SRS cards (kanji_drip.py / grammar_drip.py / vocab_drip.py + this
+# bot's callback handling below) --------------------------------------
+
+def _send_card(api_base: str, chat_id: str, html_text: str, inline_keyboard: list) -> None:
+    try:
+        _request_with_retry(
+            "POST",
+            f"{api_base}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": html_text,
+                "parse_mode": "HTML",
+                "reply_markup": {"inline_keyboard": inline_keyboard},
+            },
+        )
+    except requests.RequestException as exc:
+        print(f"Warning: failed to send Telegram SRS card ({exc})")
+
+
+def send_srs_card(api_base: str, chat_id: str, kind: str, item_key: str, html_text: str) -> None:
+    """One active-recall card, sent as its OWN message: `html_text` (HTML
+    parse_mode, expected to wrap the answer in <tg-spoiler>...</tg-spoiler>
+    so it's blurred until tapped) plus an Again/Hard/Good/Easy inline
+    keyboard directly below it. `kind` is "k" (kanji), "g" (grammar), or
+    "v" (vocab - see SRS_KIND_PATHS). vocab_drip.py's batch of several
+    words calls this once per word rather than combining them into one
+    message, specifically so each word's buttons land right under it
+    instead of all buttons piling up at the bottom of one long message -
+    Telegram has no way to attach a keyboard mid-message."""
+    buttons = [
+        {"text": srs.LABELS[action], "callback_data": f"srs|{kind}|{item_key}|{action}"}
+        for action in srs.ACTIONS
+    ]
+    _send_card(api_base, chat_id, html_text, [buttons])
+
+
+def handle_srs_callback(api_base: str, callback: dict, allowed_chat_id: str) -> None:
+    """A tap on one of send_srs_card's buttons. Verifies the chat, applies
+    the rating to the right deck's state file, answers the callback (the
+    little toast Telegram shows) with the resulting interval, and strips
+    the buttons off that message so it can't be tapped twice."""
+    callback_id = callback["id"]
+    message = callback.get("message") or {}
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    data = callback.get("data") or ""
+
+    if chat_id != allowed_chat_id:
+        print(f"Ignored SRS callback from unauthorized chat_id {chat_id}")
+        _answer_callback_query(api_base, callback_id, "")
+        return
+
+    parts = data.split("|")
+    if len(parts) != 4 or parts[0] != "srs" or parts[1] not in SRS_KIND_PATHS or parts[3] not in srs.ACTIONS:
+        print(f"Ignored malformed SRS callback_data: {data!r}")
+        _answer_callback_query(api_base, callback_id, "")
+        return
+
+    _, kind, item_key, action = parts
+    path, box_hours = SRS_KIND_PATHS[kind]
+    state = srs.load_state(path)
+    interval_hours = srs.record_review(state, item_key, action, box_hours, srs.now_utc())
+    srs.save_state(path, state)
+
+    toast = f"{srs.LABELS[action]} — next review in {srs.format_interval(interval_hours)}"
+    print(f"SRS: {kind}:{item_key} rated {action}, next due in {srs.format_interval(interval_hours)}")
+    _answer_callback_query(api_base, callback_id, toast)
+
+    message_id = message.get("message_id")
+    if message_id is not None:
+        current_keyboard = (message.get("reply_markup") or {}).get("inline_keyboard", [])
+        remaining_keyboard = [
+            row for row in current_keyboard if not any(btn.get("callback_data") == data for btn in row)
+        ]
+        _edit_message_reply_markup(api_base, chat_id, message_id, remaining_keyboard)
+
+
+def _answer_callback_query(api_base: str, callback_id: str, text: str) -> None:
+    try:
+        _request_with_retry(
+            "POST",
+            f"{api_base}/answerCallbackQuery",
+            json={"callback_query_id": callback_id, "text": text},
+        )
+    except requests.RequestException as exc:
+        print(f"Warning: answerCallbackQuery failed ({exc})")
+
+
+def _edit_message_reply_markup(api_base: str, chat_id: str, message_id: int, inline_keyboard: list) -> None:
+    try:
+        _request_with_retry(
+            "POST",
+            f"{api_base}/editMessageReplyMarkup",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": inline_keyboard},
+            },
+        )
+    except requests.RequestException as exc:
+        print(f"Warning: editMessageReplyMarkup failed ({exc})")
+
+
 # Leaves headroom under TELEGRAM_MESSAGE_CHAR_LIMIT for whatever prefix
 # (e.g. "Switched to session N...") gets prepended to a recap.
 RECAP_CHAR_LIMIT = 3500
@@ -1092,6 +1207,11 @@ def main() -> None:
         for update in updates:
             offset = update["update_id"] + 1
             try:
+                callback = update.get("callback_query")
+                if callback:
+                    handle_srs_callback(api_base, callback, allowed_chat_id)
+                    continue
+
                 message = update.get("message")
                 if not message or "text" not in message:
                     continue

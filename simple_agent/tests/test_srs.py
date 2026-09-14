@@ -1,0 +1,202 @@
+"""Regression tests for srs.py's Leitner-style scheduler: box transitions
+on each rating, due-before-new ordering, and the daily new-item cap.
+
+Run: python3 -m unittest tests.test_srs -v   (from simple_agent/)
+"""
+
+import os
+import sys
+import unittest
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import srs  # noqa: E402
+
+
+BOX_HOURS = [1, 3, 8, 20]
+NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+class RecordReviewTest(unittest.TestCase):
+    def test_good_advances_one_box(self):
+        state = {}
+        interval = srs.record_review(state, "決", "good", BOX_HOURS, NOW)
+        self.assertEqual(state["決"]["box"], 1)
+        self.assertEqual(interval, BOX_HOURS[1])
+
+    def test_easy_advances_two_boxes(self):
+        state = {}
+        srs.record_review(state, "決", "easy", BOX_HOURS, NOW)
+        self.assertEqual(state["決"]["box"], 2)
+
+    def test_easy_is_capped_at_the_top_box(self):
+        state = {"決": {"box": len(BOX_HOURS) - 1, "reps": 5, "lapses": 0}}
+        srs.record_review(state, "決", "easy", BOX_HOURS, NOW)
+        self.assertEqual(state["決"]["box"], len(BOX_HOURS) - 1)
+
+    def test_again_resets_to_box_zero_and_counts_a_lapse(self):
+        state = {"決": {"box": 3, "reps": 5, "lapses": 0}}
+        srs.record_review(state, "決", "again", BOX_HOURS, NOW)
+        self.assertEqual(state["決"]["box"], 0)
+        self.assertEqual(state["決"]["lapses"], 1)
+
+    def test_hard_drops_one_box_but_not_below_zero(self):
+        state = {"決": {"box": 0, "reps": 1, "lapses": 0}}
+        srs.record_review(state, "決", "hard", BOX_HOURS, NOW)
+        self.assertEqual(state["決"]["box"], 0)
+
+    def test_due_date_is_now_plus_the_new_box_interval(self):
+        state = {}
+        srs.record_review(state, "決", "good", BOX_HOURS, NOW)
+        due = datetime.fromisoformat(state["決"]["due"])
+        self.assertEqual(due, NOW + timedelta(hours=BOX_HOURS[1]))
+
+    def test_reps_increments_every_call(self):
+        state = {}
+        srs.record_review(state, "決", "good", BOX_HOURS, NOW)
+        srs.record_review(state, "決", "hard", BOX_HOURS, NOW)
+        self.assertEqual(state["決"]["reps"], 2)
+
+    def test_unknown_action_raises(self):
+        with self.assertRaises(ValueError):
+            srs.record_review({}, "決", "meh", BOX_HOURS, NOW)
+
+
+class PickNextTest(unittest.TestCase):
+    def test_never_seen_item_is_introduced_in_rank_order(self):
+        state = {}
+        key, is_new = srs.pick_next(["決", "作", "動"], state, NOW, new_per_day=5)
+        self.assertEqual(key, "決")
+        self.assertTrue(is_new)
+        self.assertIn("決", state)  # pick_next records the intro itself
+        self.assertEqual(state["決"]["box"], 0)
+
+    def test_due_review_takes_priority_over_a_new_item(self):
+        state = {
+            "作": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW - timedelta(hours=1)).isoformat()},
+        }
+        key, is_new = srs.pick_next(["決", "作", "動"], state, NOW, new_per_day=5)
+        self.assertEqual(key, "作")
+        self.assertFalse(is_new)
+
+    def test_not_yet_due_review_does_not_block_a_new_introduction(self):
+        state = {
+            "作": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW + timedelta(hours=1)).isoformat()},
+        }
+        key, is_new = srs.pick_next(["決", "作", "動"], state, NOW, new_per_day=5)
+        self.assertEqual(key, "決")
+        self.assertTrue(is_new)
+
+    def test_most_overdue_review_wins_when_several_are_due(self):
+        state = {
+            "作": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW - timedelta(hours=1)).isoformat()},
+            "動": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW - timedelta(hours=5)).isoformat()},
+        }
+        key, is_new = srs.pick_next(["決", "作", "動"], state, NOW, new_per_day=5)
+        self.assertEqual(key, "動")
+
+    def test_introduced_but_unrated_item_is_not_due_before_the_resurface_timeout(self):
+        state = {}
+        srs.pick_next(["決"], state, NOW, new_per_day=5)
+        second_key, is_new = srs.pick_next(
+            ["決"], state, NOW + timedelta(hours=2), new_per_day=5, unrated_resurface_hours=3.0
+        )
+        self.assertIsNone(second_key)
+        self.assertIsNone(is_new)
+
+    def test_unrated_item_resurfaces_as_due_after_the_timeout(self):
+        # Missed a card entirely (asleep, busy)? It comes back around
+        # instead of silently wasting that day's new-item slot forever.
+        state = {}
+        srs.pick_next(["決"], state, NOW, new_per_day=5)
+        key, is_new = srs.pick_next(
+            ["決"], state, NOW + timedelta(hours=4), new_per_day=5, unrated_resurface_hours=3.0
+        )
+        self.assertEqual(key, "決")
+        self.assertFalse(is_new)
+        # still unrated - no "due" field yet, distinguishing a reminder
+        # from an ordinary rated-then-due review
+        self.assertNotIn("due", state["決"])
+
+    def test_resurfaced_unrated_item_still_blocks_a_new_introduction(self):
+        state = {}
+        srs.pick_next(["決"], state, NOW, new_per_day=5)
+        key, is_new = srs.pick_next(
+            ["決", "作"], state, NOW + timedelta(hours=4), new_per_day=5, unrated_resurface_hours=3.0
+        )
+        self.assertEqual(key, "決")  # the overdue reminder wins over introducing 作
+
+    def test_daily_new_item_cap_is_respected(self):
+        state = {}
+        srs.pick_next(["決"], state, NOW, new_per_day=1)
+        key, is_new = srs.pick_next(["決", "作"], state, NOW + timedelta(hours=1), new_per_day=1)
+        self.assertIsNone(key)
+        self.assertIsNone(is_new)
+
+    def test_cap_resets_on_a_new_utc_day(self):
+        # 決 was introduced AND rated on day 1 (due far in the future, so
+        # it's neither an overdue review nor an unrated reminder) - isolates
+        # the cap-reset check from due/resurface interference.
+        state = {
+            "決": {
+                "box": 0,
+                "reps": 1,
+                "lapses": 0,
+                "introduced_at": NOW.isoformat(),
+                "due": (NOW + timedelta(hours=100)).isoformat(),
+            }
+        }
+        next_day = NOW + timedelta(days=1)
+        key, is_new = srs.pick_next(["決", "作"], state, next_day, new_per_day=1)
+        self.assertEqual(key, "作")
+        self.assertTrue(is_new)
+
+    def test_nothing_left_to_introduce_returns_none(self):
+        state = {"決": {"box": 0, "reps": 0, "lapses": 0, "introduced_at": NOW.isoformat()}}
+        key, is_new = srs.pick_next(["決"], state, NOW, new_per_day=5)
+        self.assertIsNone(key)
+        self.assertIsNone(is_new)
+
+
+class PickBatchTest(unittest.TestCase):
+    def test_fills_the_batch_with_new_items_in_rank_order_when_nothing_is_due(self):
+        state = {}
+        picks = srs.pick_batch(["決", "作", "動", "成"], state, NOW, batch_size=3, new_per_day=5)
+        self.assertEqual([k for k, _ in picks], ["決", "作", "動"])
+        self.assertTrue(all(is_new for _, is_new in picks))
+
+    def test_due_items_are_not_picked_twice_within_one_batch(self):
+        state = {
+            "作": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW - timedelta(hours=1)).isoformat()},
+        }
+        picks = srs.pick_batch(["決", "作", "動"], state, NOW, batch_size=3, new_per_day=5)
+        self.assertEqual([k for k, _ in picks].count("作"), 1)
+
+    def test_stops_early_once_the_new_item_cap_is_hit(self):
+        state = {}
+        picks = srs.pick_batch(["決", "作", "動", "成"], state, NOW, batch_size=10, new_per_day=2)
+        self.assertEqual([k for k, _ in picks], ["決", "作"])
+
+    def test_due_items_fill_the_batch_before_any_new_ones(self):
+        state = {
+            "作": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW - timedelta(hours=1)).isoformat()},
+            "動": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW - timedelta(hours=2)).isoformat()},
+        }
+        picks = srs.pick_batch(["決", "作", "動", "成"], state, NOW, batch_size=2, new_per_day=5)
+        self.assertEqual([k for k, is_new in picks], ["動", "作"])
+        self.assertTrue(all(not is_new for _, is_new in picks))
+
+
+class FormatIntervalTest(unittest.TestCase):
+    def test_hours_under_a_day(self):
+        self.assertEqual(srs.format_interval(3), "3h")
+
+    def test_days_at_or_above_24_hours(self):
+        self.assertEqual(srs.format_interval(48), "2d")
+
+    def test_fractional_days(self):
+        self.assertEqual(srs.format_interval(36), "1.5d")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,6 +1,6 @@
 """Regression tests for vocab_drip's TSV-backed word source: parsing the
-Anki-style TSV files, picking the next batch (never-sent first, then
-least-recently-sent), and formatting a word for Telegram / the sinks.
+Anki-style TSV files, mapping a row to the sink entry shape, and rendering
+one word's spoiler-hidden block for a batch message.
 
 Run: python3 -m unittest tests.test_vocab_drip -v   (from simple_agent/)
 """
@@ -31,6 +31,12 @@ def _write_tsv(text: str) -> str:
     fd, path = tempfile.mkstemp(suffix=".tsv")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
+    return path
+
+
+def _write_tsv_and_track(case: unittest.TestCase) -> str:
+    path = _write_tsv(_TSV)
+    case.addCleanup(os.unlink, path)
     return path
 
 
@@ -68,27 +74,6 @@ class LoadRowsTest(unittest.TestCase):
         self.assertEqual(rows[0]["english"], "case; situation")  # batch1 wins
 
 
-class SelectWordsTest(unittest.TestCase):
-    def setUp(self):
-        self.rows = vd.load_rows(_write_tsv_and_track(self))
-
-    def test_never_sent_words_come_first_in_rank_order(self):
-        picked = vd.select_words(self.rows, history=[], count=2)
-        self.assertEqual([r["word"] for r in picked], ["場合", "関係"])
-
-    def test_sent_words_are_skipped_until_the_pool_is_exhausted(self):
-        picked = vd.select_words(self.rows, history=["場合"], count=2)
-        self.assertEqual([r["word"] for r in picked], ["関係", "直接"])
-
-    def test_once_all_sent_least_recently_sent_comes_back_first(self):
-        # history order = oldest first, so 関係 is the stalest
-        picked = vd.select_words(self.rows, history=["関係", "直接", "場合"], count=1)
-        self.assertEqual([r["word"] for r in picked], ["関係"])
-
-    def test_count_larger_than_pool_returns_everything(self):
-        self.assertEqual(len(vd.select_words(self.rows, [], count=99)), 3)
-
-
 class RowToEntryTest(unittest.TestCase):
     def setUp(self):
         self.rows = vd.load_rows(_write_tsv_and_track(self))
@@ -111,28 +96,38 @@ class RowToEntryTest(unittest.TestCase):
         self.assertEqual(entry["examples"], ["直接[ちょくせつ]話[はな]す。 — Talk directly."])
 
 
-class FormatWordTest(unittest.TestCase):
-    def test_block_shape_matches_the_old_drip_plus_a_nepali_line(self):
-        entry = {
-            "word": "場合",
-            "reading": "ばあい",
-            "meaning": "case; situation",
-            "particles": "〜の場合（は）",
-            "nepali": "अवस्था",
-            "examples": ["雨[あめ]の場合[ばあい]。 — In case of rain."],
-        }
-        block = vd.format_word(entry)
-        self.assertTrue(block.startswith("場合 (ばあい) — case; situation\n"))
+class FormatWordBlockTest(unittest.TestCase):
+    def setUp(self):
+        self.rows = vd.load_rows(_write_tsv_and_track(self))
+
+    def test_word_is_visible_and_rest_is_wrapped_in_a_spoiler(self):
+        block = vd.format_word_block(self.rows[0], "new")
+        self.assertIn("<b>場合</b>", block)
+        self.assertIn("<tg-spoiler>", block)
+        self.assertIn("ばあい — case; situation", block)
         self.assertIn("\U0001f1f3\U0001f1f5 अवस्था", block)
         self.assertIn("助詞: 〜の場合（は）", block)
-        self.assertIn("例文:\n1. 雨[あめ]の場合[ばあい]。 — In case of rain.", block)
+        self.assertIn("例文:\n1. 雨[あめ]の場合[ばあい]は中止[ちゅうし]。", block)
+        # the word itself must be OUTSIDE the spoiler span (it's the recall prompt)
+        self.assertLess(block.index("<b>場合</b>"), block.index("<tg-spoiler>"))
 
-    def test_divider_between_words(self):
-        entries = [
-            {"word": "A", "reading": "a", "meaning": "m", "particles": "", "examples": []},
-            {"word": "B", "reading": "b", "meaning": "n", "particles": "", "examples": []},
-        ]
-        self.assertIn("\n\n----\n\n", vd.build_message(entries))
+    def test_status_marker_varies_by_status(self):
+        self.assertTrue(vd.format_word_block(self.rows[0], "new").startswith("\U0001f210"))
+        self.assertTrue(vd.format_word_block(self.rows[0], "due").startswith("\U0001f501"))
+        self.assertTrue(vd.format_word_block(self.rows[0], "reminder").startswith("⏰"))
+
+    def test_html_special_characters_in_content_are_escaped(self):
+        row = dict(self.rows[0])
+        row["english"] = "case & effect"
+        block = vd.format_word_block(row, "new")
+        self.assertIn("case &amp; effect", block)
+        self.assertNotIn("case & effect", block)
+
+
+class BuildMessageTest(unittest.TestCase):
+    def test_blocks_are_joined_with_a_blank_line(self):
+        message = vd.build_message(["BLOCK_A", "BLOCK_B"])
+        self.assertEqual(message, "BLOCK_A\n\nBLOCK_B")
 
 
 class DespaceTest(unittest.TestCase):
@@ -144,12 +139,6 @@ class DespaceTest(unittest.TestCase):
 
     def test_keeps_spaces_around_ascii(self):
         self.assertEqual(vd._despace_japanese("JLPT N3 の 試験[しけん]"), "JLPT N3 の試験[しけん]")
-
-
-def _write_tsv_and_track(case: unittest.TestCase) -> str:
-    path = _write_tsv(_TSV)
-    case.addCleanup(os.unlink, path)
-    return path
 
 
 if __name__ == "__main__":
