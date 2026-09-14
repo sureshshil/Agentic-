@@ -1,11 +1,5 @@
 {
   "buildCommand": "bash build.sh",
   "outputDirectory": "_site",
-  "installCommand": "",
-  "rewrites": [
-    {
-      "source": "/kanjivg_strokes.json",
-      "destination": "https://github.com/sureshshil/Agentic-/releases/download/n3-kvg-v1/kanjivg_strokes.json"
-    }
-  ]
+  "installCommand": ""
 }
