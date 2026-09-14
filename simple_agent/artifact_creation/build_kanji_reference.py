@@ -7,12 +7,13 @@ import csv
 import json
 import re
 import os
+import sys
 from pathlib import Path
 
 # ── paths ──────────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent
 ROOT = SCRIPT_DIR.parent          # simple_agent/
-OUT = ROOT / "vocab_artifacts" / "n3_kanji_reference.html"
+OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "vocab_artifacts" / "n3_kanji_reference.html"
 KVG_URL_FILE = ROOT / "vocab_artifacts" / "vocab_kvg_url.json"
 CSV_FILES = sorted(ROOT.glob("N3_kanji_batch*.csv"))
 

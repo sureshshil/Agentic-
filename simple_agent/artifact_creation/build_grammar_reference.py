@@ -16,13 +16,13 @@ from datetime import date
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT       = SCRIPT_DIR.parent            # simple_agent/
 OUT_DIR    = ROOT / "vocab_artifacts"
-OUT_FILE   = OUT_DIR / "n3_grammar_reference.html"
+OUT_FILE   = Path(sys.argv[1]) if len(sys.argv) > 1 else OUT_DIR / "n3_grammar_reference.html"
 
 CSV_GLOB   = sorted(ROOT.glob("n3_grammar_batch*.csv"))
 if not CSV_GLOB:
     sys.exit("ERROR: no n3_grammar_batch*.csv files found in " + str(ROOT))
 
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # ── read CSVs ─────────────────────────────────────────────────────────────────
 def batch_num(path: Path) -> int:
