@@ -1,4 +1,5 @@
-anthropic
+google-genai
+anthropic  # only for scheduled/news_digest.py and the notebooks, still on Claude
 requests
 python-dotenv
 google-auth  # only for scheduled/vocab_sinks.py's optional Google Doc sink

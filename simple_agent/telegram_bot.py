@@ -10,7 +10,7 @@ together into one real assistant" step).
 
 Security: only responds to TELEGRAM_ALLOWED_CHAT_ID. Anyone else who
 messages the bot is silently ignored - several of these tools have real
-side effects (sending email, spending your Anthropic budget), so the bot
+side effects (sending email, spending your Vertex AI budget), so the bot
 must not act on messages from strangers who find its username.
 
 Commands:
@@ -27,7 +27,7 @@ Commands:
                  with a preview of their first message, their cost, and
                  when they were last active. Marks the current one.
   /switch <n>    Switch to session <n> from the last /sessions list - its
-                 history becomes what gets sent to Claude from now on
+                 history becomes what gets sent to the model from now on
                  (replacing what's in memory), and the bot immediately
                  replays that session's conversation back into the chat so
                  you can see it (Telegram doesn't let a bot filter its own
@@ -62,8 +62,13 @@ Session files:
   currently prunes BOT_SESSIONS_DIR automatically).
 
 Env vars:
-  ANTHROPIC_API_KEY         required
-  ANTHROPIC_WORKSPACE_ID    optional - see README's workspace-id section
+  GOOGLE_APPLICATION_CREDENTIALS  required - path to a GCP service account
+                            key json with Vertex AI access (or omit and use
+                            `gcloud auth application-default login` instead)
+  GCP_PROJECT_ID            required - the GCP project Vertex AI bills to
+  GCP_LOCATION              optional, default "global" - some models are
+                            only enabled in specific regions on a given
+                            project
   TELEGRAM_BOT_TOKEN        required - from @BotFather (see notebook 08)
   TELEGRAM_ALLOWED_CHAT_ID  required - your own chat_id (message the bot
                             once, then check notebook 08's discover_chat_id
@@ -72,7 +77,7 @@ Env vars:
                             Web Search API, https://api.search.brave.com)
   EMAIL_ADDRESS             optional - enables send_email (Gmail address)
   EMAIL_APP_PASSWORD        optional - Gmail App Password, see notebook 05
-  AGENT_MAX_COST_USD        optional, default 1.00 - a running total that
+  AGENT_MAX_COST_USD        optional, default 2.00 - a running total that
                             never resets on its own since this process
                             keeps running; delete BOT_STATE_PATH or raise
                             this to keep going once it's hit
@@ -94,14 +99,16 @@ options (it long-polls, so no public URL/webhook is needed).
 """
 
 import json
+import logging
 import os
 import smtplib
 import time
 from email.mime.text import MIMEText
 
-import anthropic
 import requests
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 # Loads telegram_bot.env from this script's own directory, regardless of
 # the process's working directory - so the bot picks up secrets the same
@@ -110,25 +117,36 @@ from dotenv import load_dotenv
 # variables always win; this only fills in what isn't already set.
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "telegram_bot.env"))
 
-MODEL = "claude-sonnet-5"
-# claude-sonnet-5 thinks adaptively by default, and thinking tokens are
-# billed as - and capped by - the same max_tokens budget as the visible
-# reply. A hard enough request (e.g. "plan this in detail") can spend the
-# *entire* budget on invisible reasoning and leave zero tokens for the
-# actual answer, truncating with stop_reason="max_tokens" and empty text.
-# 4096 leaves real headroom for that on top of a normal short reply;
-# effort="low" below (chat/tool-use work, not deep coding-style reasoning)
-# also keeps the model from reaching for heavy thinking in the first place.
+# We do manual tool-calling (execute_tool below), not the SDK's automatic
+# function calling - that's expected, so silence its per-call "Tools ...
+# are not compatible with automatic function calling" notice.
+logging.getLogger("google_genai.models").setLevel(logging.ERROR)
+
+MODEL = "gemini-3.7-flash"
+# gemini-3.7-flash thinks adaptively by default, and thinking tokens are
+# billed as - and capped by - the same max_output_tokens budget as the
+# visible reply. A hard enough request (e.g. "plan this in detail") can
+# spend the *entire* budget on invisible reasoning and leave zero tokens
+# for the actual answer, truncating with finish_reason="MAX_TOKENS" and
+# empty text. 4096 leaves real headroom for that on top of a normal short
+# reply; thinking_level=LOW below (chat/tool-use work, not deep
+# coding-style reasoning) also keeps the model from reaching for heavy
+# thinking in the first place.
 MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 
-# claude-sonnet-5 pricing, $/1M tokens - update if you switch models.
-INPUT_COST_PER_MTOK = 2.00
-OUTPUT_COST_PER_MTOK = 10.00
+# gemini-3.7-flash pricing, $/1M tokens (source: ai.google.dev/gemini-api/docs/pricing,
+# "Standard" tier - Vertex AI generally bills the same per-token rate, but a
+# spending cap depends on this being right, so double-check against Cloud
+# Billing before trusting it). These are the introductory rates through
+# 2026-12-31; they rise to $1.50 / $7.50 on 2027-01-01 - bump these then.
+# Update both if you switch models.
+INPUT_COST_PER_MTOK = 0.75
+OUTPUT_COST_PER_MTOK = 3.75  # includes thinking tokens
 
 # Unlike the notebooks (one cap per kernel session), this cap covers the
 # entire lifetime of the running process, since it never restarts on its
 # own between messages.
-MAX_COST_USD = float(os.environ.get("AGENT_MAX_COST_USD", "1.00"))
+MAX_COST_USD = float(os.environ.get("AGENT_MAX_COST_USD", "2.00"))
 
 # Once lifetime spend crosses this fraction of MAX_COST_USD, replies carry
 # a warning so you see it coming instead of being cut off by the hard cap
@@ -155,7 +173,6 @@ MEMORY_PATH = os.environ.get("BOT_MEMORY_PATH", ".telegram_bot_memory.json")
 # of every single future turn) without limit - once full, 'remember' drops
 # the oldest fact to make room, rather than accumulating forever.
 MAX_MEMORY_FACTS = int(os.environ.get("AGENT_MAX_MEMORY_FACTS", "50"))
-MAX_PAUSE_RESUMES = 10
 # Hard cap on tool_use round trips within a single turn, independent of
 # MAX_COST_USD - a runaway tool loop (model never reaching end_turn) would
 # otherwise only ever be stopped by burning through the *lifetime* cost
@@ -533,7 +550,16 @@ def build_tools() -> list:
                 },
             }
         )
-    return tools
+    return [
+        types.Tool(
+            function_declarations=[
+                types.FunctionDeclaration(
+                    name=t["name"], description=t["description"], parameters=t["input_schema"]
+                )
+                for t in tools
+            ]
+        )
+    ]
 
 
 def execute_tool(name: str, tool_input: dict) -> str:
@@ -554,15 +580,22 @@ def execute_tool(name: str, tool_input: dict) -> str:
 
 # ---- agent core (same pattern as agent.py / the notebooks) ------------
 
-def build_client() -> anthropic.Anthropic:
-    workspace_id = os.environ.get("ANTHROPIC_WORKSPACE_ID")
-    if workspace_id:
-        return anthropic.Anthropic(default_headers={"anthropic-workspace-id": workspace_id})
-    return anthropic.Anthropic()
+def build_client() -> genai.Client:
+    """Authenticates via Application Default Credentials - set
+    GOOGLE_APPLICATION_CREDENTIALS to a service account key json, or run
+    `gcloud auth application-default login` for a user login instead.
+    GCP_PROJECT_ID is required; GCP_LOCATION defaults to "global" (some
+    models are only enabled in specific regions on a given project - see
+    https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations)."""
+    return genai.Client(
+        vertexai=True,
+        project=os.environ["GCP_PROJECT_ID"],
+        location=os.environ.get("GCP_LOCATION", "global"),
+    )
 
 
 class Agent:
-    def __init__(self, client: anthropic.Anthropic | None = None):
+    def __init__(self, client: genai.Client | None = None):
         self.client = client or build_client()
         self.messages: list[dict] = []
         # Lifetime, across every session - this is what AGENT_MAX_COST_USD
@@ -578,16 +611,13 @@ class Agent:
         self.session_output_tokens = 0
         self.tools = build_tools()
 
-    def _system_prompt(self) -> list:
-        """Returns system content as cache-friendly blocks rather than a
-        plain string: everything that's identical on every single call this
-        process makes (base prompt, tool-specific guidance - all fixed once
-        env vars are read at startup) goes in one block with a cache_control
-        breakpoint, so the API only bills it in full once per TTL window
-        instead of on every message. Only what actually varies per turn
-        (today's date, long-term memory facts) goes in a second, uncached
-        block after it - caching before content that changes would defeat
-        the cache on the very next call."""
+    def _system_prompt(self) -> str:
+        """Vertex AI has no per-request cache_control breakpoint the way
+        Claude's ephemeral system blocks did - Gemini applies its own
+        implicit caching for repeated prompt prefixes automatically, with
+        no code-side opt-in. So this just returns one plain string; the
+        stable/dynamic split below is kept only because it's a natural way
+        to build the prompt, not because it affects caching."""
         stable_parts = [SYSTEM_PROMPT_BASE]
         if os.environ.get("BRAVE_API_KEY"):
             stable_parts.append(
@@ -666,19 +696,9 @@ class Agent:
                 "possibly outdated rather than silently picking one."
             )
 
-        return [
-            {
-                "type": "text",
-                "text": "\n\n".join(stable_parts),
-                # 1h so a personal bot used a few times an hour still hits
-                # cache, not just rapid-fire messages within the 5min default.
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
-            },
-            {"type": "text", "text": "\n\n".join(dynamic_parts)},
-        ]
+        return "\n\n".join(stable_parts) + "\n\n" + "\n\n".join(dynamic_parts)
 
     def _run_turn(self):
-        resumes = 0
         tool_iterations = 0
         while True:
             if self.total_cost_usd >= MAX_COST_USD:
@@ -689,35 +709,40 @@ class Agent:
                     "to the current session, so /reset won't clear it."
                 )
 
-            response = self.client.messages.create(
+            response = self.client.models.generate_content(
                 model=MODEL,
-                max_tokens=MAX_TOKENS,
-                # This is a short-reply chat/tool-use bot, not long-horizon
-                # coding/agentic work - low effort keeps adaptive thinking
-                # from over-spending the max_tokens budget on hard-sounding
-                # but not actually deep requests (see MAX_TOKENS comment).
-                output_config={"effort": "low"},
-                system=self._system_prompt(),
-                tools=self.tools,
-                messages=self.messages,
+                contents=self.messages,
+                config=types.GenerateContentConfig(
+                    system_instruction=self._system_prompt(),
+                    tools=self.tools,
+                    max_output_tokens=MAX_TOKENS,
+                    # This is a short-reply chat/tool-use bot, not
+                    # long-horizon coding/agentic work - low thinking keeps
+                    # the model from over-spending the max_output_tokens
+                    # budget on hard-sounding but not actually deep requests
+                    # (see MAX_TOKENS comment).
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level=types.ThinkingLevel.LOW
+                    ),
+                ),
             )
+            usage = response.usage_metadata
             cost_delta = (
-                response.usage.input_tokens * INPUT_COST_PER_MTOK
-                + response.usage.output_tokens * OUTPUT_COST_PER_MTOK
+                ((usage.prompt_token_count or 0) + (usage.tool_use_prompt_token_count or 0))
+                * INPUT_COST_PER_MTOK
+                + ((usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0))
+                * OUTPUT_COST_PER_MTOK
             ) / 1_000_000
             self.total_cost_usd += cost_delta
             self.session_cost_usd += cost_delta
-            self.session_input_tokens += response.usage.input_tokens
-            self.session_output_tokens += response.usage.output_tokens
-            self.messages.append({"role": "assistant", "content": response.content})
+            self.session_input_tokens += usage.prompt_token_count or 0
+            self.session_output_tokens += usage.candidates_token_count or 0
+            self.messages.append(
+                response.candidates[0].content.model_dump(mode="json", exclude_none=True)
+            )
 
-            if response.stop_reason == "pause_turn":
-                resumes += 1
-                if resumes > MAX_PAUSE_RESUMES:
-                    return response
-                continue
-
-            if response.stop_reason != "tool_use":
+            function_calls = response.function_calls
+            if not function_calls:
                 return response
 
             tool_iterations += 1
@@ -731,20 +756,25 @@ class Agent:
                 )
 
             tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    try:
-                        result = execute_tool(block.name, block.input)
-                    except Exception as exc:
-                        result = f"Error: tool '{block.name}' failed ({exc})"
-                    tool_results.append(
-                        {"type": "tool_result", "tool_use_id": block.id, "content": result}
-                    )
-            self.messages.append({"role": "user", "content": tool_results})
+            for call in function_calls:
+                try:
+                    result = execute_tool(call.name, call.args or {})
+                except Exception as exc:
+                    result = f"Error: tool '{call.name}' failed ({exc})"
+                tool_results.append(
+                    {
+                        "function_response": {
+                            "id": call.id,
+                            "name": call.name,
+                            "response": {"result": result},
+                        }
+                    }
+                )
+            self.messages.append({"role": "user", "parts": tool_results})
 
     def send(self, user_input: str) -> str:
         turn_start = len(self.messages)
-        self.messages.append({"role": "user", "content": user_input})
+        self.messages.append({"role": "user", "parts": [{"text": user_input}]})
 
         try:
             response = self._run_turn()
@@ -756,18 +786,20 @@ class Agent:
             self.messages = self.messages[:turn_start]
             raise
 
-        reply = "".join(block.text for block in response.content if block.type == "text")
+        reply = response.text or ""
 
         if not reply.strip():
             # Happens when adaptive thinking (see MAX_TOKENS comment above)
-            # spends the whole max_tokens budget on invisible reasoning and
-            # stop_reason="max_tokens" cuts the response off before any
-            # visible text block exists. Silently sending "" to Telegram
-            # would look like the bot just didn't respond - roll back the
-            # turn (same as any other failed call) and surface it instead.
+            # spends the whole max_output_tokens budget on invisible
+            # reasoning and finish_reason="MAX_TOKENS" cuts the response off
+            # before any visible text part exists. Silently sending "" to
+            # Telegram would look like the bot just didn't respond - roll
+            # back the turn (same as any other failed call) and surface it
+            # instead.
+            finish_reason = response.candidates[0].finish_reason
             self.messages = self.messages[:turn_start]
             raise EmptyReplyError(
-                f"Got no reply text back (stop_reason={response.stop_reason!r}) "
+                f"Got no reply text back (finish_reason={finish_reason!r}) "
                 "- likely spent the whole AGENT_MAX_TOKENS budget on internal "
                 "reasoning before writing an answer. Try again, ask for a "
                 "shorter/more scoped version, or raise AGENT_MAX_TOKENS."
@@ -777,8 +809,8 @@ class Agent:
         # small since the API is stateless and this process never restarts
         # the conversation on its own.
         self.messages[turn_start:] = [
-            {"role": "user", "content": user_input},
-            {"role": "assistant", "content": reply},
+            {"role": "user", "parts": [{"text": user_input}]},
+            {"role": "model", "parts": [{"text": reply}]},
         ]
         return reply
 
@@ -796,10 +828,17 @@ class Agent:
 #                                 new id and therefore a new file; nothing
 #                                 ever overwrites an older session's file.
 
-def _serialize_content(content):
-    if isinstance(content, list):
-        return [c.to_dict() if hasattr(c, "to_dict") else c for c in content]
-    return content
+def _migrate_message(m: dict) -> dict:
+    """Sessions persisted before the Claude->Gemini switch store
+    {"role": "user"/"assistant", "content": str} - convert to the new
+    {"role": "user"/"model", "parts": [{"text": ...}]} shape. Persisted
+    messages are always the collapsed plain-text form (see Agent.send), so
+    a bare string is all "content" can hold on disk - no tool_use/tool_result
+    blocks to reconcile."""
+    if "parts" in m:
+        return m
+    role = "model" if m["role"] == "assistant" else "user"
+    return {"role": role, "parts": [{"text": m.get("content", "")}]}
 
 
 def new_session_id(update_id) -> str:
@@ -819,7 +858,7 @@ def _load_session(session_id: str) -> dict:
     with open(path) as f:
         data = json.load(f)
     return {
-        "messages": data.get("messages", []),
+        "messages": [_migrate_message(m) for m in data.get("messages", [])],
         "session_cost_usd": data.get("session_cost_usd", 0.0),
     }
 
@@ -871,18 +910,19 @@ def load_state() -> dict:
     # tracking or replay already-answered Telegram messages.
     session_id = new_session_id("migrated")
     lifetime_cost_so_far = index.get("total_cost_usd", 0.0)
+    migrated_messages = [_migrate_message(m) for m in index.get("messages", [])]
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     with open(_session_path(session_id), "w") as f:
         json.dump(
             {
-                "messages": index.get("messages", []),
+                "messages": migrated_messages,
                 "session_cost_usd": lifetime_cost_so_far,
             },
             f,
         )
     return {
         "active_session_id": session_id,
-        "messages": index.get("messages", []),
+        "messages": migrated_messages,
         "session_cost_usd": lifetime_cost_so_far,
         "total_cost_usd": lifetime_cost_so_far,
         "update_offset": index.get("update_offset", 0),
@@ -896,14 +936,9 @@ def save_state(
     total_cost_usd: float,
     update_offset: int,
 ) -> None:
-    serializable_messages = [
-        {"role": m["role"], "content": _serialize_content(m["content"])} for m in messages
-    ]
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     with open(_session_path(session_id), "w") as f:
-        json.dump(
-            {"messages": serializable_messages, "session_cost_usd": session_cost_usd}, f
-        )
+        json.dump({"messages": messages, "session_cost_usd": session_cost_usd}, f)
     with open(STATE_PATH, "w") as f:
         json.dump(
             {
@@ -983,6 +1018,13 @@ RECAP_CHAR_LIMIT = 3500
 MAX_SESSIONS_LISTED = 30
 
 
+def _text_of(message: dict) -> str:
+    """Persisted messages are always the collapsed single-text-part form
+    (see Agent.send), so the first part's text is the whole message."""
+    parts = message.get("parts", [])
+    return parts[0].get("text", "") if parts else ""
+
+
 def format_session_list(entries: list, current_session_id: str) -> str:
     if not entries:
         return "No sessions yet."
@@ -992,7 +1034,7 @@ def format_session_list(entries: list, current_session_id: str) -> str:
     for i, (session_id, mtime) in enumerate(entries, start=1):
         session = _load_session(session_id)
         messages = session["messages"]
-        preview = messages[0]["content"] if messages else "(empty)"
+        preview = _text_of(messages[0]) if messages else "(empty)"
         if len(preview) > 40:
             preview = preview[:40] + "..."
         when = time.strftime("%b %d %H:%M", time.localtime(mtime))
@@ -1007,7 +1049,7 @@ def format_session_list(entries: list, current_session_id: str) -> str:
 def format_recap(messages: list, limit: int = RECAP_CHAR_LIMIT) -> str:
     if not messages:
         return "(this session has no messages yet)"
-    lines = [f"{'You' if m['role'] == 'user' else 'Bot'}: {m['content']}" for m in messages]
+    lines = [f"{'You' if m['role'] == 'user' else 'Bot'}: {_text_of(m)}" for m in messages]
     recap = "\n".join(lines)
     if len(recap) <= limit:
         return recap

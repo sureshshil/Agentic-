@@ -1,7 +1,9 @@
 # Simple Agent
 
-A minimal Claude-powered agent with a manual tool-use loop. Serves as a
-starting point for agent development in this repo.
+A minimal agent with a manual tool-use loop. Serves as a starting point for
+agent development in this repo. `agent.py` and `telegram_bot.py` run on
+Gemini via Vertex AI; the `notebooks/` and `scheduled/` scripts below are
+still on Claude/Anthropic.
 
 ## `agent.py` — the original combined script
 
@@ -12,7 +14,7 @@ new feature work happens in `notebooks/` instead (see below).
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env  # then fill in ANTHROPIC_API_KEY
+cp .env.example .env  # then fill in GOOGLE_APPLICATION_CREDENTIALS / GCP_PROJECT_ID
 export $(cat .env | xargs)
 python agent.py                    # interactive REPL
 python agent.py "What's 12 * 7?"   # one message at a time, state persisted to a local JSON file
@@ -137,14 +139,17 @@ something in the world. Two things worth knowing:
   as you add more tools with side effects (file writes, calendar events,
   purchases, etc.).
 
-**Why Brave Search instead of Anthropic's built-in `web_search`:** the
-built-in tool is zero-setup (same API key, no extra account) but its
-results carry that large verification blob you can't shrink or opt out
-of. Brave's Web Search API is a plain client-side tool (like the
-calculator) — plain JSON back, and we control the size directly:
-`count=5` short title/url/description results per search. Trade-off: it
-needs its own API key and account instead of riding on your existing
-Anthropic key. (An earlier version of this bot used Tavily instead, which
+**Why Brave Search instead of a model provider's built-in web search**
+(Claude's server-side `web_search` tool, or Gemini's Google Search
+grounding tool)**:** the built-in option is zero-setup (same credentials,
+no extra account) but either carries overhead you can't shrink (Claude's
+tool attaches a large opaque verification blob per result) or bills
+per-search separately from token usage (Gemini's grounding tool). Brave's
+Web Search API is a plain client-side tool (like the calculator) — plain
+JSON back, and we control the size directly: `count=5` short
+title/url/description results per search. Trade-off: it needs its own API
+key and account instead of riding on your existing model-provider
+credentials. (An earlier version of this bot used Tavily instead, which
 adds a synthesized `answer` field on top of the same kind of snippets;
 Brave has a larger free tier and lower per-call cost at this bot's
 volume, at the cost of doing the synthesis yourself in the prompt instead
@@ -179,7 +184,9 @@ webhook. The loop just asks again immediately after each response.
 2. Set env vars (locally, in a Codespace, or on whatever host you pick
    below):
    ```bash
-   export ANTHROPIC_API_KEY=...
+   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+   export GCP_PROJECT_ID=...             # a GCP project with Vertex AI enabled
+   # export GCP_LOCATION=global          # default; override if needed
    export TELEGRAM_BOT_TOKEN=...
    export TELEGRAM_ALLOWED_CHAT_ID=...   # your chat_id - see below
    # optional:
@@ -287,7 +294,7 @@ Any of these work identically from here on - pick whichever's signup is
 easiest for you. This bot barely uses any CPU or RAM (polling Telegram
 every ~30 seconds), so their smallest/cheapest instance size is plenty.
 No inbound ports need to be opened either: the bot only makes outbound
-requests (long-polling Telegram, calling Anthropic/Brave/Gmail), so you
+requests (long-polling Telegram, calling Vertex AI/Brave/Gmail), so you
 can leave the default firewall as-is.
 
 **1. Create the account and VM:**
@@ -442,6 +449,9 @@ new tool(s), and keep the cost-cap + turn-collapsing core intact.
 
 ### Troubleshooting: `anthropic-workspace-id is required...`
 
+(Applies to the notebooks and `scheduled/news_digest.py`, which still call
+Claude directly - not `agent.py` or `telegram_bot.py`, which use Vertex AI.)
+
 If you see:
 
 ```
@@ -462,6 +472,6 @@ in. Two ways to fix it:
    (the ID column), then either set `ANTHROPIC_WORKSPACE_ID` as an
    environment variable (or Codespaces secret) before running, or just
    type it in when a notebook's key-setup cell prompts for it (leave
-   blank if you don't need it). `agent.py` and every notebook's
-   `build_client()` picks it up automatically and attaches it as the
-   `anthropic-workspace-id` header.
+   blank if you don't need it). Every notebook's `build_client()` picks
+   it up automatically and attaches it as the `anthropic-workspace-id`
+   header.

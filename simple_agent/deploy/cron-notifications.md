@@ -43,9 +43,9 @@ All three new scripts load env vars from two files, same
 fill-in-what's-unset behavior as `telegram_bot.py`'s own `load_dotenv()`
 call (real environment variables always win):
 
-- `../telegram_bot.env` - reuses `ANTHROPIC_API_KEY`, `BRAVE_API_KEY`,
-  `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID`, etc. that are already
-  there for the bot.
+- `../telegram_bot.env` - reuses `GOOGLE_APPLICATION_CREDENTIALS`,
+  `GCP_PROJECT_ID`, `BRAVE_API_KEY`, `TELEGRAM_BOT_TOKEN`,
+  `TELEGRAM_ALLOWED_CHAT_ID`, etc. that are already there for the bot.
 - `../deploy/scheduled.env` - the handful of vars only these scripts
   need (`NTFY_TOPIC`, `ALERT_LOCATION`, `RAIN_THRESHOLD_MM`,
   `NEWS_QUERY`, `VOCAB_LEVEL`, `VOCAB_COUNT`) - see

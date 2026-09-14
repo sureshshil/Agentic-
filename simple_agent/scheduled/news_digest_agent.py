@@ -5,8 +5,8 @@ the same ntfy.sh channel as news_digest.py - reuses its
 send_notification() directly, unmodified.
 
 Cost: one full agent turn - a web_search call plus a synthesis reply - on
-whatever MODEL telegram_bot.py uses (currently claude-sonnet-5). In
-practice ~$0.02/run; each run appends its own token counts and a running
+whatever MODEL telegram_bot.py uses (currently gemini-3.5-flash via Vertex
+AI). Each run appends its own token counts and a running
 lifetime total to ../.news_digest_usage.json and prints them to the cron
 log, so `cat ../.news_digest_usage.json` shows exactly what this job has
 spent. Uses a fresh Agent() instance, entirely separate from
@@ -21,8 +21,11 @@ See ../deploy/cron-notifications.md for VPS cron setup.
 Env vars (loaded via python-dotenv, same pattern as telegram_bot.py -
 real environment variables always win; these files just fill in what
 isn't already set):
-  ANTHROPIC_API_KEY        required - from ../telegram_bot.env
-  ANTHROPIC_WORKSPACE_ID   optional - see telegram_bot.py's docstring
+  GOOGLE_APPLICATION_CREDENTIALS  required (unless using
+                           `gcloud auth application-default login`
+                           instead) - from ../telegram_bot.env
+  GCP_PROJECT_ID           required - from ../telegram_bot.env
+  GCP_LOCATION             optional - from ../telegram_bot.env
   BRAVE_API_KEY            required, from ../telegram_bot.env - without
                            it the agent has no web_search tool and can't
                            look up today's actual news instead of
@@ -46,7 +49,7 @@ from dotenv import load_dotenv
 _SIMPLE_AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _SIMPLE_AGENT_DIR)
 
-# telegram_bot.env covers ANTHROPIC_API_KEY/BRAVE_API_KEY (also loaded
+# telegram_bot.env covers GCP_PROJECT_ID/BRAVE_API_KEY (also loaded
 # again, harmlessly, when `from telegram_bot import Agent` runs below);
 # scheduled.env covers the vars only this script and rain_alert.py need.
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
@@ -85,7 +88,7 @@ def _save_usage(usage: dict) -> None:
 def main() -> None:
     missing = [
         name
-        for name in ("ANTHROPIC_API_KEY", "BRAVE_API_KEY", "NTFY_TOPIC")
+        for name in ("GCP_PROJECT_ID", "BRAVE_API_KEY", "NTFY_TOPIC")
         if not os.environ.get(name)
     ]
     if missing:

@@ -1,7 +1,8 @@
 """Regression tests for the Agent core loop in telegram_bot.py.
 
-No live API calls: anthropic.Anthropic().messages.create is replaced with a
-MagicMock so these run offline and don't need ANTHROPIC_API_KEY.
+No live API calls: genai.Client().models.generate_content is replaced with
+a MagicMock so these run offline and don't need GOOGLE_APPLICATION_CREDENTIALS
+or GCP_PROJECT_ID.
 
 Run: python3 -m unittest tests.test_agent_loop -v   (from simple_agent/)
 """
@@ -16,29 +17,40 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import telegram_bot as tb
 
 
-def make_response(content_blocks, stop_reason, in_tok=10, out_tok=10):
+def make_usage(in_tok=10, out_tok=10):
+    u = MagicMock()
+    u.prompt_token_count = in_tok
+    u.tool_use_prompt_token_count = 0
+    u.candidates_token_count = out_tok
+    u.thoughts_token_count = 0
+    return u
+
+
+def make_response(parts, function_calls, text, finish_reason="STOP", in_tok=10, out_tok=10):
+    """parts/function_calls/text mirror what a real GenerateContentResponse
+    exposes: .candidates[0].content (the raw Content to persist),
+    .function_calls (the model's tool-call requests, if any), and .text
+    (the concatenated visible reply)."""
     r = MagicMock()
-    r.content = content_blocks
-    r.stop_reason = stop_reason
-    r.usage.input_tokens = in_tok
-    r.usage.output_tokens = out_tok
+    content = MagicMock()
+    content.model_dump.return_value = {"role": "model", "parts": parts}
+    r.candidates = [MagicMock(content=content, finish_reason=finish_reason)]
+    r.function_calls = function_calls
+    r.text = text
+    r.usage_metadata = make_usage(in_tok, out_tok)
     return r
 
 
-def text_block(t):
-    b = MagicMock()
-    b.type = "text"
-    b.text = t
-    return b
+def text_part(t):
+    return {"text": t}
 
 
-def tool_block(name, tool_input, block_id="tool_1"):
-    b = MagicMock()
-    b.type = "tool_use"
-    b.name = name
-    b.input = tool_input
-    b.id = block_id
-    return b
+def function_call(name, args, call_id="call_1"):
+    fc = MagicMock()
+    fc.name = name
+    fc.args = args
+    fc.id = call_id
+    return fc
 
 
 class AgentLoopTest(unittest.TestCase):
@@ -70,12 +82,13 @@ class AgentLoopTest(unittest.TestCase):
         the user's reply or get persisted to history - only the final
         (non tool-calling) response's text is surfaced/saved."""
         reasoning = "Checking the weather since the user asked about Paris."
-        self.client.messages.create.side_effect = [
+        self.client.models.generate_content.side_effect = [
             make_response(
-                [text_block(reasoning), tool_block("get_weather", {"location": "Paris"})],
-                "tool_use",
+                [text_part(reasoning), {"function_call": {"name": "get_weather", "args": {"location": "Paris"}}}],
+                [function_call("get_weather", {"location": "Paris"})],
+                text=None,
             ),
-            make_response([text_block("It's 18C and cloudy in Paris.")], "end_turn"),
+            make_response([text_part("It's 18C and cloudy in Paris.")], [], "It's 18C and cloudy in Paris."),
         ]
 
         with unittest.mock.patch.object(tb, "execute_tool", return_value="Weather: cloudy, 18C"):
@@ -84,17 +97,21 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(reply, "It's 18C and cloudy in Paris.")
         self.assertNotIn(reasoning, reply)
         self.assertTrue(
-            all(reasoning not in str(m["content"]) for m in self.agent.messages),
+            all(reasoning not in str(m["parts"]) for m in self.agent.messages),
             "reasoning text leaked into persisted message history",
         )
 
     def test_multi_tool_turn_collapses_to_single_exchange(self):
         """A turn with several tool round-trips still ends up as exactly
-        one {user, assistant} pair in history, not one entry per round-trip."""
-        self.client.messages.create.side_effect = [
-            make_response([tool_block("recall", {}, "t1")], "tool_use"),
-            make_response([tool_block("get_weather", {"location": "Rome"}, "t2")], "tool_use"),
-            make_response([text_block("No memories yet; Rome is sunny.")], "end_turn"),
+        one {user, model} pair in history, not one entry per round-trip."""
+        self.client.models.generate_content.side_effect = [
+            make_response([{"function_call": {"name": "recall", "args": {}}}], [function_call("recall", {}, "t1")], None),
+            make_response(
+                [{"function_call": {"name": "get_weather", "args": {"location": "Rome"}}}],
+                [function_call("get_weather", {"location": "Rome"}, "t2")],
+                None,
+            ),
+            make_response([text_part("No memories yet; Rome is sunny.")], [], "No memories yet; Rome is sunny."),
         ]
 
         with unittest.mock.patch.object(tb, "execute_tool", return_value="ok"):
@@ -102,14 +119,16 @@ class AgentLoopTest(unittest.TestCase):
 
         self.assertEqual(reply, "No memories yet; Rome is sunny.")
         self.assertEqual(len(self.agent.messages), 2)
-        self.assertEqual(self.agent.messages[0], {"role": "user", "content": "recall and check rome weather"})
-        self.assertEqual(self.agent.messages[1], {"role": "assistant", "content": reply})
+        self.assertEqual(
+            self.agent.messages[0], {"role": "user", "parts": [{"text": "recall and check rome weather"}]}
+        )
+        self.assertEqual(self.agent.messages[1], {"role": "model", "parts": [{"text": reply}]})
 
     def test_failed_turn_rolls_back_dangling_user_message(self):
         """If _run_turn raises (API error, budget cap, ...), the just-appended
         user message must be rolled back - otherwise the next send() would
         append a second consecutive 'user' message, which the API rejects."""
-        self.client.messages.create.side_effect = RuntimeError("simulated API failure")
+        self.client.models.generate_content.side_effect = RuntimeError("simulated API failure")
 
         with self.assertRaises(RuntimeError):
             self.agent.send("hello")
@@ -120,8 +139,8 @@ class AgentLoopTest(unittest.TestCase):
         """A model stuck calling tools forever must be cut off, not looped
         on indefinitely or billed without bound."""
         tb.MAX_TOOL_ITERATIONS = 2
-        self.client.messages.create.side_effect = lambda **kwargs: make_response(
-            [tool_block("recall", {})], "tool_use"
+        self.client.models.generate_content.side_effect = lambda **kwargs: make_response(
+            [{"function_call": {"name": "recall", "args": {}}}], [function_call("recall", {})], None
         )
 
         with unittest.mock.patch.object(tb, "execute_tool", return_value="ok"):
@@ -140,7 +159,7 @@ class AgentLoopTest(unittest.TestCase):
         with self.assertRaises(tb.BudgetExceededError):
             self.agent.send("hello")
 
-        self.client.messages.create.assert_not_called()
+        self.client.models.generate_content.assert_not_called()
         self.assertEqual(self.agent.messages, [])
 
 
