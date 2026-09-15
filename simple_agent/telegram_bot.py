@@ -1023,6 +1023,23 @@ def send_telegram_reply(api_base: str, chat_id: str, text: str) -> None:
             return  # don't send later chunks out of order after a failure
 
 
+def send_photo(api_base: str, chat_id: str, photo_bytes: bytes, filename: str = "image.png") -> None:
+    """Sends a single image via Telegram's sendPhoto (multipart, not
+    sendMessage's JSON body) - used by kanji_drip.py to show the kanji
+    itself as a large rendered glyph (see kanji_image.py) rather than the
+    small/thin Unicode text Telegram's own client font would otherwise
+    produce."""
+    try:
+        _request_with_retry(
+            "POST",
+            f"{api_base}/sendPhoto",
+            data={"chat_id": chat_id},
+            files={"photo": (filename, photo_bytes, "image/png")},
+        )
+    except requests.RequestException as exc:
+        print(f"Warning: failed to send Telegram photo ({exc})")
+
+
 # ---- SRS cards (kanji_drip.py / grammar_drip.py / vocab_drip.py + this
 # bot's callback handling below) --------------------------------------
 

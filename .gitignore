@@ -27,6 +27,7 @@ simple_agent/add.pub
 
 # Local caches and audio files — all hosted on GitHub Releases
 simple_agent/vocab_artifacts/.kanjivg_cache/
+simple_agent/vocab_artifacts/.fonts_cache/
 simple_agent/vocab_artifacts/_wparts/
 simple_agent/vocab_artifacts/audio/words/
 simple_agent/vocab_artifacts/audio/_parts/

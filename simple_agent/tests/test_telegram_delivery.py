@@ -70,5 +70,24 @@ class SendTelegramReplyTest(unittest.TestCase):
         self.assertEqual(mock_request.call_count, 1)
 
 
+class SendPhotoTest(unittest.TestCase):
+    def test_sends_multipart_not_json(self):
+        with patch.object(tb, "_request_with_retry") as mock_request:
+            tb.send_photo("https://api.telegram.org/botX", "123", b"fake-png-bytes", filename="k.png")
+
+        mock_request.assert_called_once()
+        args, kwargs = mock_request.call_args
+        self.assertEqual(args, ("POST", "https://api.telegram.org/botX/sendPhoto"))
+        self.assertEqual(kwargs["data"], {"chat_id": "123"})
+        self.assertEqual(kwargs["files"], {"photo": ("k.png", b"fake-png-bytes", "image/png")})
+        self.assertNotIn("json", kwargs)
+
+    def test_failure_is_caught_not_raised(self):
+        with patch.object(
+            tb, "_request_with_retry", side_effect=tb.requests.RequestException("boom")
+        ):
+            tb.send_photo("https://api.telegram.org/botX", "123", b"fake-png-bytes")  # no raise
+
+
 if __name__ == "__main__":
     unittest.main()

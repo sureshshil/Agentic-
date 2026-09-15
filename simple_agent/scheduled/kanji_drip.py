@@ -58,8 +58,9 @@ sys.path.insert(0, _SCHEDULED_DIR)
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
-from telegram_bot import send_srs_card  # noqa: E402 - needs sys.path insert above
+from telegram_bot import send_photo, send_srs_card  # noqa: E402 - needs sys.path insert above
 from kanji_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
+import kanji_image  # noqa: E402 - needs sys.path insert above
 import srs  # noqa: E402 - needs sys.path insert above
 
 KANJI_LEVEL = os.environ.get("KANJI_LEVEL") or "N3"
@@ -137,12 +138,12 @@ _STATUS_LABELS = {
 
 
 def format_card(row: dict, status: str, box: int, level: str) -> str:
-    """The HTML (parse_mode=HTML) message text for one kanji: the
-    character itself visible, everything else under a spoiler. `status`
-    is "new" (never sent before), "due" (a rated item's review interval
-    elapsed), or "reminder" (sent before but never rated, resurfaced
-    after srs.py's unrated-resurface timeout - see main())."""
-    kanji = (row.get("kanji") or "").strip()
+    """The HTML (parse_mode=HTML) message text sent under the rendered
+    kanji image (see kanji_image.render_kanji_png / main()): a status
+    header, then everything else under a spoiler. `status` is "new"
+    (never sent before), "due" (a rated item's review interval elapsed),
+    or "reminder" (sent before but never rated, resurfaced after srs.py's
+    unrated-resurface timeout - see main())."""
     header = _STATUS_LABELS[status].format(
         level=html.escape(level), box=box + 1, top=len(srs.BOX_HOURS_KANJI)
     )
@@ -174,7 +175,7 @@ def format_card(row: dict, status: str, box: int, level: str) -> str:
             line += f"\n— {html.escape(example_en)}"
         body.append(line)
 
-    return f"{header}\n\n<b>{html.escape(kanji)}</b>\n\n<tg-spoiler>{chr(10).join(body)}</tg-spoiler>"
+    return f"{header}\n\n<tg-spoiler>{chr(10).join(body)}</tg-spoiler>"
 
 
 def main() -> None:
@@ -219,6 +220,12 @@ def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = str(os.environ["TELEGRAM_ALLOWED_CHAT_ID"])
     api_base = f"https://api.telegram.org/bot{token}"
+
+    # The kanji itself goes out as a large rendered glyph, not plain Unicode
+    # text - Telegram clients render bare CJK text small/thin, which made the
+    # character genuinely hard to read at a glance. Sent as its own message
+    # (no caption/keyboard) right before the spoiler card that carries those.
+    send_photo(api_base, chat_id, kanji_image.render_kanji_png(key), filename="kanji.png")
     send_srs_card(api_base, chat_id, "k", key, html_text)
 
     print(f"\n[kanji] sent {key} ({status}) from {KANJI_CSV_GLOB} ({len(rows)} total)")
