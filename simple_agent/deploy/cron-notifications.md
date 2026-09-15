@@ -122,19 +122,29 @@ call (real environment variables always win):
    # doesn't call load_dotenv())
    0 8 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 news_digest_agent.py >> /var/log/news-digest.log 2>&1
 
-   # Vocab active-recall drip (7-word batch) - every 2 hours, but only
+   # Vocab active-recall drip (10-word batch) - every 2 hours, but only
    # 07:00-23:00 JST (0,2,4,...,22 minus the overnight hours) - adjust
    # this hour list to your own waking hours/timezone; there's no
-   # quiet-hours logic in the script itself.
-   0 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 vocab_drip.py >> /var/log/vocab-drip.log 2>&1
+   # quiet-hours logic in the script itself. Offset 15min from kanji's
+   # hourly :00 so the two never land in the same minute (they otherwise
+   # collide on every even JST hour, since vocab's 2-hourly slots are a
+   # subset of kanji's hourly ones).
+   15 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 vocab_drip.py >> /var/log/vocab-drip.log 2>&1
 
-   # Kanji active-recall drip (one card) - every hour within that same window
+   # Kanji active-recall drip (3-kanji batch) - every hour within that same window
    0 22,23,0-14 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 kanji_drip.py >> /var/log/kanji-drip.log 2>&1
 
-   # Grammar active-recall drip (one card) - every 2 hours, offset 30min
-   # from vocab so the two never land in the same minute
+   # Grammar active-recall drip (3-pattern batch) - every 2 hours, offset
+   # 30min from vocab (and thus 30min from kanji's hourly :00 too)
    30 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 grammar_drip.py >> /var/log/grammar-drip.log 2>&1
    ```
+
+   With WEBAPP_BASE_URL set, each of these fires is ONE Mini App
+   message (the whole batch as a swipeable deck), not one message per
+   item - see the Mini App section below. This is still a lot of
+   pushes/day (kanji hourly = 17/day, vocab + grammar every 2h = 9/day
+   each => ~35/day across the 07:00-23:00 window) - widen the hour
+   lists or drop to every-3/4-hours if that's too frequent for you.
 
    Replace `/path/to/Agentic-` with the repo's actual path on the VPS,
    and `python3` with a full interpreter path (`which python3`) if
