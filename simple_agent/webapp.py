@@ -17,17 +17,36 @@ visible at a time, swipe or Prev/Next between them, tap to reveal, rate
 to advance. Each rating submits straight to /api/submit instead of
 round-tripping through a Telegram callback_query.
 
-Auth: Telegram signs the page's `initData` (see verify_init_data) with
-an HMAC keyed off the bot token, so the page can't be opened by anyone
-but you and can't be spoofed by hand-crafting a request - same guarantee
-TELEGRAM_ALLOWED_CHAT_ID gives the polling loop. For a private chat with
-the bot, the WebApp's user id IS your chat id, so that's what gets
-compared against TELEGRAM_ALLOWED_CHAT_ID.
+Two ways to open the same link (send_web_app_card in telegram_bot.py
+sends both buttons on every card): a "Review" button (Telegram's
+`web_app` type) that opens it inside Telegram as a Mini App, and an
+"Open in browser" button (a plain `url` type) that launches Safari/
+Chrome instead. Both hit this exact same /review URL - only Telegram's
+button *type* differs, which is what decides whether Telegram launches
+its in-app webview (with the `Telegram.WebApp` JS bridge available) or
+hands off to the system browser (no bridge, no initData at all).
 
-kanji_drip.py / grammar_drip.py / vocab_drip.py all send one Mini App
-link per run's batch (see each module's find_row / build_body_lines,
-which this module imports lazily - see _load_drip_module - to avoid a
-circular import with telegram_bot.py at process startup).
+Auth is therefore two-layered:
+- Inside Telegram: Telegram signs the page's `initData` (see
+  verify_init_data) with an HMAC keyed off the bot token, so a rating
+  submit can't be spoofed - same guarantee TELEGRAM_ALLOWED_CHAT_ID
+  gives the polling loop. For a private chat with the bot, the WebApp's
+  user id IS your chat id, so that's what gets compared against
+  TELEGRAM_ALLOWED_CHAT_ID.
+- In a plain browser there's no initData to check (it doesn't exist
+  outside Telegram's own launch flow), so each link is itself signed
+  instead (see _sign_link / _verify_link): an HMAC over kind+keys+an
+  expiry, keyed by the same bot token, appended as `exp`/`sig` query
+  params by build_review_url. The page embeds those same values so a
+  submit can echo them back as proof the request originated from a
+  genuine, unexpired link - /api/submit only falls back to this when
+  `initData` is empty (i.e. never inside Telegram, where initData is
+  always populated), so the Mini App path is unchanged either way.
+
+kanji_drip.py / grammar_drip.py / vocab_drip.py all send one link per
+run's batch (see each module's find_row / build_body_lines, which this
+module imports lazily - see _load_drip_module - to avoid a circular
+import with telegram_bot.py at process startup).
 """
 
 import hashlib
@@ -51,6 +70,11 @@ _SCHEDULED_DIR = os.path.join(_SIMPLE_AGENT_DIR, "scheduled")
 WEBAPP_HOST = "127.0.0.1"
 WEBAPP_PORT = int(os.environ.get("WEBAPP_PORT") or "8080")
 INIT_DATA_MAX_AGE_SECONDS = 3600
+# How long a plain-browser link stays valid (see _sign_link) - generous,
+# since an SRS card may sit unrated in the chat for a while before you
+# get to it. Irrelevant to the Mini App path, which is authed by
+# initData (see module docstring), not by the link's own expiry.
+LINK_TTL_SECONDS = 30 * 24 * 3600
 
 # kind -> everything webapp.py needs to render that deck's cards and
 # record a rating, without importing kanji_drip.py/grammar_drip.py/
@@ -131,12 +155,40 @@ def _status_badge(rec: dict, box_hours: list) -> str:
     return f"\U0001f501 Review (box {box + 1}/{len(box_hours)})"
 
 
-def build_review_url(base_url: str, kind: str, keys: list) -> str:
-    """One Mini App link for a whole batch - kanji_drip.py / grammar_
-    drip.py / vocab_drip.py all call this instead of sending one message
-    per item. `keys` order is preserved as the card order in the deck."""
-    keys_param = urllib.parse.quote(",".join(keys), safe=",")
-    return f"{base_url.rstrip('/')}/review?kind={kind}&keys={keys_param}"
+def _sign_link(kind: str, keys_raw: str, exp: int, bot_token: str) -> str:
+    """HMAC over exactly what a request can present back (kind, the raw
+    comma-joined keys string as it appears in the URL, and the expiry) -
+    keyed by the bot token, same secret verify_init_data already trusts.
+    Used both to mint a link (build_review_url) and to check one
+    presented later (_verify_link)."""
+    payload = f"{kind}|{keys_raw}|{exp}"
+    return hmac.new(bot_token.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _verify_link(kind: str, keys_raw: str, exp: str, sig: str, bot_token: str) -> bool:
+    try:
+        exp_int = int(exp)
+    except (TypeError, ValueError):
+        return False
+    if time.time() > exp_int:
+        return False
+    expected = _sign_link(kind, keys_raw, exp_int, bot_token)
+    return hmac.compare_digest(expected, sig or "")
+
+
+def build_review_url(base_url: str, kind: str, keys: list, bot_token: str) -> str:
+    """One link for a whole batch - kanji_drip.py / grammar_drip.py /
+    vocab_drip.py all call this instead of sending one message per item.
+    `keys` order is preserved as the card order in the deck. Signed (see
+    _sign_link) so the link works as its own bearer credential for the
+    plain-browser "Open in browser" path (see module docstring) - the
+    Mini App path doesn't need this, but signing is cheap and uniform
+    either way."""
+    keys_raw = ",".join(keys)
+    exp = int(time.time()) + LINK_TTL_SECONDS
+    sig = _sign_link(kind, keys_raw, exp, bot_token)
+    keys_param = urllib.parse.quote(keys_raw, safe=",")
+    return f"{base_url.rstrip('/')}/review?kind={kind}&keys={keys_param}&exp={exp}&sig={sig}"
 
 
 # __KIND_LABEL__/__CARDS_JSON__ are replaced with .replace(), not
@@ -212,6 +264,13 @@ PAGE_TEMPLATE = """<!doctype html>
 
   var CARDS = JSON.parse(document.getElementById('cards-data').textContent);
   var KIND = "__KIND__";
+  // Fallback auth for the "Open in browser" path, where there's no
+  // Telegram initData at all - see module docstring. Unused (but still
+  // sent) when opened as a Mini App, where initData is always present
+  // and takes priority server-side.
+  var KEYS_RAW = __KEYS_RAW__;
+  var EXP = __EXP__;
+  var SIG = __SIG__;
   var index = 0;
   var revealed = CARDS.map(function () { return false; });
   var rated = CARDS.map(function () { return false; });
@@ -309,6 +368,9 @@ PAGE_TEMPLATE = """<!doctype html>
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         initData: tg ? tg.initData : '',
+        keysRaw: KEYS_RAW,
+        exp: EXP,
+        sig: SIG,
         kind: KIND,
         key: CARDS[i].key,
         action: action
@@ -386,9 +448,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def _handle_review_page(self, parsed):
         qs = urllib.parse.parse_qs(parsed.query)
         kind = (qs.get("kind") or [""])[0]
-        keys = [k for k in (qs.get("keys") or [""])[0].split(",") if k]
+        keys_raw = (qs.get("keys") or [""])[0]
+        keys = [k for k in keys_raw.split(",") if k]
+        exp = (qs.get("exp") or [""])[0]
+        sig = (qs.get("sig") or [""])[0]
         if kind not in _KIND_CONFIG or not keys:
             self._plain(400, "bad request")
+            return
+        if not _verify_link(kind, keys_raw, exp, sig, self.bot_token):
+            self._plain(401, "invalid or expired link")
             return
 
         cfg = _KIND_CONFIG[kind]
@@ -417,7 +485,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
 
         cards_json = json.dumps(cards, ensure_ascii=False).replace("</", "<\\/")
-        page = PAGE_TEMPLATE.replace("__KIND__", kind).replace("__CARDS_JSON__", cards_json)
+        page = (
+            PAGE_TEMPLATE.replace("__KIND__", kind)
+            .replace("__CARDS_JSON__", cards_json)
+            .replace("__KEYS_RAW__", json.dumps(keys_raw))
+            .replace("__EXP__", json.dumps(exp))
+            .replace("__SIG__", json.dumps(sig))
+        )
         self._html(200, page)
 
     def _handle_review_image(self, parsed):
@@ -442,22 +516,40 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": "malformed JSON body"})
             return
 
-        verified = verify_init_data(payload.get("initData", ""), self.bot_token)
-        if verified is None:
-            self._json(401, {"error": "invalid or expired initData"})
-            return
-
-        user = verified.get("user") or {}
-        if str(user.get("id", "")) != self.allowed_chat_id:
-            self._json(403, {"error": "not allowed"})
-            return
-
         kind = payload.get("kind", "")
         key = payload.get("key", "")
         action = payload.get("action", "")
         if kind not in _KIND_CONFIG or not key or action not in srs.ACTIONS:
             self._json(400, {"error": "bad request"})
             return
+
+        init_data = payload.get("initData", "")
+        if init_data:
+            # Opened as a Mini App inside Telegram - initData is always
+            # populated there, so this branch is authoritative whenever
+            # it's non-empty and failure here is a hard reject (never
+            # falls through to the link-signature check below).
+            verified = verify_init_data(init_data, self.bot_token)
+            if verified is None:
+                self._json(401, {"error": "invalid or expired initData"})
+                return
+            user = verified.get("user") or {}
+            if str(user.get("id", "")) != self.allowed_chat_id:
+                self._json(403, {"error": "not allowed"})
+                return
+        else:
+            # Opened via the "Open in browser" button - no Telegram
+            # bridge, so the link's own signature is the credential
+            # instead (see module docstring / _verify_link). The key
+            # being rated must actually be one this specific link named,
+            # so a valid-but-unrelated link can't be reused to rate
+            # something else.
+            keys_raw = payload.get("keysRaw", "")
+            exp = payload.get("exp", "")
+            sig = payload.get("sig", "")
+            if not _verify_link(kind, keys_raw, exp, sig, self.bot_token) or key not in keys_raw.split(","):
+                self._json(401, {"error": "invalid or expired link"})
+                return
 
         box_hours = _KIND_CONFIG[kind]["box_hours"]
         path = _srs_state_path(kind)

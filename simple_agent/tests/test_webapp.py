@@ -64,16 +64,53 @@ class VerifyInitDataTest(unittest.TestCase):
 
 class BuildReviewUrlTest(unittest.TestCase):
     def test_batch_of_keys_round_trips_through_the_query_string(self):
-        url = webapp.build_review_url("https://example.sslip.io", "k", ["決", "続", "増"])
+        url = webapp.build_review_url("https://example.sslip.io", "k", ["決", "続", "増"], BOT_TOKEN)
         self.assertTrue(url.startswith("https://example.sslip.io/review?kind=k&keys="))
         parsed = urllib.parse.urlparse(url)
         qs = urllib.parse.parse_qs(parsed.query)
         self.assertEqual(qs["keys"][0].split(","), ["決", "続", "増"])
 
     def test_trailing_slash_on_base_url_is_not_duplicated(self):
-        url = webapp.build_review_url("https://example.sslip.io/", "k", ["決"])
+        url = webapp.build_review_url("https://example.sslip.io/", "k", ["決"], BOT_TOKEN)
         self.assertTrue(url.startswith("https://example.sslip.io/review?"))
         self.assertNotIn("//review", url.split("://", 1)[1])
+
+    def test_url_carries_a_valid_signature_and_future_expiry(self):
+        url = webapp.build_review_url("https://example.sslip.io", "k", ["決"], BOT_TOKEN)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        exp, sig = qs["exp"][0], qs["sig"][0]
+        self.assertTrue(webapp._verify_link("k", "決", exp, sig, BOT_TOKEN))
+        self.assertGreater(int(exp), time.time())
+
+
+class VerifyLinkTest(unittest.TestCase):
+    def test_valid_signature_verifies(self):
+        exp = int(time.time()) + 3600
+        sig = webapp._sign_link("k", "決,続", exp, BOT_TOKEN)
+        self.assertTrue(webapp._verify_link("k", "決,続", str(exp), sig, BOT_TOKEN))
+
+    def test_tampered_signature_is_rejected(self):
+        exp = int(time.time()) + 3600
+        sig = webapp._sign_link("k", "決,続", exp, BOT_TOKEN)
+        self.assertFalse(webapp._verify_link("k", "決,続", str(exp), sig[:-4] + "0000", BOT_TOKEN))
+
+    def test_signature_for_different_keys_is_rejected(self):
+        exp = int(time.time()) + 3600
+        sig = webapp._sign_link("k", "決,続", exp, BOT_TOKEN)
+        self.assertFalse(webapp._verify_link("k", "決,増", str(exp), sig, BOT_TOKEN))
+
+    def test_expired_link_is_rejected(self):
+        exp = int(time.time()) - 10
+        sig = webapp._sign_link("k", "決", exp, BOT_TOKEN)
+        self.assertFalse(webapp._verify_link("k", "決", str(exp), sig, BOT_TOKEN))
+
+    def test_wrong_bot_token_is_rejected(self):
+        exp = int(time.time()) + 3600
+        sig = webapp._sign_link("k", "決", exp, BOT_TOKEN)
+        self.assertFalse(webapp._verify_link("k", "決", str(exp), sig, "OTHER:TOKEN"))
+
+    def test_malformed_exp_is_rejected(self):
+        self.assertFalse(webapp._verify_link("k", "決", "not-a-number", "whatever", BOT_TOKEN))
 
 
 class ReviewServerTest(unittest.TestCase):
@@ -126,7 +163,7 @@ class ReviewServerTest(unittest.TestCase):
             return exc.code, exc.read().decode()
 
     def test_review_page_serves_a_batch_of_kanji_as_one_deck(self):
-        url = webapp.build_review_url("", "k", ["決", "続", "増"])
+        url = webapp.build_review_url("", "k", ["決", "続", "増"], BOT_TOKEN)
         status, body = self._get(url)
         self.assertEqual(status, 200)
         self.assertIn("submitRating", body)
@@ -138,7 +175,7 @@ class ReviewServerTest(unittest.TestCase):
         self.assertTrue(all(c["image"] for c in cards))
 
     def test_review_page_serves_a_grammar_batch_without_images(self):
-        url = webapp.build_review_url("", "g", ["〜ようになる"])
+        url = webapp.build_review_url("", "g", ["〜ようになる"], BOT_TOKEN)
         status, body = self._get(url)
         self.assertEqual(status, 200)
         cards_json = body.split('id="cards-data">', 1)[1].split("</script>", 1)[0]
@@ -148,7 +185,7 @@ class ReviewServerTest(unittest.TestCase):
         self.assertNotIn("image", cards[0])
 
     def test_review_page_serves_a_vocab_batch(self):
-        url = webapp.build_review_url("", "v", ["関係"])
+        url = webapp.build_review_url("", "v", ["関係"], BOT_TOKEN)
         status, body = self._get(url)
         self.assertEqual(status, 200)
         cards_json = body.split('id="cards-data">', 1)[1].split("</script>", 1)[0]
@@ -156,7 +193,7 @@ class ReviewServerTest(unittest.TestCase):
         self.assertEqual(cards[0]["key"], "関係")
 
     def test_review_page_skips_unknown_keys_but_keeps_known_ones(self):
-        url = webapp.build_review_url("", "k", ["決", "不明"])  # 不明 not in fixture
+        url = webapp.build_review_url("", "k", ["決", "不明"], BOT_TOKEN)  # 不明 not in fixture
         status, body = self._get(url)
         self.assertEqual(status, 200)
         cards_json = body.split('id="cards-data">', 1)[1].split("</script>", 1)[0]
@@ -164,7 +201,7 @@ class ReviewServerTest(unittest.TestCase):
         self.assertEqual([c["key"] for c in cards], ["決"])
 
     def test_review_page_404s_when_every_key_is_unknown(self):
-        url = webapp.build_review_url("", "k", ["不明"])
+        url = webapp.build_review_url("", "k", ["不明"], BOT_TOKEN)
         status, _ = self._get(url)
         self.assertEqual(status, 404)
 
@@ -175,6 +212,22 @@ class ReviewServerTest(unittest.TestCase):
     def test_review_page_400s_for_unknown_kind(self):
         status, _ = self._get("/review?kind=x&keys=%E6%B1%BA")
         self.assertEqual(status, 400)
+
+    def test_review_page_401s_without_a_valid_signature(self):
+        status, _ = self._get("/review?kind=k&keys=%E6%B1%BA")  # no exp/sig at all
+        self.assertEqual(status, 401)
+
+    def test_review_page_401s_with_a_tampered_signature(self):
+        url = webapp.build_review_url("", "k", ["決"], BOT_TOKEN)
+        tampered = url[:-4] + "0000"
+        status, _ = self._get(tampered)
+        self.assertEqual(status, 401)
+
+    def test_review_page_401s_with_an_expired_link(self):
+        exp = int(time.time()) - 10
+        sig = webapp._sign_link("k", "決", exp, BOT_TOKEN)
+        status, _ = self._get(f"/review?kind=k&keys=%E6%B1%BA&exp={exp}&sig={sig}")
+        self.assertEqual(status, 401)
 
     def test_review_image_is_a_valid_png(self):
         resp = urllib.request.urlopen(f"{self.base}/review/image?key=%E6%B1%BA")
@@ -204,6 +257,47 @@ class ReviewServerTest(unittest.TestCase):
         init_data = _sign({"auth_date": str(int(time.time())), "user": json.dumps({"id": int(self.ALLOWED_CHAT_ID)})})
         status, body = self._post_submit({"initData": init_data, "kind": "k", "key": "決", "action": "whoops"})
         self.assertEqual(status, 400)
+
+    # "Open in browser" path - no Telegram initData at all, so the link's
+    # own signature is the credential instead (see webapp.py's module
+    # docstring / _verify_link).
+
+    def test_submit_via_link_signature_succeeds_with_no_init_data(self):
+        exp = int(time.time()) + 3600
+        sig = webapp._sign_link("k", "決,続", exp, BOT_TOKEN)
+        status, body = self._post_submit({
+            "initData": "", "keysRaw": "決,続", "exp": str(exp), "sig": sig,
+            "kind": "k", "key": "決", "action": "easy",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(body["label"], "Easy")
+
+    def test_submit_via_link_signature_rejects_a_key_not_in_the_link(self):
+        exp = int(time.time()) + 3600
+        sig = webapp._sign_link("k", "決,続", exp, BOT_TOKEN)  # signed for 決/続 only
+        status, body = self._post_submit({
+            "initData": "", "keysRaw": "決,続", "exp": str(exp), "sig": sig,
+            "kind": "k", "key": "増", "action": "good",  # not part of this link
+        })
+        self.assertEqual(status, 401)
+
+    def test_submit_via_link_signature_rejects_a_tampered_signature(self):
+        exp = int(time.time()) + 3600
+        sig = webapp._sign_link("k", "決", exp, BOT_TOKEN)
+        status, body = self._post_submit({
+            "initData": "", "keysRaw": "決", "exp": str(exp), "sig": sig[:-4] + "0000",
+            "kind": "k", "key": "決", "action": "good",
+        })
+        self.assertEqual(status, 401)
+
+    def test_submit_via_link_signature_rejects_an_expired_link(self):
+        exp = int(time.time()) - 10
+        sig = webapp._sign_link("k", "決", exp, BOT_TOKEN)
+        status, body = self._post_submit({
+            "initData": "", "keysRaw": "決", "exp": str(exp), "sig": sig,
+            "kind": "k", "key": "決", "action": "good",
+        })
+        self.assertEqual(status, 401)
 
 
 if __name__ == "__main__":

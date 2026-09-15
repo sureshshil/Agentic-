@@ -270,9 +270,12 @@ def main() -> None:
         # whole batch as a swipeable flashcard deck inside Telegram (a
         # Mini App - webapp.py) instead of a header message plus one
         # spoiler card per word piling up in the chat.
-        review_url = webapp.build_review_url(WEBAPP_BASE_URL, "v", picked_keys)
+        review_url = webapp.build_review_url(WEBAPP_BASE_URL, "v", picked_keys, token)
         header = f"\U0001f4d8 {VOCAB_LEVEL} vocabulary review ({len(picks)} card{'s' if len(picks) != 1 else ''})"
-        send_web_app_card(api_base, chat_id, header, "\U0001f4d6 Review", review_url)
+        send_web_app_card(
+            api_base, chat_id, header, "\U0001f4d6 Review", review_url,
+            browser_button_text="\U0001f310 Open in browser",
+        )
         print(f"\n[vocab] sent {len(picks)} words via Mini App link from {VOCAB_TSV_GLOB}: {', '.join(picked_keys)}")
     else:
         blocks = []

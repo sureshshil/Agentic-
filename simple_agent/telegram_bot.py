@@ -1060,15 +1060,28 @@ def _send_card(api_base: str, chat_id: str, html_text: str, inline_keyboard: lis
         print(f"Warning: failed to send Telegram SRS card ({exc})")
 
 
-def send_web_app_card(api_base: str, chat_id: str, html_text: str, button_text: str, url: str) -> None:
-    """One short message with a single button that opens `url` inside
-    Telegram itself as a Mini App (a `web_app` inline-keyboard button,
-    not a plain link - Telegram only renders it as an in-app webview,
-    not a browser tab, when the button carries `web_app` instead of
-    `url`). Used by kanji_drip.py (see its WEBAPP_BASE_URL branch)
-    instead of send_photo + send_srs_card's three-message flow, once
-    webapp.py's review server is configured."""
-    _send_card(api_base, chat_id, html_text, [[{"text": button_text, "web_app": {"url": url}}]])
+def send_web_app_card(
+    api_base: str, chat_id: str, html_text: str, button_text: str, url: str,
+    browser_button_text: str = None,
+) -> None:
+    """One short message with a button that opens `url` inside Telegram
+    itself as a Mini App (a `web_app` inline-keyboard button, not a
+    plain link - Telegram only renders it as an in-app webview, not a
+    browser tab, when the button carries `web_app` instead of `url`).
+    Used by kanji_drip.py/grammar_drip.py/vocab_drip.py (see each
+    script's WEBAPP_BASE_URL branch) instead of their old per-item
+    message flow, once webapp.py's review server is configured.
+
+    If `browser_button_text` is given, a second row is added with the
+    SAME url as a plain `url`-type button, which Telegram opens in the
+    system browser (Safari/Chrome) instead of its own webview - see
+    webapp.py's module docstring for how the one page authenticates
+    both entry points. The Mini App button/row is unaffected either
+    way - this is purely additive."""
+    keyboard = [[{"text": button_text, "web_app": {"url": url}}]]
+    if browser_button_text:
+        keyboard.append([{"text": browser_button_text, "url": url}])
+    _send_card(api_base, chat_id, html_text, keyboard)
 
 
 def send_srs_card(api_base: str, chat_id: str, kind: str, item_key: str, html_text: str) -> None:
