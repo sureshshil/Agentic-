@@ -48,7 +48,7 @@ telegram_bot.py - real environment variables always win):
   TELEGRAM_BOT_TOKEN        required, from ../telegram_bot.env
   TELEGRAM_ALLOWED_CHAT_ID  required, from ../telegram_bot.env
   VOCAB_LEVEL               optional, default "N3" (JLPT level, label only)
-  VOCAB_BATCH_SIZE          optional, default 7 (words per push)
+  VOCAB_BATCH_SIZE          optional, default 10 (words per push)
   VOCAB_NEW_PER_DAY         optional, default 16 (new words introduced/UTC day)
   VOCAB_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next -
                             a sent-but-never-tapped word comes back around
@@ -86,12 +86,13 @@ sys.path.insert(0, _SCHEDULED_DIR)
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
-from telegram_bot import send_srs_card, send_telegram_reply  # noqa: E402 - needs sys.path insert above
+from telegram_bot import send_srs_card, send_telegram_reply, send_web_app_card  # noqa: E402 - needs sys.path insert above
 from vocab_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import srs  # noqa: E402 - needs sys.path insert above
+import webapp  # noqa: E402 - needs sys.path insert above
 
 VOCAB_LEVEL = os.environ.get("VOCAB_LEVEL") or "N3"
-VOCAB_BATCH_SIZE = int(os.environ.get("VOCAB_BATCH_SIZE") or "7")
+VOCAB_BATCH_SIZE = int(os.environ.get("VOCAB_BATCH_SIZE") or "10")
 VOCAB_NEW_PER_DAY = int(os.environ.get("VOCAB_NEW_PER_DAY") or "16")
 VOCAB_UNRATED_RESURFACE_HOURS = float(os.environ.get("VOCAB_UNRATED_RESURFACE_HOURS") or "3")
 VOCAB_TSV_GLOB = os.environ.get("VOCAB_TSV_GLOB") or os.path.join(
@@ -100,6 +101,10 @@ VOCAB_TSV_GLOB = os.environ.get("VOCAB_TSV_GLOB") or os.path.join(
 VOCAB_SRS_PATH = os.environ.get("VOCAB_SRS_PATH") or os.path.join(
     _SIMPLE_AGENT_DIR, ".vocab_srs.json"
 )
+# See kanji_drip.py's WEBAPP_BASE_URL comment - same opt-in switch. When
+# set, the whole batch goes out as one Mini App link (swipeable flashcard
+# deck) instead of one Telegram message per word.
+WEBAPP_BASE_URL = (os.environ.get("WEBAPP_BASE_URL") or "").rstrip("/")
 
 # The '#columns:<tab-separated names>' line in each Anki-style TSV header.
 _COLUMN_HEADER_PREFIX = "#columns:"
@@ -152,6 +157,16 @@ def load_rows(glob_pattern: str) -> list:
     return rows
 
 
+def find_row(key: str) -> dict:
+    """The TSV row for one word, or None - used by webapp.py to look up
+    a card's content from its Mini App review link (see main()'s
+    WEBAPP_BASE_URL branch)."""
+    for row in load_rows(VOCAB_TSV_GLOB):
+        if (row.get("word") or "").strip() == key:
+            return row
+    return None
+
+
 def row_to_entry(row: dict) -> dict:
     """One TSV row -> the structured dict both format_word_block (below)
     and the Notion / Google Doc sinks expect (word / reading / meaning /
@@ -176,11 +191,11 @@ def row_to_entry(row: dict) -> dict:
     }
 
 
-def format_word_block(row: dict, status: str) -> str:
-    """One word's HTML (parse_mode=HTML) block within a batch message:
-    the word itself visible, everything else under its own <tg-spoiler>
-    (each spoiler in a message reveals independently on tap). `status` is
-    "new" / "due" / "reminder" - see kanji_drip.format_card."""
+def build_body_lines(row: dict) -> list:
+    """Reading/meaning/particles/examples for one word, as a list of
+    HTML-escaped lines (see kanji_drip.build_body_lines - same
+    join-with-'\\n' convention, shared by format_word_block's
+    <tg-spoiler> body and webapp.py's browser-rendered review page)."""
     entry = row_to_entry(row)
     lines = [
         f"{html.escape(entry['reading'])} — {html.escape(entry['meaning'])}"
@@ -194,7 +209,16 @@ def format_word_block(row: dict, status: str) -> str:
         lines.append("例文:")
         for i, example in enumerate(entry["examples"], 1):
             lines.append(f"{i}. {html.escape(example)}")
+    return lines
 
+
+def format_word_block(row: dict, status: str) -> str:
+    """One word's HTML (parse_mode=HTML) block within a batch message:
+    the word itself visible, everything else under its own <tg-spoiler>
+    (each spoiler in a message reveals independently on tap). `status` is
+    "new" / "due" / "reminder" - see kanji_drip.format_card."""
+    entry = row_to_entry(row)
+    lines = build_body_lines(row)
     marker = _STATUS_MARKERS[status]
     return f"{marker} <b>{html.escape(entry['word'])}</b>\n<tg-spoiler>{chr(10).join(lines)}</tg-spoiler>"
 
@@ -235,32 +259,38 @@ def main() -> None:
 
     srs.save_state(VOCAB_SRS_PATH, state)  # pick_batch already recorded any new intros
 
-    blocks = []
-    item_keys = []  # one send_srs_card call per word, same order as blocks
-    entries = []  # for the optional Notion/Google Doc sinks, same shape as before
-    statuses = []
-    for key, is_new in picks:
-        rec = state.get(key, {})
-        status = "new" if is_new else ("due" if rec.get("due") else "reminder")
-        row = row_by_key[key]
-        blocks.append(format_word_block(row, status))
-        item_keys.append(key)
-        entries.append(row_to_entry(row))
-        statuses.append(f"{key} ({status})")
-
-    print(build_message(blocks))  # cron log only - not what gets sent
-
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = str(os.environ["TELEGRAM_ALLOWED_CHAT_ID"])
     api_base = f"https://api.telegram.org/bot{token}"
+    picked_keys = [key for key, _ in picks]
+    entries = [row_to_entry(row_by_key[key]) for key in picked_keys]
 
-    send_telegram_reply(
-        api_base, chat_id, f"\U0001f4d8 {VOCAB_LEVEL} Vocabulary ({len(picks)} words)"
-    )
-    for key, block in zip(item_keys, blocks):
-        send_srs_card(api_base, chat_id, "v", key, block)
+    if WEBAPP_BASE_URL:
+        # One short message with a single "Review" button that opens the
+        # whole batch as a swipeable flashcard deck inside Telegram (a
+        # Mini App - webapp.py) instead of a header message plus one
+        # spoiler card per word piling up in the chat.
+        review_url = webapp.build_review_url(WEBAPP_BASE_URL, "v", picked_keys)
+        header = f"\U0001f4d8 {VOCAB_LEVEL} vocabulary review ({len(picks)} card{'s' if len(picks) != 1 else ''})"
+        send_web_app_card(api_base, chat_id, header, "\U0001f4d6 Review", review_url)
+        print(f"\n[vocab] sent {len(picks)} words via Mini App link from {VOCAB_TSV_GLOB}: {', '.join(picked_keys)}")
+    else:
+        blocks = []
+        statuses = []
+        for key, is_new in picks:
+            rec = state.get(key, {})
+            status = "new" if is_new else ("due" if rec.get("due") else "reminder")
+            row = row_by_key[key]
+            blocks.append(format_word_block(row, status))
+            statuses.append(f"{key} ({status})")
 
-    print(f"\n[vocab] sent {len(picks)} words from {VOCAB_TSV_GLOB}: {', '.join(statuses)}")
+        print(build_message(blocks))  # cron log only - not what gets sent
+        send_telegram_reply(
+            api_base, chat_id, f"\U0001f4d8 {VOCAB_LEVEL} Vocabulary ({len(picks)} words)"
+        )
+        for key, block in zip(picked_keys, blocks):
+            send_srs_card(api_base, chat_id, "v", key, block)
+        print(f"\n[vocab] sent {len(picks)} words from {VOCAB_TSV_GLOB}: {', '.join(statuses)}")
 
     # Optional extra sinks - after Telegram (the primary channel) and the
     # SRS state save, so a slow or failing API here never delays the

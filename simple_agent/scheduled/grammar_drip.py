@@ -1,21 +1,25 @@
-"""Every-2-hours single-grammar-pattern active-recall drip via Telegram,
+"""Every-2-hours grammar-pattern active-recall drip via Telegram,
 spaced-repetition version - sibling to kanji_drip.py (same srs.py engine,
-same telegram_bot.py callback handler), just on a slower cadence and a
-different deck. See kanji_drip.py's docstring for the full rationale
-(active recall behind a spoiler tag, Leitner review intervals, due
-reviews before new introductions, a daily cap on new items).
+same telegram_bot.py callback handler, same webapp.py Mini App), just on
+a slower cadence and a different deck. See kanji_drip.py's docstring for
+the full rationale (active recall, Leitner review intervals, due reviews
+before new introductions, a daily cap on new items, batched into one
+swipeable Mini App link when WEBAPP_BASE_URL is set).
 
 Grammar content comes from the hand-curated CSVs next to this repo
 (../n3_grammar_batch*.csv by default, override with GRAMMAR_CSV_GLOB) -
-NOT from an LLM call. Button taps are handled entirely by
-telegram_bot.py's long-polling loop; this script only ever sends. State
-lives in .grammar_srs.json (gitignored).
+NOT from an LLM call. Button taps (or, with WEBAPP_BASE_URL set, Mini App
+rating submits) are handled entirely by telegram_bot.py's long-polling
+loop / webapp.py; this script only ever sends. State lives in
+.grammar_srs.json (gitignored).
 
 Env vars (loaded via python-dotenv from ../telegram_bot.env and
 ../deploy/scheduled.env, real environment variables always win):
   TELEGRAM_BOT_TOKEN         required, from ../telegram_bot.env
   TELEGRAM_ALLOWED_CHAT_ID   required, from ../telegram_bot.env
   GRAMMAR_LEVEL              optional, default "N3" (label only)
+  GRAMMAR_BATCH_SIZE         optional, default 3 (patterns per push - see
+                             srs.pick_batch; only matters with WEBAPP_BASE_URL set)
   GRAMMAR_NEW_PER_DAY        optional, default 4 (new patterns/UTC day)
   GRAMMAR_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next -
                              a sent-but-never-rated pattern comes back
@@ -44,11 +48,13 @@ sys.path.insert(0, _SCHEDULED_DIR)
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
-from telegram_bot import send_srs_card  # noqa: E402 - needs sys.path insert above
+from telegram_bot import send_srs_card, send_web_app_card  # noqa: E402 - needs sys.path insert above
 from grammar_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import srs  # noqa: E402 - needs sys.path insert above
+import webapp  # noqa: E402 - needs sys.path insert above
 
 GRAMMAR_LEVEL = os.environ.get("GRAMMAR_LEVEL") or "N3"
+GRAMMAR_BATCH_SIZE = int(os.environ.get("GRAMMAR_BATCH_SIZE") or "3")
 GRAMMAR_NEW_PER_DAY = int(os.environ.get("GRAMMAR_NEW_PER_DAY") or "4")
 GRAMMAR_UNRATED_RESURFACE_HOURS = float(os.environ.get("GRAMMAR_UNRATED_RESURFACE_HOURS") or "3")
 GRAMMAR_CSV_GLOB = os.environ.get("GRAMMAR_CSV_GLOB") or os.path.join(
@@ -57,6 +63,8 @@ GRAMMAR_CSV_GLOB = os.environ.get("GRAMMAR_CSV_GLOB") or os.path.join(
 GRAMMAR_SRS_PATH = os.environ.get("GRAMMAR_SRS_PATH") or os.path.join(
     _SIMPLE_AGENT_DIR, ".grammar_srs.json"
 )
+# See kanji_drip.py's WEBAPP_BASE_URL comment - same opt-in switch.
+WEBAPP_BASE_URL = (os.environ.get("WEBAPP_BASE_URL") or "").rstrip("/")
 
 
 def load_rows(glob_pattern: str) -> list:
@@ -74,6 +82,16 @@ def load_rows(glob_pattern: str) -> list:
                 seen.add(pattern)
                 rows.append(row)
     return rows
+
+
+def find_row(key: str) -> dict:
+    """The CSV row for one grammar pattern, or None - used by webapp.py
+    to look up a card's content from its Mini App review link (see
+    main()'s WEBAPP_BASE_URL branch)."""
+    for row in load_rows(GRAMMAR_CSV_GLOB):
+        if (row.get("grammar") or "").strip() == key:
+            return row
+    return None
 
 
 def row_to_entry(row: dict) -> dict:
@@ -105,15 +123,11 @@ _STATUS_LABELS = {
 }
 
 
-def format_card(row: dict, status: str, box: int, level: str) -> str:
-    """The HTML (parse_mode=HTML) message text for one grammar pattern:
-    the pattern itself visible, everything else under a spoiler. `status`
-    is "new" / "due" / "reminder" - see kanji_drip.format_card."""
-    pattern = (row.get("grammar") or "").strip()
-    header = _STATUS_LABELS[status].format(
-        level=html.escape(level), box=box + 1, top=len(srs.BOX_HOURS_GRAMMAR)
-    )
-
+def build_body_lines(row: dict) -> list:
+    """Formation/meaning/nuance/contrast/example for one grammar pattern,
+    as a list of HTML-escaped lines (see kanji_drip.build_body_lines -
+    same join-with-'\\n' convention, shared by format_card's <tg-spoiler>
+    body and webapp.py's browser-rendered review page)."""
     body = []
     if (row.get("formation") or "").strip():
         body.append(f"形: {html.escape(row['formation'].strip())}")
@@ -139,6 +153,18 @@ def format_card(row: dict, status: str, box: int, level: str) -> str:
             example_lines.append(f"— {html.escape(ex_en)}")
         body.append("\n".join(example_lines))
 
+    return body
+
+
+def format_card(row: dict, status: str, box: int, level: str) -> str:
+    """The HTML (parse_mode=HTML) message text for one grammar pattern:
+    the pattern itself visible, everything else under a spoiler. `status`
+    is "new" / "due" / "reminder" - see kanji_drip.format_card."""
+    pattern = (row.get("grammar") or "").strip()
+    header = _STATUS_LABELS[status].format(
+        level=html.escape(level), box=box + 1, top=len(srs.BOX_HOURS_GRAMMAR)
+    )
+    body = build_body_lines(row)
     return f"{header}\n\n<b>{html.escape(pattern)}</b>\n\n<tg-spoiler>{chr(10).join(body)}</tg-spoiler>"
 
 
@@ -160,40 +186,51 @@ def main() -> None:
 
     state = srs.load_state(GRAMMAR_SRS_PATH)
     now = srs.now_utc()
-    key, is_new = srs.pick_next(
-        keys, state, now, GRAMMAR_NEW_PER_DAY, unrated_resurface_hours=GRAMMAR_UNRATED_RESURFACE_HOURS
+    picks = srs.pick_batch(
+        keys, state, now, GRAMMAR_BATCH_SIZE, GRAMMAR_NEW_PER_DAY,
+        unrated_resurface_hours=GRAMMAR_UNRATED_RESURFACE_HOURS,
     )
 
-    if key is None:
+    if not picks:
         print(
             f"[grammar] nothing due and today's {GRAMMAR_NEW_PER_DAY}-new-pattern cap "
             "is reached - skipping this run."
         )
         return
 
-    if is_new:
-        srs.save_state(GRAMMAR_SRS_PATH, state)  # pick_next already recorded the intro
-
-    rec = state.get(key, {})
-    box = rec.get("box", 0)
-    status = "new" if is_new else ("due" if rec.get("due") else "reminder")
-    row = row_by_key[key]
-    html_text = format_card(row, status, box, GRAMMAR_LEVEL)
-    print(html_text)
+    srs.save_state(GRAMMAR_SRS_PATH, state)  # pick_batch already recorded any new intros
 
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = str(os.environ["TELEGRAM_ALLOWED_CHAT_ID"])
     api_base = f"https://api.telegram.org/bot{token}"
-    send_srs_card(api_base, chat_id, "g", key, html_text)
+    picked_keys = [key for key, _ in picks]
 
-    print(f"\n[grammar] sent {key!r} ({status}) from {GRAMMAR_CSV_GLOB} ({len(rows)} total)")
+    if WEBAPP_BASE_URL:
+        # One short message with a single "Review" button that opens the
+        # whole batch as a swipeable flashcard deck inside Telegram (a
+        # Mini App - webapp.py) instead of a spoiler card + button row
+        # per pattern piling up in the chat.
+        review_url = webapp.build_review_url(WEBAPP_BASE_URL, "g", picked_keys)
+        header = f"\U0001f210 {GRAMMAR_LEVEL} grammar review ({len(picks)} card{'s' if len(picks) != 1 else ''})"
+        send_web_app_card(api_base, chat_id, header, "\U0001f4d6 Review", review_url)
+        print(f"\n[grammar] sent {len(picks)} patterns via Mini App link from {GRAMMAR_CSV_GLOB}: {', '.join(picked_keys)}")
+    else:
+        for key, is_new in picks:
+            rec = state.get(key, {})
+            box = rec.get("box", 0)
+            status = "new" if is_new else ("due" if rec.get("due") else "reminder")
+            row = row_by_key[key]
+            html_text = format_card(row, status, box, GRAMMAR_LEVEL)
+            print(html_text)
+            send_srs_card(api_base, chat_id, "g", key, html_text)
+        print(f"\n[grammar] sent {len(picks)} patterns from {GRAMMAR_CSV_GLOB}: {', '.join(picked_keys)}")
 
     # Optional extra sinks - after Telegram (the primary channel) and the
     # SRS state save, so a slow or failing API here never delays the
     # phone push or risks re-picking the same pattern next run. Each
     # returns a status string (never raises); print it for the cron log.
     now_dt = datetime.now(timezone.utc)
-    entries = [row_to_entry(row)]
+    entries = [row_to_entry(row_by_key[key]) for key in picked_keys]
     if os.environ.get("NOTION_API_KEY") and os.environ.get("NOTION_GRAMMAR_DB_ID"):
         print(notion_add_row(entries, GRAMMAR_LEVEL))
     if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") and os.environ.get("GRAMMAR_GDOC_ID"):

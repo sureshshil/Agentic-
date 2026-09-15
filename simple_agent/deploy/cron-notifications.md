@@ -240,14 +240,19 @@ python3 grammar_drip.py
 
 ## Optional: SRS review via Telegram Mini App instead of chat clutter
 
-By default each drip sends three chunky messages per item (the kanji
-image, a `<tg-spoiler>` card, and an Again/Hard/Good/Easy button row).
-`webapp.py` replaces that with a Telegram **Mini App**: one short message
-with a single "Review" button that opens the full card (image, tap-to-
-reveal answer, rating buttons) inside Telegram itself, in a webview - no
-browser tab, far less scrollback. It runs as a background thread inside
-`telegram_bot.py`'s own process (same systemd service, nothing new to
-manage or restart separately).
+By default each drip sends one chunky set of messages *per item* (kanji:
+image + `<tg-spoiler>` card + button row; grammar: pattern + spoiler card
++ button row; vocab: a header message plus one spoiler block per word).
+`webapp.py` replaces that with a Telegram **Mini App**: each run's whole
+batch goes out as ONE short message with a single "Review" button that
+opens a swipeable flashcard deck inside Telegram itself - one card at a
+time (image for kanji, big text for grammar/vocab), tap to reveal, swipe
+or Prev/Next between cards, rate to advance, auto-closes once every card
+in the batch is rated. No browser tab, far less scrollback. Runs as a
+background thread inside `telegram_bot.py`'s own process (same systemd
+service, nothing new to manage or restart separately). Batch sizes are
+each deck's own `*_BATCH_SIZE` env var (defaults: kanji 3, grammar 3,
+vocab 10 - see `scheduled.env.example`).
 
 Telegram only allows a Mini App button to open an **HTTPS** URL with a
 real certificate - no plain HTTP, no self-signed cert - so this needs a
@@ -276,14 +281,14 @@ Let's Encrypt certificate automatically.
    ```
 3. **Set `WEBAPP_BASE_URL`** (the public origin from step 1) and
    optionally `WEBAPP_PORT` (default `8080`) in `../telegram_bot.env` -
-   loaded by both `telegram_bot.py` (which binds the port) and
-   `kanji_drip.py` (which uses the base URL to build each card's Review
-   link). Leave `WEBAPP_BASE_URL` unset to keep the old three-message
-   flow - `kanji_drip.py` falls back automatically.
+   loaded by `telegram_bot.py` (which binds the port) and all three drip
+   scripts (which use the base URL to build their batch's Review link).
+   Leave `WEBAPP_BASE_URL` unset to keep each script's old per-item
+   message flow - they all fall back automatically.
 4. `systemctl restart telegram-bot` - watch for `[webapp] Mini App
    review server listening on 127.0.0.1:8080` in `journalctl -u
-   telegram-bot`, then run `python3 kanji_drip.py` manually to send a
-   test card.
+   telegram-bot`, then run `python3 kanji_drip.py` (or `grammar_drip.py`
+   / `vocab_drip.py`) manually to send a test batch.
 
 Auth: the Mini App page can't be opened or forged by a stranger who
 finds the URL - Telegram signs each page load's `initData` with an HMAC
@@ -292,6 +297,5 @@ keyed on the bot token (`webapp.py`'s `verify_init_data`), and
 `TELEGRAM_ALLOWED_CHAT_ID` before touching any SRS state file, the same
 guarantee `TELEGRAM_ALLOWED_CHAT_ID` already gives the polling loop.
 
-Only `kanji_drip.py` (`kind="k"`) is wired up so far; `grammar_drip.py`
-and `vocab_drip.py` can follow the same shape later (see `_KIND_CONFIG`
-in `webapp.py`).
+All three decks (`kind="k"`/`"g"`/`"v"`) are wired up - see
+`_KIND_CONFIG` in `webapp.py` if you add a fourth deck later.

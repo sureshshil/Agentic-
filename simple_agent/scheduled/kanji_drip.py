@@ -1,18 +1,20 @@
-"""Hourly single-kanji active-recall drip via Telegram, spaced-repetition
+"""Hourly kanji active-recall drip via Telegram, spaced-repetition
 version - same thin-entry-point cron pattern as vocab_drip.py next to this
-file, but a different learning shape on purpose:
+file. Each run picks up to KANJI_BATCH_SIZE kanji (srs.pick_batch, default
+3) - one at a time, character shown plain, everything else (reading,
+meaning, mnemonic, compounds, example) hidden until you actively try to
+recall it, then rate your own recall with Again / Hard / Good / Easy. That
+rating drives a Leitner-style per-kanji review interval (srs.py, shared
+with grammar_drip.py) - reviews that are actually due always go out
+before any brand-new kanji, and only up to KANJI_NEW_PER_DAY new kanji
+get introduced per UTC day so the due queue can't outrun what one-an-hour
+can actually clear.
 
-vocab_drip pushes a batch of words every couple hours and just cycles
-through them (never-sent first, then least-recently-sent) - fine for a
-passive read. This is meant to be a habit: ONE kanji an hour, character
-shown plain, everything else (reading, meaning, mnemonic, compounds,
-example) hidden behind a Telegram spoiler tag so you have to actually try
-to recall it before revealing, then rate your own recall with an inline
-Again / Hard / Good / Easy keyboard. That rating drives a Leitner-style
-per-kanji review interval (srs.py, shared with grammar_drip.py) - reviews
-that are actually due always go out before any brand-new kanji, and only
-up to KANJI_NEW_PER_DAY new kanji get introduced per UTC day so the due
-queue can't outrun what one-an-hour can actually clear.
+When WEBAPP_BASE_URL is set (see webapp.py / deploy/cron-
+notifications.md), the whole batch goes out as ONE short message with a
+"Review" button that opens a swipeable flashcard deck inside Telegram
+itself. Unset, it falls back to the old flow: each kanji as its own
+image + <tg-spoiler> card + button row.
 
 The button taps are handled by telegram_bot.py's own long-polling loop
 (handle_srs_callback), not by this script - this script only ever sends;
@@ -29,6 +31,9 @@ telegram_bot.py - real environment variables always win):
   TELEGRAM_BOT_TOKEN        required, from ../telegram_bot.env
   TELEGRAM_ALLOWED_CHAT_ID  required, from ../telegram_bot.env
   KANJI_LEVEL               optional, default "N3" (label only)
+  KANJI_BATCH_SIZE          optional, default 3 (kanji per push - see srs.pick_batch;
+                            only matters when WEBAPP_BASE_URL is set, since the old
+                            per-item card flow below always sent exactly one)
   KANJI_NEW_PER_DAY         optional, default 6 (new kanji introduced/UTC day)
   KANJI_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next -
                             a sent-but-never-rated kanji comes back around
@@ -46,7 +51,6 @@ import glob
 import html
 import os
 import sys
-import urllib.parse
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -63,8 +67,10 @@ from telegram_bot import send_photo, send_srs_card, send_web_app_card  # noqa: E
 from kanji_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import kanji_image  # noqa: E402 - needs sys.path insert above
 import srs  # noqa: E402 - needs sys.path insert above
+import webapp  # noqa: E402 - needs sys.path insert above
 
 KANJI_LEVEL = os.environ.get("KANJI_LEVEL") or "N3"
+KANJI_BATCH_SIZE = int(os.environ.get("KANJI_BATCH_SIZE") or "3")
 KANJI_NEW_PER_DAY = int(os.environ.get("KANJI_NEW_PER_DAY") or "6")
 KANJI_UNRATED_RESURFACE_HOURS = float(os.environ.get("KANJI_UNRATED_RESURFACE_HOURS") or "3")
 KANJI_CSV_GLOB = os.environ.get("KANJI_CSV_GLOB") or os.path.join(
@@ -222,58 +228,57 @@ def main() -> None:
 
     state = srs.load_state(KANJI_SRS_PATH)
     now = srs.now_utc()
-    key, is_new = srs.pick_next(
-        keys, state, now, KANJI_NEW_PER_DAY, unrated_resurface_hours=KANJI_UNRATED_RESURFACE_HOURS
+    picks = srs.pick_batch(
+        keys, state, now, KANJI_BATCH_SIZE, KANJI_NEW_PER_DAY,
+        unrated_resurface_hours=KANJI_UNRATED_RESURFACE_HOURS,
     )
 
-    if key is None:
+    if not picks:
         print(
             f"[kanji] nothing due and today's {KANJI_NEW_PER_DAY}-new-kanji cap is "
             "reached - skipping this run."
         )
         return
 
-    if is_new:
-        srs.save_state(KANJI_SRS_PATH, state)  # pick_next already recorded the intro
-
-    rec = state.get(key, {})
-    box = rec.get("box", 0)
-    status = "new" if is_new else ("due" if rec.get("due") else "reminder")
-    row = row_by_key[key]
+    srs.save_state(KANJI_SRS_PATH, state)  # pick_batch already recorded any new intros
 
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = str(os.environ["TELEGRAM_ALLOWED_CHAT_ID"])
     api_base = f"https://api.telegram.org/bot{token}"
+    picked_keys = [key for key, _ in picks]
 
     if WEBAPP_BASE_URL:
-        # One short message with a "Review" button that opens the kanji
-        # image + spoiler-equivalent body + rating buttons inside a
-        # Telegram Mini App (webapp.py) instead of three chunky messages
-        # (image, spoiler card, button row) piling up in the chat.
-        header = _STATUS_LABELS[status].format(
-            level=html.escape(KANJI_LEVEL), box=box + 1, top=len(srs.BOX_HOURS_KANJI)
-        )
-        review_url = f"{WEBAPP_BASE_URL}/review?kind=k&key={urllib.parse.quote(key)}"
-        send_web_app_card(api_base, chat_id, header, f"\U0001f4d6 Review {key}", review_url)
-        print(f"\n[kanji] sent {key} ({status}) via Mini App link from {KANJI_CSV_GLOB} ({len(rows)} total)")
+        # One short message with a single "Review" button that opens the
+        # whole batch as a swipeable flashcard deck inside Telegram (a
+        # Mini App - webapp.py) instead of a separate image + spoiler
+        # card + button row per kanji piling up in the chat.
+        review_url = webapp.build_review_url(WEBAPP_BASE_URL, "k", picked_keys)
+        header = f"\U0001f210 {KANJI_LEVEL} kanji review ({len(picks)} card{'s' if len(picks) != 1 else ''})"
+        send_web_app_card(api_base, chat_id, header, "\U0001f4d6 Review", review_url)
+        print(f"\n[kanji] sent {len(picks)} kanji via Mini App link from {KANJI_CSV_GLOB}: {', '.join(picked_keys)}")
     else:
-        html_text = format_card(row, status, box, KANJI_LEVEL)
-        print(html_text)
-        # The kanji itself goes out as a large rendered glyph, not plain
-        # Unicode text - Telegram clients render bare CJK text small/thin,
-        # which made the character genuinely hard to read at a glance.
-        # Sent as its own message (no caption/keyboard) right before the
-        # spoiler card that carries those.
-        send_photo(api_base, chat_id, kanji_image.render_kanji_png(key), filename="kanji.png")
-        send_srs_card(api_base, chat_id, "k", key, html_text)
-        print(f"\n[kanji] sent {key} ({status}) from {KANJI_CSV_GLOB} ({len(rows)} total)")
+        for key, is_new in picks:
+            rec = state.get(key, {})
+            box = rec.get("box", 0)
+            status = "new" if is_new else ("due" if rec.get("due") else "reminder")
+            row = row_by_key[key]
+            html_text = format_card(row, status, box, KANJI_LEVEL)
+            print(html_text)
+            # The kanji itself goes out as a large rendered glyph, not
+            # plain Unicode text - Telegram clients render bare CJK text
+            # small/thin, which made the character genuinely hard to
+            # read at a glance. Sent as its own message (no caption/
+            # keyboard) right before the spoiler card that carries those.
+            send_photo(api_base, chat_id, kanji_image.render_kanji_png(key), filename="kanji.png")
+            send_srs_card(api_base, chat_id, "k", key, html_text)
+        print(f"\n[kanji] sent {len(picks)} kanji from {KANJI_CSV_GLOB}: {', '.join(picked_keys)}")
 
     # Optional extra sinks - after Telegram (the primary channel) and the
     # SRS state save, so a slow or failing API here never delays the
     # phone push or risks re-picking the same kanji next run. Each returns
     # a status string (never raises); print it for the cron log.
     now_dt = datetime.now(timezone.utc)
-    entries = [row_to_entry(row)]
+    entries = [row_to_entry(row_by_key[key]) for key in picked_keys]
     if os.environ.get("NOTION_API_KEY") and os.environ.get("NOTION_KANJI_DB_ID"):
         print(notion_add_row(entries, KANJI_LEVEL))
     if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") and os.environ.get("KANJI_GDOC_ID"):
