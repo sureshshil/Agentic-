@@ -1,8 +1,10 @@
 name: News Digest
 
+# The daily digest actually runs via VPS cron (news_digest_agent.py, see
+# deploy/cron-notifications.md) - that's what replaced this workflow, so
+# the schedule trigger stays off to avoid firing a second, redundant
+# digest. Kept only for workflow_dispatch (manual "Run workflow" testing).
 on:
-  schedule:
-    - cron: "13 23 * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -13,11 +15,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install anthropic requests
-      - run: python simple_agent/scheduled/news_digest.py
+      - run: pip install -r simple_agent/requirements.txt
+      - name: Write GCP service account key
+        run: printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      - run: python simple_agent/scheduled/news_digest_agent.py
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/gcp-key.json
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_LOCATION: ${{ vars.GCP_LOCATION || secrets.GCP_LOCATION }}
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NEWS_QUERY: ${{ vars.NEWS_QUERY || secrets.NEWS_QUERY }}

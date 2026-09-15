@@ -361,10 +361,14 @@ GitHub to run a script in the cloud on a cron schedule, for free (public
 repos get unlimited free minutes; private repos get a generous free
 tier).
 
-| Script | Runs | Uses Claude? | Approx. cost/run |
+| Script | Runs | LLM call? | Approx. cost/run |
 |---|---|---|---|
 | `scheduled/rain_alert.py` | Every 30 min (`*/30 * * * *`) | No | $0 — plain MET Norway + ntfy.sh, no LLM call at all |
-| `scheduled/news_digest.py` | Daily, 23:00 UTC = 08:00 JST (`0 23 * * *`) | Yes, once per run | ~$0.001–0.003 (one fixed Tavily search + one Claude summarization call, not an open-ended agent loop) |
+| `scheduled/news_digest_agent.py` | Manual only (`workflow_dispatch`) | Yes, once per run — Gemini via Vertex AI (same `Agent` class as `telegram_bot.py`) | a fraction of a cent (one web_search tool call + one synthesis reply, not an open-ended loop) |
+
+**This project currently runs both of these live via VPS cron instead** — see `deploy/cron-notifications.md` — so the GitHub Actions versions below are a fallback path for anyone without a VPS, not what's actually firing day to day. Both `news-digest.yml` and `rain-alert.yml` have their `schedule:` triggers deliberately disabled (dispatch-only) to avoid sending a second, redundant digest/alert alongside the VPS cron jobs — re-enable a `schedule:` block only if you're *not* running the VPS cron setup.
+
+`scheduled/news_digest.py` (the original Tavily+Claude version) still exists and works standalone — swap it in for the simpler, cheaper, non-agent version per `deploy/cron-notifications.md`.
 
 **Why `rain_alert.py` skips Claude entirely:** "is heavy rain coming"
 is a deterministic check (a forecast precipitation figure crossing a
@@ -404,20 +408,26 @@ gitignored state file, so a storm parked over the city for three hours
 is one push rather than six. GitHub Actions runners are ephemeral and
 can't persist that file between runs, so the workflow sets it to `0`.
 
-**Why `news_digest.py` does use Claude:** summarizing search results
+**Why the news digest does use an LLM:** summarizing search results
 into a readable digest is exactly what an LLM is good at, unlike the
-rain check. It's still just one fixed request per run (not a tool-use
-loop), so cost stays small and predictable without needing the
-notebooks' `BudgetExceededError` machinery.
+rain check. `news_digest_agent.py` spends one agent turn per run (a
+`web_search` call plus a synthesis reply, not an open-ended loop), so
+cost stays small and predictable without needing the notebooks'
+`BudgetExceededError` machinery.
 
 ### Setup
 
 1. In your GitHub repo: **Settings → Secrets and variables → Actions**.
 2. Under **Secrets**, add (only what each workflow needs):
    - `NTFY_TOPIC` — same topic from notebook 07 (both scripts use it)
-   - `ANTHROPIC_API_KEY`, and `ANTHROPIC_WORKSPACE_ID` if you needed one
-     (news digest only)
-   - `TAVILY_API_KEY` (news digest only)
+   - `GCP_PROJECT_ID` — the GCP project Vertex AI bills to (news digest
+     only)
+   - `GCP_SA_KEY` — the full contents of a GCP service-account key JSON
+     file with Vertex AI access (news digest only); the workflow writes
+     it to a temp file and points `GOOGLE_APPLICATION_CREDENTIALS` at it
+   - `BRAVE_API_KEY` — Brave Web Search API key, gives the agent its
+     `web_search` tool (news digest only)
+   - Optionally `GCP_LOCATION` if you don't want the `global` default
 3. Under **Variables** (not secret, but optional overrides):
    - `ALERT_LAT` + `ALERT_LON` — exact coordinates, and `ALERT_LABEL` for
      what to call the place in the message. Prefer these over
@@ -428,14 +438,14 @@ notebooks' `BudgetExceededError` machinery.
    - `RAIN_THRESHOLD_MM` (default `7.5`), `ALERT_LOOKAHEAD_HOURS`
      (default `6`)
    - `NEWS_QUERY` (default `top world news today` if unset)
-4. Commit and push — the workflows activate automatically once they're on
-   the repo's default branch. (Scheduled workflows only run from the
-   default branch, not from feature branches like this one — merge before
-   expecting the cron to fire.)
+4. Commit and push — a `schedule:` trigger only activates once the
+   workflow file is on the repo's default branch (not a feature branch
+   like this one — merge before expecting a cron to fire). `news-digest.yml`
+   has no `schedule:` trigger right now (see note above) — it only runs
+   when manually dispatched.
 5. **Test without waiting for the schedule:** go to the **Actions** tab →
-   select "Rain Alert" or "News Digest" → **Run workflow**. This uses the
-   same `workflow_dispatch` trigger both files include specifically for
-   manual testing.
+   select "Rain Alert" or "News Digest" → **Run workflow**. Both files
+   include `workflow_dispatch` for exactly this.
 
 All cron times are UTC — adjust the `cron:` line in the `.yml` files for
 your own schedule preference; GitHub's schedule syntax is standard 5-field
@@ -449,8 +459,9 @@ new tool(s), and keep the cost-cap + turn-collapsing core intact.
 
 ### Troubleshooting: `anthropic-workspace-id is required...`
 
-(Applies to the notebooks and `scheduled/news_digest.py`, which still call
-Claude directly - not `agent.py` or `telegram_bot.py`, which use Vertex AI.)
+(Applies to the notebooks and the standalone `scheduled/news_digest.py` -
+not `agent.py`, `telegram_bot.py`, or `scheduled/news_digest_agent.py`,
+which all use Vertex AI.)
 
 If you see:
 

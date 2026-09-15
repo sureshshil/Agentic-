@@ -1,8 +1,11 @@
 name: Rain Alert
 
+# The alert actually runs via VPS cron (rain_alert_cron.py, see
+# deploy/cron-notifications.md) - that's what replaced this workflow, so
+# the schedule trigger stays off to avoid a duplicate/spammy alert (this
+# workflow also can't persist ALERT_COOLDOWN_MIN state between runs).
+# Kept only for workflow_dispatch (manual "Run workflow" testing).
 on:
-  schedule:
-    - cron: "7,37 * * * *"
   workflow_dispatch: {}
 
 jobs:
