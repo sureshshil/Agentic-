@@ -46,6 +46,7 @@ import glob
 import html
 import os
 import sys
+import urllib.parse
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -58,7 +59,7 @@ sys.path.insert(0, _SCHEDULED_DIR)
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
-from telegram_bot import send_photo, send_srs_card  # noqa: E402 - needs sys.path insert above
+from telegram_bot import send_photo, send_srs_card, send_web_app_card  # noqa: E402 - needs sys.path insert above
 from kanji_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import kanji_image  # noqa: E402 - needs sys.path insert above
 import srs  # noqa: E402 - needs sys.path insert above
@@ -72,6 +73,11 @@ KANJI_CSV_GLOB = os.environ.get("KANJI_CSV_GLOB") or os.path.join(
 KANJI_SRS_PATH = os.environ.get("KANJI_SRS_PATH") or os.path.join(
     _SIMPLE_AGENT_DIR, ".kanji_srs.json"
 )
+# Set once Caddy + webapp.py's Mini App server are live (see
+# deploy/cron-notifications.md) - switches main() from the old
+# image+spoiler+4-button card to a single compact message with a "Review"
+# button that opens the card in a Telegram Mini App instead.
+WEBAPP_BASE_URL = (os.environ.get("WEBAPP_BASE_URL") or "").rstrip("/")
 
 
 def load_rows(glob_pattern: str) -> list:
@@ -110,6 +116,16 @@ def _split_words(words_field: str) -> list:
     return entries
 
 
+def find_row(key: str) -> dict:
+    """The CSV row for one kanji character, or None - used by webapp.py to
+    look up a card's content from the `key` query param on its Mini App
+    review link (see main()'s WEBAPP_BASE_URL branch)."""
+    for row in load_rows(KANJI_CSV_GLOB):
+        if (row.get("kanji") or "").strip() == key:
+            return row
+    return None
+
+
 def row_to_entry(row: dict) -> dict:
     """One CSV row -> the structured dict the Notion / Google Doc sinks
     expect (kanji / reading / meaning / component / confusable / words /
@@ -137,17 +153,13 @@ _STATUS_LABELS = {
 }
 
 
-def format_card(row: dict, status: str, box: int, level: str) -> str:
-    """The HTML (parse_mode=HTML) message text sent under the rendered
-    kanji image (see kanji_image.render_kanji_png / main()): a status
-    header, then everything else under a spoiler. `status` is "new"
-    (never sent before), "due" (a rated item's review interval elapsed),
-    or "reminder" (sent before but never rated, resurfaced after srs.py's
-    unrated-resurface timeout - see main())."""
-    header = _STATUS_LABELS[status].format(
-        level=html.escape(level), box=box + 1, top=len(srs.BOX_HOURS_KANJI)
-    )
-
+def build_body_lines(row: dict) -> list:
+    """Reading/meaning/component/confusable/words/example for one kanji,
+    as a list of HTML-escaped lines (join with '\\n' for a Telegram
+    <tg-spoiler> body - format_card does this - or for a browser, render
+    inside a `white-space: pre-line` element instead - webapp.py's review
+    page does this, since Telegram's HTML parse_mode has no <br> tag to
+    convert to)."""
     readings = " / ".join(
         r.strip() for r in (row.get("onyomi", ""), row.get("kunyomi", "")) if r.strip()
     )
@@ -175,6 +187,20 @@ def format_card(row: dict, status: str, box: int, level: str) -> str:
             line += f"\n— {html.escape(example_en)}"
         body.append(line)
 
+    return body
+
+
+def format_card(row: dict, status: str, box: int, level: str) -> str:
+    """The HTML (parse_mode=HTML) message text sent under the rendered
+    kanji image (see kanji_image.render_kanji_png / main()): a status
+    header, then everything else under a spoiler. `status` is "new"
+    (never sent before), "due" (a rated item's review interval elapsed),
+    or "reminder" (sent before but never rated, resurfaced after srs.py's
+    unrated-resurface timeout - see main())."""
+    header = _STATUS_LABELS[status].format(
+        level=html.escape(level), box=box + 1, top=len(srs.BOX_HOURS_KANJI)
+    )
+    body = build_body_lines(row)
     return f"{header}\n\n<tg-spoiler>{chr(10).join(body)}</tg-spoiler>"
 
 
@@ -214,21 +240,33 @@ def main() -> None:
     box = rec.get("box", 0)
     status = "new" if is_new else ("due" if rec.get("due") else "reminder")
     row = row_by_key[key]
-    html_text = format_card(row, status, box, KANJI_LEVEL)
-    print(html_text)
 
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = str(os.environ["TELEGRAM_ALLOWED_CHAT_ID"])
     api_base = f"https://api.telegram.org/bot{token}"
 
-    # The kanji itself goes out as a large rendered glyph, not plain Unicode
-    # text - Telegram clients render bare CJK text small/thin, which made the
-    # character genuinely hard to read at a glance. Sent as its own message
-    # (no caption/keyboard) right before the spoiler card that carries those.
-    send_photo(api_base, chat_id, kanji_image.render_kanji_png(key), filename="kanji.png")
-    send_srs_card(api_base, chat_id, "k", key, html_text)
-
-    print(f"\n[kanji] sent {key} ({status}) from {KANJI_CSV_GLOB} ({len(rows)} total)")
+    if WEBAPP_BASE_URL:
+        # One short message with a "Review" button that opens the kanji
+        # image + spoiler-equivalent body + rating buttons inside a
+        # Telegram Mini App (webapp.py) instead of three chunky messages
+        # (image, spoiler card, button row) piling up in the chat.
+        header = _STATUS_LABELS[status].format(
+            level=html.escape(KANJI_LEVEL), box=box + 1, top=len(srs.BOX_HOURS_KANJI)
+        )
+        review_url = f"{WEBAPP_BASE_URL}/review?kind=k&key={urllib.parse.quote(key)}"
+        send_web_app_card(api_base, chat_id, header, f"\U0001f4d6 Review {key}", review_url)
+        print(f"\n[kanji] sent {key} ({status}) via Mini App link from {KANJI_CSV_GLOB} ({len(rows)} total)")
+    else:
+        html_text = format_card(row, status, box, KANJI_LEVEL)
+        print(html_text)
+        # The kanji itself goes out as a large rendered glyph, not plain
+        # Unicode text - Telegram clients render bare CJK text small/thin,
+        # which made the character genuinely hard to read at a glance.
+        # Sent as its own message (no caption/keyboard) right before the
+        # spoiler card that carries those.
+        send_photo(api_base, chat_id, kanji_image.render_kanji_png(key), filename="kanji.png")
+        send_srs_card(api_base, chat_id, "k", key, html_text)
+        print(f"\n[kanji] sent {key} ({status}) from {KANJI_CSV_GLOB} ({len(rows)} total)")
 
     # Optional extra sinks - after Telegram (the primary channel) and the
     # SRS state save, so a slow or failing API here never delays the

@@ -111,6 +111,7 @@ from google import genai
 from google.genai import types
 
 import srs
+import webapp
 
 # Loads telegram_bot.env from this script's own directory, regardless of
 # the process's working directory - so the bot picks up secrets the same
@@ -1059,6 +1060,17 @@ def _send_card(api_base: str, chat_id: str, html_text: str, inline_keyboard: lis
         print(f"Warning: failed to send Telegram SRS card ({exc})")
 
 
+def send_web_app_card(api_base: str, chat_id: str, html_text: str, button_text: str, url: str) -> None:
+    """One short message with a single button that opens `url` inside
+    Telegram itself as a Mini App (a `web_app` inline-keyboard button,
+    not a plain link - Telegram only renders it as an in-app webview,
+    not a browser tab, when the button carries `web_app` instead of
+    `url`). Used by kanji_drip.py (see its WEBAPP_BASE_URL branch)
+    instead of send_photo + send_srs_card's three-message flow, once
+    webapp.py's review server is configured."""
+    _send_card(api_base, chat_id, html_text, [[{"text": button_text, "web_app": {"url": url}}]])
+
+
 def send_srs_card(api_base: str, chat_id: str, kind: str, item_key: str, html_text: str) -> None:
     """One active-recall card, sent as its OWN message: `html_text` (HTML
     parse_mode, expected to wrap the answer in <tg-spoiler>...</tg-spoiler>
@@ -1200,6 +1212,12 @@ def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     allowed_chat_id = str(os.environ["TELEGRAM_ALLOWED_CHAT_ID"])
     api_base = f"https://api.telegram.org/bot{token}"
+
+    # SRS Mini App review server (see webapp.py) - runs in a background
+    # thread inside this same process/systemd service, alongside (not
+    # instead of) the getUpdates long-polling loop below. Binds
+    # 127.0.0.1 only; Caddy is what exposes it over HTTPS.
+    webapp.start_server(token, allowed_chat_id)
 
     state = load_state()
     agent = Agent()

@@ -237,3 +237,61 @@ python3 grammar_drip.py
 # Notion: added 1/1 grammar rows
 # Google Doc: appended 1 pattern(s) (740 chars) at index 940
 ```
+
+## Optional: SRS review via Telegram Mini App instead of chat clutter
+
+By default each drip sends three chunky messages per item (the kanji
+image, a `<tg-spoiler>` card, and an Again/Hard/Good/Easy button row).
+`webapp.py` replaces that with a Telegram **Mini App**: one short message
+with a single "Review" button that opens the full card (image, tap-to-
+reveal answer, rating buttons) inside Telegram itself, in a webview - no
+browser tab, far less scrollback. It runs as a background thread inside
+`telegram_bot.py`'s own process (same systemd service, nothing new to
+manage or restart separately).
+
+Telegram only allows a Mini App button to open an **HTTPS** URL with a
+real certificate - no plain HTTP, no self-signed cert - so this needs a
+public HTTPS front door pointed at the VPS. If you don't already own a
+domain, [sslip.io](https://sslip.io) gives you one for free with zero
+signup: `<your-ip-with-dashes>.sslip.io` resolves straight to your VPS's
+own public IP, and [Caddy](https://caddyserver.com) will get it a real
+Let's Encrypt certificate automatically.
+
+1. **Install Caddy** (official apt repo - see
+   <https://caddyserver.com/docs/install#debian-ubuntu-raspbian>), then
+   point its Caddyfile (`/etc/caddy/Caddyfile`) at
+   `telegram_bot.py`'s webapp server, which only ever binds
+   `127.0.0.1`:
+   ```
+   <your-ip-with-dashes>.sslip.io {
+       reverse_proxy localhost:8080
+   }
+   ```
+   `systemctl reload caddy` picks it up; Caddy fetches the cert on the
+   first real request.
+2. **Open ports 80/443** (needed for the cert challenge and for HTTPS
+   itself) alongside 22 for SSH - e.g. with `ufw`:
+   ```bash
+   ufw allow 22/tcp && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable
+   ```
+3. **Set `WEBAPP_BASE_URL`** (the public origin from step 1) and
+   optionally `WEBAPP_PORT` (default `8080`) in `../telegram_bot.env` -
+   loaded by both `telegram_bot.py` (which binds the port) and
+   `kanji_drip.py` (which uses the base URL to build each card's Review
+   link). Leave `WEBAPP_BASE_URL` unset to keep the old three-message
+   flow - `kanji_drip.py` falls back automatically.
+4. `systemctl restart telegram-bot` - watch for `[webapp] Mini App
+   review server listening on 127.0.0.1:8080` in `journalctl -u
+   telegram-bot`, then run `python3 kanji_drip.py` manually to send a
+   test card.
+
+Auth: the Mini App page can't be opened or forged by a stranger who
+finds the URL - Telegram signs each page load's `initData` with an HMAC
+keyed on the bot token (`webapp.py`'s `verify_init_data`), and
+`/api/submit` checks the signed Telegram user id against
+`TELEGRAM_ALLOWED_CHAT_ID` before touching any SRS state file, the same
+guarantee `TELEGRAM_ALLOWED_CHAT_ID` already gives the polling loop.
+
+Only `kanji_drip.py` (`kind="k"`) is wired up so far; `grammar_drip.py`
+and `vocab_drip.py` can follow the same shape later (see `_KIND_CONFIG`
+in `webapp.py`).
