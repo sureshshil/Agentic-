@@ -19,6 +19,10 @@ State shape (one JSON file per deck, e.g. .kanji_srs.json):
       "reps": 3,                    total reviews (any rating)
       "lapses": 1,                  how many times rated "again"
       "introduced_at": "<iso8601>", set once, when first sent
+      "first_seen_at": "<iso8601>", set once, the first time the card was
+                                     actually opened (webapp.py's GET
+                                     /review - see mark_seen); absent if
+                                     it's been sent but never opened
       "last_result": "good",        most recent rating
       "last_reviewed": "<iso8601>", set on every rating
       "due": "<iso8601>",           set on every rating; absent until the
@@ -85,6 +89,22 @@ def _introduced_today_count(state: dict, today: str) -> int:
     )
 
 
+def mark_seen(state: dict, key: str, now: datetime) -> bool:
+    """Records that `key`'s card was actually opened (webapp.py's GET
+    /review, the first time it renders that key) - gates pick_next's
+    unrated-resurface reminder so an introduced-but-never-opened item
+    doesn't get silently re-pushed just because time passed; it only
+    resurfaces after you've actually looked at it once. A no-op if
+    already recorded (first open only) or if `key` isn't in `state` at
+    all. Returns whether it actually set anything, so callers only need
+    to persist state when something changed."""
+    rec = state.get(key)
+    if rec is None or rec.get("first_seen_at"):
+        return False
+    rec["first_seen_at"] = now.isoformat()
+    return True
+
+
 def pick_next(
     rank_ordered_keys: list,
     state: dict,
@@ -102,9 +122,13 @@ def pick_next(
     An item that was introduced but never rated (no "due" yet - you never
     tapped a button) would otherwise vanish forever and its new-item slot
     would've been wasted for nothing. So it's treated as due again
-    `unrated_resurface_hours` after it was first sent, same priority as
-    an ordinary overdue review - the caller can tell the two apart by
-    checking whether state[key]["due"] is set."""
+    `unrated_resurface_hours` after you first actually opened it
+    (mark_seen's first_seen_at - NOT introduced_at), same priority as an
+    ordinary overdue review - the caller can tell the two apart by
+    checking whether state[key]["due"] is set. If it's never been opened
+    at all, it never resurfaces on a timer - it just waits, since
+    re-pushing something you haven't even looked at yet would just be
+    noise, not a helpful reminder."""
     now_iso = now.isoformat()
     resurface_cutoff_iso = (now - timedelta(hours=unrated_resurface_hours)).isoformat()
 
@@ -113,8 +137,8 @@ def pick_next(
         due = rec.get("due")
         if due:
             return due if due <= now_iso else None
-        introduced = rec.get("introduced_at", "")
-        return introduced if introduced and introduced <= resurface_cutoff_iso else None
+        first_seen = rec.get("first_seen_at")
+        return first_seen if first_seen and first_seen <= resurface_cutoff_iso else None
 
     due = [key for key in rank_ordered_keys if key in state and effective_due(key)]
     if due:

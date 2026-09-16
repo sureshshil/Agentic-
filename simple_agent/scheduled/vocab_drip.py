@@ -191,11 +191,14 @@ def row_to_entry(row: dict) -> dict:
     }
 
 
-def build_body_lines(row: dict) -> list:
+def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
     """Reading/meaning/particles/examples for one word, as a list of
     HTML-escaped lines (see kanji_drip.build_body_lines - same
     join-with-'\\n' convention, shared by format_word_block's
-    <tg-spoiler> body and webapp.py's browser-rendered review page)."""
+    <tg-spoiler> body and webapp.py's browser-rendered review page).
+    `enrichment` is accepted only so webapp.py can call every drip
+    module's build_body_lines the same way - vocab has no LLM enrichment
+    (see llm_enrich.py) and this is always None/ignored here."""
     entry = row_to_entry(row)
     lines = [
         f"{html.escape(entry['reading'])} — {html.escape(entry['meaning'])}"
@@ -293,6 +296,14 @@ def main() -> None:
         )
         for key, block in zip(picked_keys, blocks):
             send_srs_card(api_base, chat_id, "v", key, block)
+        # Unlike the Mini App flow (marked seen when webapp.py later
+        # serves the review page - see srs.mark_seen), a card sent this
+        # way is already fully visible the moment it lands in the chat,
+        # so it counts as seen right now - otherwise an unrated word
+        # would never resurface as a reminder (see srs.pick_next).
+        now = srs.now_utc()
+        if any([srs.mark_seen(state, key, now) for key in picked_keys]):
+            srs.save_state(VOCAB_SRS_PATH, state)
         print(f"\n[vocab] sent {len(picks)} words from {VOCAB_TSV_GLOB}: {', '.join(statuses)}")
 
     # Optional extra sinks - after Telegram (the primary channel) and the

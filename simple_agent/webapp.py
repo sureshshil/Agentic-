@@ -63,6 +63,7 @@ from threading import Thread
 
 import srs
 import kanji_image
+import llm_enrich
 
 _SIMPLE_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SCHEDULED_DIR = os.path.join(_SIMPLE_AGENT_DIR, "scheduled")
@@ -83,10 +84,12 @@ _KIND_CONFIG = {
     "k": {
         "module": "kanji_drip", "env_var": "KANJI_SRS_PATH", "default_path": ".kanji_srs.json",
         "box_hours": srs.BOX_HOURS_KANJI, "front_field": "kanji", "has_image": True, "label": "Kanji",
+        "enrich_env_var": "KANJI_ENRICH_CACHE_PATH", "enrich_default_path": ".kanji_enrich_cache.json",
     },
     "g": {
         "module": "grammar_drip", "env_var": "GRAMMAR_SRS_PATH", "default_path": ".grammar_srs.json",
         "box_hours": srs.BOX_HOURS_GRAMMAR, "front_field": "grammar", "has_image": False, "label": "Grammar",
+        "enrich_env_var": "GRAMMAR_ENRICH_CACHE_PATH", "enrich_default_path": ".grammar_enrich_cache.json",
     },
     "v": {
         "module": "vocab_drip", "env_var": "VOCAB_SRS_PATH", "default_path": ".vocab_srs.json",
@@ -141,6 +144,18 @@ def _load_drip_module(kind: str):
 def _srs_state_path(kind: str) -> str:
     cfg = _KIND_CONFIG[kind]
     return os.environ.get(cfg["env_var"]) or os.path.join(_SIMPLE_AGENT_DIR, cfg["default_path"])
+
+
+def _enrich_cache(kind: str) -> dict:
+    """The kanji_drip.py/grammar_drip.py enrichment cache (see
+    llm_enrich.py) for `kind`, or {} for a deck with no enrichment
+    support (currently vocab) - so a card renders with its curated
+    content alone, exactly as if enrichment were never generated."""
+    cfg = _KIND_CONFIG[kind]
+    if "enrich_env_var" not in cfg:
+        return {}
+    path = os.environ.get(cfg["enrich_env_var"]) or os.path.join(_SIMPLE_AGENT_DIR, cfg["enrich_default_path"])
+    return llm_enrich.load_cache(path)
 
 
 def _status_badge(rec: dict, box_hours: list) -> str:
@@ -461,15 +476,23 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         cfg = _KIND_CONFIG[kind]
         module = _load_drip_module(kind)
-        state = srs.load_state(_srs_state_path(kind))
+        state_path = _srs_state_path(kind)
+        state = srs.load_state(state_path)
+        enrich_cache = _enrich_cache(kind)
 
         cards = []
+        seen_changed = False
+        now = srs.now_utc()
         for key in keys:
             row = module.find_row(key)
             if row is None:
                 continue  # e.g. content CSV changed since the link was sent
             rec = state.get(key, {})
-            body_html = "\n".join(module.build_body_lines(row)).replace("\n", "<br>")
+            # First time this exact card is actually opened - gates the
+            # drip's unrated-resurface reminder (see srs.mark_seen) so an
+            # introduced-but-unopened item isn't re-pushed on a timer.
+            seen_changed = srs.mark_seen(state, key, now) or seen_changed
+            body_html = "\n".join(module.build_body_lines(row, enrich_cache.get(key))).replace("\n", "<br>")
             card = {
                 "key": key,
                 "badge": _status_badge(rec, cfg["box_hours"]),
@@ -483,6 +506,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if not cards:
             self._plain(404, "no cards found")
             return
+
+        if seen_changed:
+            srs.save_state(state_path, state)
 
         cards_json = json.dumps(cards, ensure_ascii=False).replace("</", "<\\/")
         page = (

@@ -62,6 +62,27 @@ class RecordReviewTest(unittest.TestCase):
             srs.record_review({}, "決", "meh", BOX_HOURS, NOW)
 
 
+class MarkSeenTest(unittest.TestCase):
+    def test_sets_first_seen_at_and_reports_it_changed(self):
+        state = {"決": {"box": 0, "reps": 0, "lapses": 0}}
+        changed = srs.mark_seen(state, "決", NOW)
+        self.assertTrue(changed)
+        self.assertEqual(state["決"]["first_seen_at"], NOW.isoformat())
+
+    def test_second_call_is_a_no_op(self):
+        state = {"決": {"box": 0, "reps": 0, "lapses": 0}}
+        srs.mark_seen(state, "決", NOW)
+        changed = srs.mark_seen(state, "決", NOW + timedelta(hours=1))
+        self.assertFalse(changed)
+        self.assertEqual(state["決"]["first_seen_at"], NOW.isoformat())  # unchanged
+
+    def test_unknown_key_is_a_no_op(self):
+        state = {}
+        changed = srs.mark_seen(state, "決", NOW)
+        self.assertFalse(changed)
+        self.assertEqual(state, {})
+
+
 class PickNextTest(unittest.TestCase):
     def test_never_seen_item_is_introduced_in_rank_order(self):
         state = {}
@@ -98,19 +119,34 @@ class PickNextTest(unittest.TestCase):
     def test_introduced_but_unrated_item_is_not_due_before_the_resurface_timeout(self):
         state = {}
         srs.pick_next(["決"], state, NOW, new_per_day=5)
+        srs.mark_seen(state, "決", NOW)
         second_key, is_new = srs.pick_next(
             ["決"], state, NOW + timedelta(hours=2), new_per_day=5, unrated_resurface_hours=3.0
         )
         self.assertIsNone(second_key)
         self.assertIsNone(is_new)
 
-    def test_unrated_item_resurfaces_as_due_after_the_timeout(self):
-        # Missed a card entirely (asleep, busy)? It comes back around
-        # instead of silently wasting that day's new-item slot forever.
+    def test_unopened_item_never_resurfaces_on_a_timer_alone(self):
+        # Never actually opened the card at all (not even mark_seen) -
+        # re-pushing it as a "reminder" would just be noise, not a
+        # helpful nudge, so it waits indefinitely instead of timing out.
         state = {}
         srs.pick_next(["決"], state, NOW, new_per_day=5)
         key, is_new = srs.pick_next(
-            ["決"], state, NOW + timedelta(hours=4), new_per_day=5, unrated_resurface_hours=3.0
+            ["決"], state, NOW + timedelta(days=30), new_per_day=5, unrated_resurface_hours=3.0
+        )
+        self.assertIsNone(key)
+        self.assertIsNone(is_new)
+
+    def test_unrated_item_resurfaces_as_due_after_the_timeout_once_seen(self):
+        # Opened it (mark_seen) but never rated - now it's fair to treat
+        # as an actual reminder instead of silently wasting that day's
+        # new-item slot forever.
+        state = {}
+        srs.pick_next(["決"], state, NOW, new_per_day=5)
+        srs.mark_seen(state, "決", NOW + timedelta(hours=1))
+        key, is_new = srs.pick_next(
+            ["決"], state, NOW + timedelta(hours=5), new_per_day=5, unrated_resurface_hours=3.0
         )
         self.assertEqual(key, "決")
         self.assertFalse(is_new)
@@ -121,6 +157,7 @@ class PickNextTest(unittest.TestCase):
     def test_resurfaced_unrated_item_still_blocks_a_new_introduction(self):
         state = {}
         srs.pick_next(["決"], state, NOW, new_per_day=5)
+        srs.mark_seen(state, "決", NOW)
         key, is_new = srs.pick_next(
             ["決", "作"], state, NOW + timedelta(hours=4), new_per_day=5, unrated_resurface_hours=3.0
         )

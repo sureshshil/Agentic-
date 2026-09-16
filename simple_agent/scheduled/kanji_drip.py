@@ -1,6 +1,10 @@
-"""Hourly kanji active-recall drip via Telegram, spaced-repetition
-version - same thin-entry-point cron pattern as vocab_drip.py next to this
-file. Each run picks up to KANJI_BATCH_SIZE kanji (srs.pick_batch, default
+"""Kanji active-recall drip via Telegram, spaced-repetition version - same
+thin-entry-point cron pattern as vocab_drip.py next to this file. Cadence
+is entirely up to crontab, not this script (see
+../deploy/cron-notifications.md - currently 3x/day in this deployment,
+deliberately sparse now that each push carries a full LLM practice block
+rather than a single line). Each run picks up to KANJI_BATCH_SIZE kanji
+(srs.pick_batch, default
 3) - one at a time, character shown plain, everything else (reading,
 meaning, mnemonic, compounds, example) hidden until you actively try to
 recall it, then rate your own recall with Again / Hard / Good / Easy. That
@@ -22,8 +26,19 @@ it never listens. State lives in .kanji_srs.json (gitignored, shared with
 that handler).
 
 Kanji content comes from the hand-curated CSVs next to this repo
-(../N3_kanji_batch*.csv by default, override with KANJI_CSV_GLOB) - NOT
-from an LLM call.
+(../N3_kanji_batch*.csv by default, override with KANJI_CSV_GLOB), not
+from an LLM call - this includes each kanji's own mnemonic (`component`'s
+"X + Y (story → meaning)" breakdown) and, for many confusable-kanji
+rows, a `disc_note` distinguishing tip, both shown directly. Optionally,
+ON TOP of that curated content, a full AI practice block (2-3 fresh
+example sentences, a short explanation, a mini dialogue, and a
+multiple-choice practice question) gets generated per push via Gemini
+(see ../llm_enrich.py) and shown as extra "AI" sections - deliberately no
+AI-generated mnemonic/component-breakdown, since the CSV's own is better
+than anything an LLM would reinvent here. This is additive and fails
+soft, so a model outage never removes the curated card. Cached in
+KANJI_ENRICH_CACHE_PATH so webapp.py's Mini App page shows the exact same
+generated content as whatever went out with the push, not a re-roll.
 
 Env vars (loaded via python-dotenv from ../telegram_bot.env and
 ../deploy/scheduled.env, same fill-in-what's-unset behavior as
@@ -36,10 +51,22 @@ telegram_bot.py - real environment variables always win):
                             per-item card flow below always sent exactly one)
   KANJI_NEW_PER_DAY         optional, default 6 (new kanji introduced/UTC day)
   KANJI_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next -
-                            a sent-but-never-rated kanji comes back around
-                            as a "reminder" instead of vanishing forever)
+                            an opened-but-never-rated kanji comes back
+                            around as a "reminder" this many hours after
+                            you actually opened it (srs.mark_seen, set by
+                            webapp.py's GET /review), instead of
+                            vanishing forever. One you've never even
+                            opened does NOT resurface on a timer - it
+                            just waits until you look at it once)
   KANJI_CSV_GLOB            optional, default ../N3_kanji_batch*.csv
   KANJI_SRS_PATH            optional, default ../.kanji_srs.json
+  KANJI_ENRICH_CACHE_PATH   optional, default ../.kanji_enrich_cache.json
+  GCP_PROJECT_ID            optional - enables the per-push LLM example
+                            sentence (see ../llm_enrich.py); unset means
+                            the drip behaves exactly as before.
+  DRIP_ENRICH_MAX_COST_USD  optional, default 1.00 - lifetime cap shared
+                            with grammar_drip.py's enrichment - see
+                            ../llm_enrich.py.
 
 Run this only during hours you're actually reachable - crontab is the
 place for that (see ../deploy/cron-notifications.md), not this script;
@@ -66,6 +93,7 @@ load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 from telegram_bot import send_photo, send_srs_card, send_web_app_card  # noqa: E402 - needs sys.path insert above
 from kanji_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import kanji_image  # noqa: E402 - needs sys.path insert above
+import llm_enrich  # noqa: E402 - needs sys.path insert above
 import srs  # noqa: E402 - needs sys.path insert above
 import webapp  # noqa: E402 - needs sys.path insert above
 
@@ -78,6 +106,9 @@ KANJI_CSV_GLOB = os.environ.get("KANJI_CSV_GLOB") or os.path.join(
 )
 KANJI_SRS_PATH = os.environ.get("KANJI_SRS_PATH") or os.path.join(
     _SIMPLE_AGENT_DIR, ".kanji_srs.json"
+)
+KANJI_ENRICH_CACHE_PATH = os.environ.get("KANJI_ENRICH_CACHE_PATH") or os.path.join(
+    _SIMPLE_AGENT_DIR, ".kanji_enrich_cache.json"
 )
 # Set once Caddy + webapp.py's Mini App server are live (see
 # deploy/cron-notifications.md) - switches main() from the old
@@ -159,13 +190,20 @@ _STATUS_LABELS = {
 }
 
 
-def build_body_lines(row: dict) -> list:
-    """Reading/meaning/component/confusable/words/example for one kanji,
-    as a list of HTML-escaped lines (join with '\\n' for a Telegram
-    <tg-spoiler> body - format_card does this - or for a browser, render
-    inside a `white-space: pre-line` element instead - webapp.py's review
-    page does this, since Telegram's HTML parse_mode has no <br> tag to
-    convert to)."""
+def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
+    """Reading/meaning/component/confusable/disc_note/words/example for
+    one kanji, as a list of HTML-escaped lines (join with '\\n' for a
+    Telegram <tg-spoiler> body - format_card does this - or for a
+    browser, render inside a `white-space: pre-line` element instead -
+    webapp.py's review page does this, since Telegram's HTML parse_mode
+    has no <br> tag to convert to). `enrichment` is an optional
+    llm_enrich.enrich_kanji() result - when present, its AI-generated
+    practice block (examples, explanation, dialogue, practice question -
+    see llm_enrich.format_blocks) is appended after the curated content;
+    the curated content itself is never replaced. There's deliberately no
+    AI-generated mnemonic/component-breakdown - `component` and
+    `disc_note` below are the curated ones for that (see
+    llm_enrich.enrich_kanji's docstring)."""
     readings = " / ".join(
         r.strip() for r in (row.get("onyomi", ""), row.get("kunyomi", "")) if r.strip()
     )
@@ -178,6 +216,8 @@ def build_body_lines(row: dict) -> list:
         body.append(f"構成: {html.escape(row['component'].strip())}")
     if (row.get("confusable") or "").strip():
         body.append(f"似ている: {html.escape(row['confusable'].strip())}")
+    if (row.get("disc_note") or "").strip():
+        body.append(f"\U0001f4a1 ヒント: {html.escape(row['disc_note'].strip())}")
 
     words = _split_words(row.get("words", ""))
     if words:
@@ -193,20 +233,26 @@ def build_body_lines(row: dict) -> list:
             line += f"\n— {html.escape(example_en)}"
         body.append(line)
 
+    if enrichment:
+        for block in llm_enrich.format_blocks(enrichment):
+            body.append("")
+            body.append(block)
+
     return body
 
 
-def format_card(row: dict, status: str, box: int, level: str) -> str:
+def format_card(row: dict, status: str, box: int, level: str, enrichment: dict | None = None) -> str:
     """The HTML (parse_mode=HTML) message text sent under the rendered
     kanji image (see kanji_image.render_kanji_png / main()): a status
     header, then everything else under a spoiler. `status` is "new"
     (never sent before), "due" (a rated item's review interval elapsed),
     or "reminder" (sent before but never rated, resurfaced after srs.py's
-    unrated-resurface timeout - see main())."""
+    unrated-resurface timeout - see main()). `enrichment` - see
+    build_body_lines."""
     header = _STATUS_LABELS[status].format(
         level=html.escape(level), box=box + 1, top=len(srs.BOX_HOURS_KANJI)
     )
-    body = build_body_lines(row)
+    body = build_body_lines(row, enrichment)
     return f"{header}\n\n<tg-spoiler>{chr(10).join(body)}</tg-spoiler>"
 
 
@@ -247,6 +293,19 @@ def main() -> None:
     api_base = f"https://api.telegram.org/bot{token}"
     picked_keys = [key for key, _ in picks]
 
+    # One fresh AI example sentence per picked kanji, generated now (this
+    # push) and cached so the Mini App page (webapp.py, opened later)
+    # shows the exact same content rather than re-rolling it - see
+    # llm_enrich.py. No-op (skipped/None) when GCP_PROJECT_ID isn't set
+    # or the lifetime cost cap has been reached; either way the CSV
+    # content below is unaffected.
+    enrichments = {}
+    for key in picked_keys:
+        result = llm_enrich.enrich_kanji(row_by_key[key], KANJI_LEVEL)
+        if result:
+            enrichments[key] = result
+            llm_enrich.save_cache_entry(KANJI_ENRICH_CACHE_PATH, key, result)
+
     if WEBAPP_BASE_URL:
         # One short message with a single "Review" button that opens the
         # whole batch as a swipeable flashcard deck inside Telegram (a
@@ -265,7 +324,7 @@ def main() -> None:
             box = rec.get("box", 0)
             status = "new" if is_new else ("due" if rec.get("due") else "reminder")
             row = row_by_key[key]
-            html_text = format_card(row, status, box, KANJI_LEVEL)
+            html_text = format_card(row, status, box, KANJI_LEVEL, enrichments.get(key))
             print(html_text)
             # The kanji itself goes out as a large rendered glyph, not
             # plain Unicode text - Telegram clients render bare CJK text
@@ -274,6 +333,14 @@ def main() -> None:
             # keyboard) right before the spoiler card that carries those.
             send_photo(api_base, chat_id, kanji_image.render_kanji_png(key), filename="kanji.png")
             send_srs_card(api_base, chat_id, "k", key, html_text)
+        # Unlike the Mini App flow (marked seen when webapp.py later
+        # serves the review page - see srs.mark_seen), a card sent this
+        # way is already fully visible the moment it lands in the chat,
+        # so it counts as seen right now - otherwise an unrated kanji
+        # would never resurface as a reminder (see srs.pick_next).
+        now_seen = srs.now_utc()
+        if any([srs.mark_seen(state, key, now_seen) for key in picked_keys]):
+            srs.save_state(KANJI_SRS_PATH, state)
         print(f"\n[kanji] sent {len(picks)} kanji from {KANJI_CSV_GLOB}: {', '.join(picked_keys)}")
 
     # Optional extra sinks - after Telegram (the primary channel) and the

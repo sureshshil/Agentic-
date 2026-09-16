@@ -1,17 +1,27 @@
-"""Every-2-hours grammar-pattern active-recall drip via Telegram,
-spaced-repetition version - sibling to kanji_drip.py (same srs.py engine,
-same telegram_bot.py callback handler, same webapp.py Mini App), just on
-a slower cadence and a different deck. See kanji_drip.py's docstring for
-the full rationale (active recall, Leitner review intervals, due reviews
-before new introductions, a daily cap on new items, batched into one
-swipeable Mini App link when WEBAPP_BASE_URL is set).
+"""Grammar-pattern active-recall drip via Telegram, spaced-repetition
+version - sibling to kanji_drip.py (same srs.py engine, same
+telegram_bot.py callback handler, same webapp.py Mini App), just a
+different deck. Cadence is entirely up to crontab, not this script (see
+../deploy/cron-notifications.md - currently 2x/day in this deployment,
+deliberately sparse now that each push carries a full LLM practice block
+rather than a single line). See kanji_drip.py's docstring for the full
+rationale (active recall, Leitner review intervals, due reviews before
+new introductions, a daily cap on new items, batched into one swipeable
+Mini App link when WEBAPP_BASE_URL is set).
 
 Grammar content comes from the hand-curated CSVs next to this repo
-(../n3_grammar_batch*.csv by default, override with GRAMMAR_CSV_GLOB) -
-NOT from an LLM call. Button taps (or, with WEBAPP_BASE_URL set, Mini App
-rating submits) are handled entirely by telegram_bot.py's long-polling
-loop / webapp.py; this script only ever sends. State lives in
-.grammar_srs.json (gitignored).
+(../n3_grammar_batch*.csv by default, override with GRAMMAR_CSV_GLOB),
+not from an LLM call. Optionally, ON TOP of that curated content, a full
+AI practice block (2-3 fresh example sentences, a short explanation, a
+mini dialogue, and a multiple-choice practice question) gets generated
+per push via Gemini (see ../llm_enrich.py) and shown as extra "AI"
+sections alongside the CSV's own content - additive and fails soft, same
+as kanji_drip.py. Cached in GRAMMAR_ENRICH_CACHE_PATH so webapp.py's Mini
+App page shows the exact same generated content as whatever went out
+with the push.
+Button taps (or, with WEBAPP_BASE_URL set, Mini App rating submits) are
+handled entirely by telegram_bot.py's long-polling loop / webapp.py; this
+script only ever sends. State lives in .grammar_srs.json (gitignored).
 
 Env vars (loaded via python-dotenv from ../telegram_bot.env and
 ../deploy/scheduled.env, real environment variables always win):
@@ -22,10 +32,22 @@ Env vars (loaded via python-dotenv from ../telegram_bot.env and
                              srs.pick_batch; only matters with WEBAPP_BASE_URL set)
   GRAMMAR_NEW_PER_DAY        optional, default 4 (new patterns/UTC day)
   GRAMMAR_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next -
-                             a sent-but-never-rated pattern comes back
-                             around as a "reminder" instead of vanishing)
+                             an opened-but-never-rated pattern comes back
+                             around as a "reminder" this many hours after
+                             you actually opened it (srs.mark_seen, set
+                             by webapp.py's GET /review), instead of
+                             vanishing forever. One you've never even
+                             opened does NOT resurface on a timer - it
+                             just waits until you look at it once)
   GRAMMAR_CSV_GLOB           optional, default ../n3_grammar_batch*.csv
   GRAMMAR_SRS_PATH           optional, default ../.grammar_srs.json
+  GRAMMAR_ENRICH_CACHE_PATH  optional, default ../.grammar_enrich_cache.json
+  GCP_PROJECT_ID             optional - enables the per-push LLM example/
+                             tip (see ../llm_enrich.py); unset means the
+                             drip behaves exactly as before.
+  DRIP_ENRICH_MAX_COST_USD   optional, default 1.00 - lifetime cap shared
+                             with kanji_drip.py's enrichment - see
+                             ../llm_enrich.py.
 
 Run this only during hours you're actually reachable - crontab is the
 place for that (see ../deploy/cron-notifications.md), not this script.
@@ -50,6 +72,7 @@ load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
 from telegram_bot import send_srs_card, send_web_app_card  # noqa: E402 - needs sys.path insert above
 from grammar_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
+import llm_enrich  # noqa: E402 - needs sys.path insert above
 import srs  # noqa: E402 - needs sys.path insert above
 import webapp  # noqa: E402 - needs sys.path insert above
 
@@ -62,6 +85,9 @@ GRAMMAR_CSV_GLOB = os.environ.get("GRAMMAR_CSV_GLOB") or os.path.join(
 )
 GRAMMAR_SRS_PATH = os.environ.get("GRAMMAR_SRS_PATH") or os.path.join(
     _SIMPLE_AGENT_DIR, ".grammar_srs.json"
+)
+GRAMMAR_ENRICH_CACHE_PATH = os.environ.get("GRAMMAR_ENRICH_CACHE_PATH") or os.path.join(
+    _SIMPLE_AGENT_DIR, ".grammar_enrich_cache.json"
 )
 # See kanji_drip.py's WEBAPP_BASE_URL comment - same opt-in switch.
 WEBAPP_BASE_URL = (os.environ.get("WEBAPP_BASE_URL") or "").rstrip("/")
@@ -123,11 +149,15 @@ _STATUS_LABELS = {
 }
 
 
-def build_body_lines(row: dict) -> list:
+def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
     """Formation/meaning/nuance/contrast/example for one grammar pattern,
     as a list of HTML-escaped lines (see kanji_drip.build_body_lines -
     same join-with-'\\n' convention, shared by format_card's <tg-spoiler>
-    body and webapp.py's browser-rendered review page)."""
+    body and webapp.py's browser-rendered review page). `enrichment` is
+    an optional llm_enrich.enrich_grammar() result - when present, its
+    AI-generated practice block (examples, explanation, dialogue,
+    practice question - see llm_enrich.format_blocks) is appended after
+    the curated content; the curated content itself is never replaced."""
     body = []
     if (row.get("formation") or "").strip():
         body.append(f"形: {html.escape(row['formation'].strip())}")
@@ -153,18 +183,24 @@ def build_body_lines(row: dict) -> list:
             example_lines.append(f"— {html.escape(ex_en)}")
         body.append("\n".join(example_lines))
 
+    if enrichment:
+        for block in llm_enrich.format_blocks(enrichment):
+            body.append("")
+            body.append(block)
+
     return body
 
 
-def format_card(row: dict, status: str, box: int, level: str) -> str:
+def format_card(row: dict, status: str, box: int, level: str, enrichment: dict | None = None) -> str:
     """The HTML (parse_mode=HTML) message text for one grammar pattern:
     the pattern itself visible, everything else under a spoiler. `status`
-    is "new" / "due" / "reminder" - see kanji_drip.format_card."""
+    is "new" / "due" / "reminder" - see kanji_drip.format_card.
+    `enrichment` - see build_body_lines."""
     pattern = (row.get("grammar") or "").strip()
     header = _STATUS_LABELS[status].format(
         level=html.escape(level), box=box + 1, top=len(srs.BOX_HOURS_GRAMMAR)
     )
-    body = build_body_lines(row)
+    body = build_body_lines(row, enrichment)
     return f"{header}\n\n<b>{html.escape(pattern)}</b>\n\n<tg-spoiler>{chr(10).join(body)}</tg-spoiler>"
 
 
@@ -205,6 +241,17 @@ def main() -> None:
     api_base = f"https://api.telegram.org/bot{token}"
     picked_keys = [key for key, _ in picks]
 
+    # One fresh AI example + usage tip per picked pattern, generated now
+    # (this push) and cached so the Mini App page (webapp.py, opened
+    # later) shows the exact same content - see kanji_drip.py's identical
+    # comment / llm_enrich.py.
+    enrichments = {}
+    for key in picked_keys:
+        result = llm_enrich.enrich_grammar(row_by_key[key], GRAMMAR_LEVEL)
+        if result:
+            enrichments[key] = result
+            llm_enrich.save_cache_entry(GRAMMAR_ENRICH_CACHE_PATH, key, result)
+
     if WEBAPP_BASE_URL:
         # One short message with a single "Review" button that opens the
         # whole batch as a swipeable flashcard deck inside Telegram (a
@@ -223,9 +270,17 @@ def main() -> None:
             box = rec.get("box", 0)
             status = "new" if is_new else ("due" if rec.get("due") else "reminder")
             row = row_by_key[key]
-            html_text = format_card(row, status, box, GRAMMAR_LEVEL)
+            html_text = format_card(row, status, box, GRAMMAR_LEVEL, enrichments.get(key))
             print(html_text)
             send_srs_card(api_base, chat_id, "g", key, html_text)
+        # Unlike the Mini App flow (marked seen when webapp.py later
+        # serves the review page - see srs.mark_seen), a card sent this
+        # way is already fully visible the moment it lands in the chat,
+        # so it counts as seen right now - otherwise an unrated pattern
+        # would never resurface as a reminder (see srs.pick_next).
+        now_seen = srs.now_utc()
+        if any([srs.mark_seen(state, key, now_seen) for key in picked_keys]):
+            srs.save_state(GRAMMAR_SRS_PATH, state)
         print(f"\n[grammar] sent {len(picks)} patterns from {GRAMMAR_CSV_GLOB}: {', '.join(picked_keys)}")
 
     # Optional extra sinks - after Telegram (the primary channel) and the

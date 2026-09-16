@@ -24,7 +24,10 @@ Three new files, neither touching the originals:
   version.
 - `vocab_drip.py` / `kanji_drip.py` / `grammar_drip.py` - active-recall
   cards drawn from the hand-curated TSV/CSV files in `simple_agent/` (no
-  LLM call), all three sharing one Leitner-style engine
+  LLM call required - kanji/grammar can optionally add one fresh
+  LLM-generated example per push on top of the curated content, see
+  "Optional: LLM-enhanced examples" below), all three sharing one
+  Leitner-style engine
   (`scheduled/srs.py`): the word/character/pattern is shown plain,
   everything else (reading, meaning, mnemonic, compounds/nuance,
   examples) hidden under a Telegram spoiler tag so you have to actually
@@ -131,20 +134,25 @@ call (real environment variables always win):
    # subset of kanji's hourly ones).
    15 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 vocab_drip.py >> /var/log/vocab-drip.log 2>&1
 
-   # Kanji active-recall drip (3-kanji batch) - every hour within that same window
-   0 22,23,0-14 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 kanji_drip.py >> /var/log/kanji-drip.log 2>&1
+   # Kanji active-recall drip (3-kanji batch) - 3x/day (09:00/15:00/21:00
+   # JST = UTC 0/6/12). Deliberately much sparser than an hourly cadence
+   # now that each push carries a full LLM-generated practice block (see
+   # "Optional: LLM-enhanced practice block" below) instead of a single
+   # line - a few dense sessions a day beats a constant trickle of pings.
+   0 0,6,12 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 kanji_drip.py >> /var/log/kanji-drip.log 2>&1
 
-   # Grammar active-recall drip (3-pattern batch) - every 2 hours, offset
-   # 30min from vocab (and thus 30min from kanji's hourly :00 too)
-   30 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 grammar_drip.py >> /var/log/grammar-drip.log 2>&1
+   # Grammar active-recall drip (3-pattern batch) - 2x/day (10:30/20:30
+   # JST = UTC 1:30/11:30), same "denser but rarer" reasoning as kanji.
+   30 1,11 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 grammar_drip.py >> /var/log/grammar-drip.log 2>&1
    ```
 
    With WEBAPP_BASE_URL set, each of these fires is ONE Mini App
    message (the whole batch as a swipeable deck), not one message per
-   item - see the Mini App section below. This is still a lot of
-   pushes/day (kanji hourly = 17/day, vocab + grammar every 2h = 9/day
-   each => ~35/day across the 07:00-23:00 window) - widen the hour
-   lists or drop to every-3/4-hours if that's too frequent for you.
+   item - see the Mini App section below. Adjust the hour lists to your
+   own waking hours/timezone, or back toward the old hourly/every-2h
+   cadence if 3x/2x a day is too sparse for your actual review habit -
+   there's no quiet-hours logic in the scripts themselves, only what
+   cron fires.
 
    Replace `/path/to/Agentic-` with the repo's actual path on the VPS,
    and `python3` with a full interpreter path (`which python3`) if
@@ -157,6 +165,46 @@ status`/`journalctl` visibility instead (consistent with
 `telegram-bot.service`), systemd timers are a reasonable alternative,
 just noticeably more boilerplate for two short-lived scripts than plain
 cron.
+
+## Optional: LLM-enhanced practice block for kanji/grammar drips
+
+`kanji_drip.py` and `grammar_drip.py` can each add a full practice block
+generated per push via Gemini on Vertex AI (`simple_agent/llm_enrich.py`):
+
+- 2-3 fresh example sentences, each in a different register/context
+  (casual, formal, question), different every push
+- a short explanation of why the first example naturally uses the
+  item that way
+- a mini 2-4 turn dialogue using the item
+- a multiple-choice practice question (4 options + answer)
+
+Deliberately does NOT generate a mnemonic (kanji) or restate nuance/
+contrast (grammar) - both CSVs already carry hand-written versions of
+that (kanji: `component`, `disc_note`; grammar: `nuance`, `contrast`,
+`trap`, `contrast_note`), shown directly as curated content rather than
+reinvented by an LLM. The generated content is shown as extra
+🤖-labelled sections alongside - never instead of - the curated CSV
+content. Vocab is unaffected.
+
+- **Enable it**: set `GCP_PROJECT_ID` (and `GOOGLE_APPLICATION_CREDENTIALS`
+  / `GCP_LOCATION` if needed) - the same Vertex AI credentials
+  `news_digest_agent.py` already uses. Nothing else to configure; it's
+  silently skipped (drips behave exactly as before) if `GCP_PROJECT_ID`
+  isn't set.
+- **Cost**: a lifetime cap, `DRIP_ENRICH_MAX_COST_USD` (shared by both
+  drips like `AGENT_MAX_COST_USD`; the code's own default is a
+  conservative 1.00, raised to 50.00 in this deployment's
+  `scheduled.env` given the richer per-item content), tracked in
+  `.llm_enrich_usage.json`. Once reached, both drips fall back to
+  curated-content-only until you raise it.
+- **Failure mode**: any error (quota, network, a malformed response)
+  makes that one item's enrichment silently skipped for that push - it
+  never fails the cron run or removes the curated card.
+- **Mini App caching**: the generated content is cached per item
+  (`.kanji_enrich_cache.json` / `.grammar_enrich_cache.json`) at push
+  time, so `webapp.py`'s Mini App review page (opened later) shows the
+  exact same content that went out with that push instead of re-rolling
+  it.
 
 ## Optional: archive each drip to Notion and a Google Doc
 

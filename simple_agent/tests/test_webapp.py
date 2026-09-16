@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import srs  # noqa: E402
 import webapp  # noqa: E402
 
 BOT_TOKEN = "TEST:TOKEN"
@@ -173,6 +174,14 @@ class ReviewServerTest(unittest.TestCase):
         cards = json.loads(cards_json)
         self.assertEqual([c["key"] for c in cards], ["決", "続", "増"])
         self.assertTrue(all(c["image"] for c in cards))
+
+    def test_opening_the_review_page_marks_the_card_as_seen(self):
+        path = self.srs_paths["KANJI_SRS_PATH"]
+        srs.save_state(path, {"減": {"box": 0, "reps": 0, "lapses": 0, "introduced_at": "2026-01-01T00:00:00+00:00"}})
+        url = webapp.build_review_url("", "k", ["減"], BOT_TOKEN)
+        status, _ = self._get(url)
+        self.assertEqual(status, 200)
+        self.assertIn("first_seen_at", srs.load_state(path)["減"])
 
     def test_review_page_serves_a_grammar_batch_without_images(self):
         url = webapp.build_review_url("", "g", ["〜ようになる"], BOT_TOKEN)
