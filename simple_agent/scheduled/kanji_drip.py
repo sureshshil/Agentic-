@@ -15,10 +15,10 @@ get introduced per UTC day so the due queue can't outrun what one-an-hour
 can actually clear.
 
 When WEBAPP_BASE_URL is set (see webapp.py / deploy/cron-
-notifications.md), the whole batch goes out as ONE short message with a
-"Review" button that opens a swipeable flashcard deck inside Telegram
-itself. Unset, it falls back to the old flow: each kanji as its own
-image + <tg-spoiler> card + button row.
+notifications.md), the whole batch goes out as ONE short message with an
+"Open in browser" button that opens a swipeable flashcard deck in the
+system browser. Unset, it falls back to the old flow: each kanji as its
+own image + <tg-spoiler> card + button row.
 
 The button taps are handled by telegram_bot.py's own long-polling loop
 (handle_srs_callback), not by this script - this script only ever sends;
@@ -37,7 +37,7 @@ multiple-choice practice question) gets generated per push via Gemini
 AI-generated mnemonic/component-breakdown, since the CSV's own is better
 than anything an LLM would reinvent here. This is additive and fails
 soft, so a model outage never removes the curated card. Cached in
-KANJI_ENRICH_CACHE_PATH so webapp.py's Mini App page shows the exact same
+KANJI_ENRICH_CACHE_PATH so webapp.py's review page shows the exact same
 generated content as whatever went out with the push, not a re-roll.
 
 Env vars (loaded via python-dotenv from ../telegram_bot.env and
@@ -50,14 +50,18 @@ telegram_bot.py - real environment variables always win):
                             only matters when WEBAPP_BASE_URL is set, since the old
                             per-item card flow below always sent exactly one)
   KANJI_NEW_PER_DAY         optional, default 6 (new kanji introduced/UTC day)
-  KANJI_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next -
-                            an opened-but-never-rated kanji comes back
-                            around as a "reminder" this many hours after
-                            you actually opened it (srs.mark_seen, set by
-                            webapp.py's GET /review), instead of
-                            vanishing forever. One you've never even
-                            opened does NOT resurface on a timer - it
-                            just waits until you look at it once)
+  KANJI_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next).
+                            Only relevant to the plain-text fallback
+                            below (WEBAPP_BASE_URL unset): an opened-but-
+                            never-rated kanji comes back as a "reminder"
+                            this many hours after it was sent (srs.
+                            mark_seen, called right at send time since
+                            the card is already fully visible in the
+                            message). With WEBAPP_BASE_URL set, seen is
+                            only recorded the moment you actually rate a
+                            card via the review link's POST /api/submit
+                            - one you never rate just waits, unsent
+                            again, until you go rate that same link)
   KANJI_CSV_GLOB            optional, default ../N3_kanji_batch*.csv
   KANJI_SRS_PATH            optional, default ../.kanji_srs.json
   KANJI_ENRICH_CACHE_PATH   optional, default ../.kanji_enrich_cache.json
@@ -90,7 +94,7 @@ sys.path.insert(0, _SCHEDULED_DIR)
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
-from telegram_bot import send_photo, send_srs_card, send_web_app_card  # noqa: E402 - needs sys.path insert above
+from telegram_bot import send_photo, send_srs_card, send_review_link_card  # noqa: E402 - needs sys.path insert above
 from kanji_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import kanji_image  # noqa: E402 - needs sys.path insert above
 import llm_enrich  # noqa: E402 - needs sys.path insert above
@@ -110,10 +114,10 @@ KANJI_SRS_PATH = os.environ.get("KANJI_SRS_PATH") or os.path.join(
 KANJI_ENRICH_CACHE_PATH = os.environ.get("KANJI_ENRICH_CACHE_PATH") or os.path.join(
     _SIMPLE_AGENT_DIR, ".kanji_enrich_cache.json"
 )
-# Set once Caddy + webapp.py's Mini App server are live (see
+# Set once Caddy + webapp.py's review server are live (see
 # deploy/cron-notifications.md) - switches main() from the old
-# image+spoiler+4-button card to a single compact message with a "Review"
-# button that opens the card in a Telegram Mini App instead.
+# image+spoiler+4-button card to a single compact message with an
+# "Open in browser" button that opens the batch's review page instead.
 WEBAPP_BASE_URL = (os.environ.get("WEBAPP_BASE_URL") or "").rstrip("/")
 
 
@@ -155,8 +159,8 @@ def _split_words(words_field: str) -> list:
 
 def find_row(key: str) -> dict:
     """The CSV row for one kanji character, or None - used by webapp.py to
-    look up a card's content from the `key` query param on its Mini App
-    review link (see main()'s WEBAPP_BASE_URL branch)."""
+    look up a card's content from the `key` query param on its review
+    link (see main()'s WEBAPP_BASE_URL branch)."""
     for row in load_rows(KANJI_CSV_GLOB):
         if (row.get("kanji") or "").strip() == key:
             return row
@@ -294,7 +298,7 @@ def main() -> None:
     picked_keys = [key for key, _ in picks]
 
     # One fresh AI example sentence per picked kanji, generated now (this
-    # push) and cached so the Mini App page (webapp.py, opened later)
+    # push) and cached so the review page (webapp.py, opened later)
     # shows the exact same content rather than re-rolling it - see
     # llm_enrich.py. No-op (skipped/None) when GCP_PROJECT_ID isn't set
     # or the lifetime cost cap has been reached; either way the CSV
@@ -307,17 +311,14 @@ def main() -> None:
             llm_enrich.save_cache_entry(KANJI_ENRICH_CACHE_PATH, key, result)
 
     if WEBAPP_BASE_URL:
-        # One short message with a single "Review" button that opens the
-        # whole batch as a swipeable flashcard deck inside Telegram (a
-        # Mini App - webapp.py) instead of a separate image + spoiler
-        # card + button row per kanji piling up in the chat.
+        # One short message with a single "Open in browser" button that
+        # opens the whole batch as a swipeable flashcard deck (webapp.py)
+        # instead of a separate image + spoiler card + button row per
+        # kanji piling up in the chat.
         review_url = webapp.build_review_url(WEBAPP_BASE_URL, "k", picked_keys, token)
         header = f"\U0001f210 {KANJI_LEVEL} kanji review ({len(picks)} card{'s' if len(picks) != 1 else ''})"
-        send_web_app_card(
-            api_base, chat_id, header, "\U0001f4d6 Review", review_url,
-            browser_button_text="\U0001f310 Open in browser",
-        )
-        print(f"\n[kanji] sent {len(picks)} kanji via Mini App link from {KANJI_CSV_GLOB}: {', '.join(picked_keys)}")
+        send_review_link_card(api_base, chat_id, header, "\U0001f310 Open in browser", review_url)
+        print(f"\n[kanji] sent {len(picks)} kanji via review link from {KANJI_CSV_GLOB}: {', '.join(picked_keys)}")
     else:
         for key, is_new in picks:
             rec = state.get(key, {})
@@ -333,11 +334,12 @@ def main() -> None:
             # keyboard) right before the spoiler card that carries those.
             send_photo(api_base, chat_id, kanji_image.render_kanji_png(key), filename="kanji.png")
             send_srs_card(api_base, chat_id, "k", key, html_text)
-        # Unlike the Mini App flow (marked seen when webapp.py later
-        # serves the review page - see srs.mark_seen), a card sent this
-        # way is already fully visible the moment it lands in the chat,
-        # so it counts as seen right now - otherwise an unrated kanji
-        # would never resurface as a reminder (see srs.pick_next).
+        # Unlike the review-link flow (marked seen only when webapp.py's
+        # POST /api/submit records an actual rating - see srs.mark_seen),
+        # a card sent this way is already fully visible the moment it
+        # lands in the chat, so it counts as seen right now - otherwise
+        # an unrated kanji would never resurface as a reminder (see
+        # srs.pick_next).
         now_seen = srs.now_utc()
         if any([srs.mark_seen(state, key, now_seen) for key in picked_keys]):
             srs.save_state(KANJI_SRS_PATH, state)

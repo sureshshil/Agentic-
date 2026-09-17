@@ -1,47 +1,35 @@
-"""Telegram Mini App server for SRS review cards - runs as a background
-thread inside telegram_bot.py's own process (see start_server(), called
-from main()), so reviewing a batch of cards doesn't need a separate
-deployment or process to keep alive. Fronted by Caddy on the VPS (auto
-HTTPS via Let's Encrypt for a free sslip.io hostname - see
-deploy/cron-notifications.md); this server itself only ever binds
-127.0.0.1, never the public interface directly.
+"""Browser-based SRS review server - runs as a background thread inside
+telegram_bot.py's own process (see start_server(), called from main()),
+so reviewing a batch of cards doesn't need a separate deployment or
+process to keep alive. Fronted by Caddy on the VPS (auto HTTPS via Let's
+Encrypt for a free sslip.io hostname - see deploy/cron-notifications.md);
+this server itself only ever binds 127.0.0.1, never the public interface
+directly.
 
-Why a Mini App instead of kanji_drip.py's old image + <tg-spoiler> card +
-Again/Hard/Good/Easy row (still there as the fallback when
+Why a review link instead of kanji_drip.py's old image + <tg-spoiler>
+card + Again/Hard/Good/Easy row (still there as the fallback when
 WEBAPP_BASE_URL is unset): that's three chunky messages *per item*,
 which clutters the chat fast, especially once a run sends several items
 at once (vocab's whole point). This collapses one run's whole batch into
-ONE short message with a single "Review" button; tapping it opens a
-swipeable flashcard deck inside Telegram itself (a Mini App) - one card
-visible at a time, swipe or Prev/Next between them, tap to reveal, rate
-to advance. Each rating submits straight to /api/submit instead of
-round-tripping through a Telegram callback_query.
+ONE short message with a single "Open in browser" button (send_review_
+link_card in telegram_bot.py); tapping it launches the system browser
+(Safari/Chrome) to a swipeable flashcard deck - one card visible at a
+time, swipe or Prev/Next between them, tap to reveal, rate to advance.
+Each rating submits straight to /api/submit instead of round-tripping
+through a Telegram callback_query.
 
-Two ways to open the same link (send_web_app_card in telegram_bot.py
-sends both buttons on every card): a "Review" button (Telegram's
-`web_app` type) that opens it inside Telegram as a Mini App, and an
-"Open in browser" button (a plain `url` type) that launches Safari/
-Chrome instead. Both hit this exact same /review URL - only Telegram's
-button *type* differs, which is what decides whether Telegram launches
-its in-app webview (with the `Telegram.WebApp` JS bridge available) or
-hands off to the system browser (no bridge, no initData at all).
+(This used to also offer a Telegram-native Mini App button - a `web_app`
+inline button that opened the same page inside Telegram's own in-app
+webview, authenticated via Telegram's signed `initData`. Dropped for
+being an extra, rarely-used auth path and code branch for what's the
+same page either way - browser-only now, one auth mechanism.)
 
-Auth is therefore two-layered:
-- Inside Telegram: Telegram signs the page's `initData` (see
-  verify_init_data) with an HMAC keyed off the bot token, so a rating
-  submit can't be spoofed - same guarantee TELEGRAM_ALLOWED_CHAT_ID
-  gives the polling loop. For a private chat with the bot, the WebApp's
-  user id IS your chat id, so that's what gets compared against
-  TELEGRAM_ALLOWED_CHAT_ID.
-- In a plain browser there's no initData to check (it doesn't exist
-  outside Telegram's own launch flow), so each link is itself signed
-  instead (see _sign_link / _verify_link): an HMAC over kind+keys+an
-  expiry, keyed by the same bot token, appended as `exp`/`sig` query
-  params by build_review_url. The page embeds those same values so a
-  submit can echo them back as proof the request originated from a
-  genuine, unexpired link - /api/submit only falls back to this when
-  `initData` is empty (i.e. never inside Telegram, where initData is
-  always populated), so the Mini App path is unchanged either way.
+Since there's no Telegram-supplied identity outside Telegram itself,
+each link is signed instead (see _sign_link / _verify_link): an HMAC
+over kind+keys+an expiry, keyed by the bot token, appended as `exp`/
+`sig` query params by build_review_url. The page embeds those same
+values so a submit can echo them back as proof the request originated
+from a genuine, unexpired link.
 
 kanji_drip.py / grammar_drip.py / vocab_drip.py all send one link per
 run's batch (see each module's find_row / build_body_lines, which this
@@ -70,11 +58,8 @@ _SCHEDULED_DIR = os.path.join(_SIMPLE_AGENT_DIR, "scheduled")
 
 WEBAPP_HOST = "127.0.0.1"
 WEBAPP_PORT = int(os.environ.get("WEBAPP_PORT") or "8080")
-INIT_DATA_MAX_AGE_SECONDS = 3600
-# How long a plain-browser link stays valid (see _sign_link) - generous,
-# since an SRS card may sit unrated in the chat for a while before you
-# get to it. Irrelevant to the Mini App path, which is authed by
-# initData (see module docstring), not by the link's own expiry.
+# How long a review link stays valid (see _sign_link) - generous, since
+# an SRS card may sit unrated in the chat for a while before you get to it.
 LINK_TTL_SECONDS = 30 * 24 * 3600
 
 # kind -> everything webapp.py needs to render that deck's cards and
@@ -96,43 +81,6 @@ _KIND_CONFIG = {
         "box_hours": srs.BOX_HOURS_VOCAB, "front_field": "word", "has_image": False, "label": "Vocab",
     },
 }
-
-
-def verify_init_data(init_data: str, bot_token: str, max_age_seconds: int = INIT_DATA_MAX_AGE_SECONDS):
-    """Validates a Telegram WebApp `initData` string per Telegram's
-    documented check (https://core.telegram.org/bots/webapps#validating-
-    data-received-via-the-mini-app): HMAC-SHA256 over the sorted
-    key=value pairs (all but `hash`), keyed by HMAC-SHA256("WebAppData",
-    bot_token). Returns the parsed field dict (with `user` JSON-decoded)
-    if genuine and fresher than `max_age_seconds`, else None."""
-    try:
-        pairs = urllib.parse.parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
-    except ValueError:
-        return None
-    data = dict(pairs)
-    received_hash = data.pop("hash", None)
-    if not received_hash:
-        return None
-
-    check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
-    secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
-    computed_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(computed_hash, received_hash):
-        return None
-
-    try:
-        auth_date = int(data.get("auth_date", 0))
-    except ValueError:
-        return None
-    if time.time() - auth_date > max_age_seconds:
-        return None
-
-    if "user" in data:
-        try:
-            data["user"] = json.loads(data["user"])
-        except json.JSONDecodeError:
-            return None
-    return data
 
 
 def _load_drip_module(kind: str):
@@ -173,9 +121,8 @@ def _status_badge(rec: dict, box_hours: list) -> str:
 def _sign_link(kind: str, keys_raw: str, exp: int, bot_token: str) -> str:
     """HMAC over exactly what a request can present back (kind, the raw
     comma-joined keys string as it appears in the URL, and the expiry) -
-    keyed by the bot token, same secret verify_init_data already trusts.
-    Used both to mint a link (build_review_url) and to check one
-    presented later (_verify_link)."""
+    keyed by the bot token. Used both to mint a link (build_review_url)
+    and to check one presented later (_verify_link)."""
     payload = f"{kind}|{keys_raw}|{exp}"
     return hmac.new(bot_token.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
@@ -195,10 +142,8 @@ def build_review_url(base_url: str, kind: str, keys: list, bot_token: str) -> st
     """One link for a whole batch - kanji_drip.py / grammar_drip.py /
     vocab_drip.py all call this instead of sending one message per item.
     `keys` order is preserved as the card order in the deck. Signed (see
-    _sign_link) so the link works as its own bearer credential for the
-    plain-browser "Open in browser" path (see module docstring) - the
-    Mini App path doesn't need this, but signing is cheap and uniform
-    either way."""
+    _sign_link) so the link works as its own bearer credential (see
+    module docstring)."""
     keys_raw = ",".join(keys)
     exp = int(time.time()) + LINK_TTL_SECONDS
     sig = _sign_link(kind, keys_raw, exp, bot_token)
@@ -214,7 +159,6 @@ PAGE_TEMPLATE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Review</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -274,15 +218,10 @@ PAGE_TEMPLATE = """<!doctype html>
 </div>
 <script type="application/json" id="cards-data">__CARDS_JSON__</script>
 <script>
-  var tg = window.Telegram && window.Telegram.WebApp;
-  if (tg) { tg.ready(); tg.expand(); }
-
   var CARDS = JSON.parse(document.getElementById('cards-data').textContent);
   var KIND = "__KIND__";
-  // Fallback auth for the "Open in browser" path, where there's no
-  // Telegram initData at all - see module docstring. Unused (but still
-  // sent) when opened as a Mini App, where initData is always present
-  // and takes priority server-side.
+  // The link's own signature is the credential (see module docstring) -
+  // echoed back on every submit as proof this came from a genuine link.
   var KEYS_RAW = __KEYS_RAW__;
   var EXP = __EXP__;
   var SIG = __SIG__;
@@ -382,7 +321,6 @@ PAGE_TEMPLATE = """<!doctype html>
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        initData: tg ? tg.initData : '',
         keysRaw: KEYS_RAW,
         exp: EXP,
         sig: SIG,
@@ -416,9 +354,8 @@ PAGE_TEMPLATE = """<!doctype html>
   }
 
   function finish() {
-    root.innerHTML = '<div class="finished">All done for this batch 🎉</div>';
+    root.innerHTML = '<div class="finished">All done for this batch 🎉<br><span style="font-size:14px;opacity:0.6;">You can close this tab now.</span></div>';
     document.querySelector('.nav').style.display = 'none';
-    setTimeout(function () { if (tg) tg.close(); }, 1200);
   }
 
   var touchStartX = null;
@@ -439,7 +376,6 @@ PAGE_TEMPLATE = """<!doctype html>
 
 class ReviewHandler(BaseHTTPRequestHandler):
     bot_token = None
-    allowed_chat_id = None
 
     def log_message(self, fmt, *args):
         print("[webapp] " + (fmt % args))
@@ -481,17 +417,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
         enrich_cache = _enrich_cache(kind)
 
         cards = []
-        seen_changed = False
-        now = srs.now_utc()
         for key in keys:
             row = module.find_row(key)
             if row is None:
                 continue  # e.g. content CSV changed since the link was sent
             rec = state.get(key, {})
-            # First time this exact card is actually opened - gates the
-            # drip's unrated-resurface reminder (see srs.mark_seen) so an
-            # introduced-but-unopened item isn't re-pushed on a timer.
-            seen_changed = srs.mark_seen(state, key, now) or seen_changed
+            # NOT marked seen here - just opening the deck shouldn't start
+            # the unrated-resurface timer for every card in it (see
+            # srs.mark_seen). That only happens once you actually rate a
+            # specific card, in _handle_submit below.
             body_html = "\n".join(module.build_body_lines(row, enrich_cache.get(key))).replace("\n", "<br>")
             card = {
                 "key": key,
@@ -506,9 +440,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if not cards:
             self._plain(404, "no cards found")
             return
-
-        if seen_changed:
-            srs.save_state(state_path, state)
 
         cards_json = json.dumps(cards, ensure_ascii=False).replace("</", "<\\/")
         page = (
@@ -549,38 +480,28 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": "bad request"})
             return
 
-        init_data = payload.get("initData", "")
-        if init_data:
-            # Opened as a Mini App inside Telegram - initData is always
-            # populated there, so this branch is authoritative whenever
-            # it's non-empty and failure here is a hard reject (never
-            # falls through to the link-signature check below).
-            verified = verify_init_data(init_data, self.bot_token)
-            if verified is None:
-                self._json(401, {"error": "invalid or expired initData"})
-                return
-            user = verified.get("user") or {}
-            if str(user.get("id", "")) != self.allowed_chat_id:
-                self._json(403, {"error": "not allowed"})
-                return
-        else:
-            # Opened via the "Open in browser" button - no Telegram
-            # bridge, so the link's own signature is the credential
-            # instead (see module docstring / _verify_link). The key
-            # being rated must actually be one this specific link named,
-            # so a valid-but-unrelated link can't be reused to rate
-            # something else.
-            keys_raw = payload.get("keysRaw", "")
-            exp = payload.get("exp", "")
-            sig = payload.get("sig", "")
-            if not _verify_link(kind, keys_raw, exp, sig, self.bot_token) or key not in keys_raw.split(","):
-                self._json(401, {"error": "invalid or expired link"})
-                return
+        # The link's own signature is the credential (see module
+        # docstring / _verify_link). The key being rated must actually be
+        # one this specific link named, so a valid-but-unrelated link
+        # can't be reused to rate something else.
+        keys_raw = payload.get("keysRaw", "")
+        exp = payload.get("exp", "")
+        sig = payload.get("sig", "")
+        if not _verify_link(kind, keys_raw, exp, sig, self.bot_token) or key not in keys_raw.split(","):
+            self._json(401, {"error": "invalid or expired link"})
+            return
 
         box_hours = _KIND_CONFIG[kind]["box_hours"]
         path = _srs_state_path(kind)
         state = srs.load_state(path)
-        interval_hours = srs.record_review(state, key, action, box_hours, srs.now_utc())
+        now = srs.now_utc()
+        # First time this specific card is actually rated - see
+        # srs.mark_seen. record_review below sets "due" regardless, which
+        # takes priority over the unrated-resurface path anyway, but this
+        # keeps first_seen_at accurate for a card that's rated without
+        # ever having been "seen" some other way.
+        srs.mark_seen(state, key, now)
+        interval_hours = srs.record_review(state, key, action, box_hours, now)
         srs.save_state(path, state)
         print(f"[webapp] SRS: {kind}:{key} rated {action}, next due in {srs.format_interval(interval_hours)}")
 
@@ -611,16 +532,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def start_server(bot_token: str, allowed_chat_id: str, port: int = WEBAPP_PORT) -> ThreadingHTTPServer:
-    """Starts the Mini App server in a daemon background thread and
-    returns immediately - called once from telegram_bot.py's main(),
-    alongside (not instead of) the existing getUpdates long-polling loop.
-    Binds 127.0.0.1 only; Caddy is what actually exposes it over HTTPS
-    (see deploy/cron-notifications.md)."""
+def start_server(bot_token: str, port: int = WEBAPP_PORT) -> ThreadingHTTPServer:
+    """Starts the review server in a daemon background thread and returns
+    immediately - called once from telegram_bot.py's main(), alongside
+    (not instead of) the existing getUpdates long-polling loop. Binds
+    127.0.0.1 only; Caddy is what actually exposes it over HTTPS (see
+    deploy/cron-notifications.md)."""
     ReviewHandler.bot_token = bot_token
-    ReviewHandler.allowed_chat_id = allowed_chat_id
     server = ThreadingHTTPServer((WEBAPP_HOST, port), ReviewHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    print(f"[webapp] Mini App review server listening on {WEBAPP_HOST}:{port}")
+    print(f"[webapp] review server listening on {WEBAPP_HOST}:{port}")
     return server

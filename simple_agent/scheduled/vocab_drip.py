@@ -50,9 +50,15 @@ telegram_bot.py - real environment variables always win):
   VOCAB_LEVEL               optional, default "N3" (JLPT level, label only)
   VOCAB_BATCH_SIZE          optional, default 10 (words per push)
   VOCAB_NEW_PER_DAY         optional, default 16 (new words introduced/UTC day)
-  VOCAB_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next -
-                            a sent-but-never-tapped word comes back around
-                            as a reminder instead of vanishing forever)
+  VOCAB_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next).
+                            Only relevant to the plain-text fallback
+                            below (WEBAPP_BASE_URL unset): a sent-but-
+                            never-tapped word comes back around as a
+                            reminder instead of vanishing forever. With
+                            WEBAPP_BASE_URL set, seen is only recorded
+                            the moment you actually rate a word via the
+                            review link - one you never rate just waits
+                            until you go rate that same link)
   VOCAB_TSV_GLOB            optional, default ../N3_vocab_batch*.tsv
   VOCAB_SRS_PATH            optional, default ../.vocab_srs.json
 
@@ -86,7 +92,7 @@ sys.path.insert(0, _SCHEDULED_DIR)
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
-from telegram_bot import send_srs_card, send_telegram_reply, send_web_app_card  # noqa: E402 - needs sys.path insert above
+from telegram_bot import send_srs_card, send_telegram_reply, send_review_link_card  # noqa: E402 - needs sys.path insert above
 from vocab_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import srs  # noqa: E402 - needs sys.path insert above
 import webapp  # noqa: E402 - needs sys.path insert above
@@ -102,8 +108,8 @@ VOCAB_SRS_PATH = os.environ.get("VOCAB_SRS_PATH") or os.path.join(
     _SIMPLE_AGENT_DIR, ".vocab_srs.json"
 )
 # See kanji_drip.py's WEBAPP_BASE_URL comment - same opt-in switch. When
-# set, the whole batch goes out as one Mini App link (swipeable flashcard
-# deck) instead of one Telegram message per word.
+# set, the whole batch goes out as one browser review link (swipeable
+# flashcard deck) instead of one Telegram message per word.
 WEBAPP_BASE_URL = (os.environ.get("WEBAPP_BASE_URL") or "").rstrip("/")
 
 # The '#columns:<tab-separated names>' line in each Anki-style TSV header.
@@ -159,8 +165,8 @@ def load_rows(glob_pattern: str) -> list:
 
 def find_row(key: str) -> dict:
     """The TSV row for one word, or None - used by webapp.py to look up
-    a card's content from its Mini App review link (see main()'s
-    WEBAPP_BASE_URL branch)."""
+    a card's content from its review link (see main()'s WEBAPP_BASE_URL
+    branch)."""
     for row in load_rows(VOCAB_TSV_GLOB):
         if (row.get("word") or "").strip() == key:
             return row
@@ -269,17 +275,14 @@ def main() -> None:
     entries = [row_to_entry(row_by_key[key]) for key in picked_keys]
 
     if WEBAPP_BASE_URL:
-        # One short message with a single "Review" button that opens the
-        # whole batch as a swipeable flashcard deck inside Telegram (a
-        # Mini App - webapp.py) instead of a header message plus one
-        # spoiler card per word piling up in the chat.
+        # One short message with a single "Open in browser" button that
+        # opens the whole batch as a swipeable flashcard deck (webapp.py)
+        # instead of a header message plus one spoiler card per word
+        # piling up in the chat.
         review_url = webapp.build_review_url(WEBAPP_BASE_URL, "v", picked_keys, token)
         header = f"\U0001f4d8 {VOCAB_LEVEL} vocabulary review ({len(picks)} card{'s' if len(picks) != 1 else ''})"
-        send_web_app_card(
-            api_base, chat_id, header, "\U0001f4d6 Review", review_url,
-            browser_button_text="\U0001f310 Open in browser",
-        )
-        print(f"\n[vocab] sent {len(picks)} words via Mini App link from {VOCAB_TSV_GLOB}: {', '.join(picked_keys)}")
+        send_review_link_card(api_base, chat_id, header, "\U0001f310 Open in browser", review_url)
+        print(f"\n[vocab] sent {len(picks)} words via review link from {VOCAB_TSV_GLOB}: {', '.join(picked_keys)}")
     else:
         blocks = []
         statuses = []
@@ -296,11 +299,12 @@ def main() -> None:
         )
         for key, block in zip(picked_keys, blocks):
             send_srs_card(api_base, chat_id, "v", key, block)
-        # Unlike the Mini App flow (marked seen when webapp.py later
-        # serves the review page - see srs.mark_seen), a card sent this
-        # way is already fully visible the moment it lands in the chat,
-        # so it counts as seen right now - otherwise an unrated word
-        # would never resurface as a reminder (see srs.pick_next).
+        # Unlike the review-link flow (marked seen only when webapp.py's
+        # POST /api/submit records an actual rating - see srs.mark_seen),
+        # a card sent this way is already fully visible the moment it
+        # lands in the chat, so it counts as seen right now - otherwise
+        # an unrated word would never resurface as a reminder (see
+        # srs.pick_next).
         now = srs.now_utc()
         if any([srs.mark_seen(state, key, now) for key in picked_keys]):
             srs.save_state(VOCAB_SRS_PATH, state)

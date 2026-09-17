@@ -1,13 +1,13 @@
 """Grammar-pattern active-recall drip via Telegram, spaced-repetition
 version - sibling to kanji_drip.py (same srs.py engine, same
-telegram_bot.py callback handler, same webapp.py Mini App), just a
+telegram_bot.py callback handler, same webapp.py review server), just a
 different deck. Cadence is entirely up to crontab, not this script (see
 ../deploy/cron-notifications.md - currently 2x/day in this deployment,
 deliberately sparse now that each push carries a full LLM practice block
 rather than a single line). See kanji_drip.py's docstring for the full
 rationale (active recall, Leitner review intervals, due reviews before
 new introductions, a daily cap on new items, batched into one swipeable
-Mini App link when WEBAPP_BASE_URL is set).
+browser review link when WEBAPP_BASE_URL is set).
 
 Grammar content comes from the hand-curated CSVs next to this repo
 (../n3_grammar_batch*.csv by default, override with GRAMMAR_CSV_GLOB),
@@ -16,12 +16,13 @@ AI practice block (2-3 fresh example sentences, a short explanation, a
 mini dialogue, and a multiple-choice practice question) gets generated
 per push via Gemini (see ../llm_enrich.py) and shown as extra "AI"
 sections alongside the CSV's own content - additive and fails soft, same
-as kanji_drip.py. Cached in GRAMMAR_ENRICH_CACHE_PATH so webapp.py's Mini
-App page shows the exact same generated content as whatever went out
+as kanji_drip.py. Cached in GRAMMAR_ENRICH_CACHE_PATH so webapp.py's
+review page shows the exact same generated content as whatever went out
 with the push.
-Button taps (or, with WEBAPP_BASE_URL set, Mini App rating submits) are
-handled entirely by telegram_bot.py's long-polling loop / webapp.py; this
-script only ever sends. State lives in .grammar_srs.json (gitignored).
+Button taps (or, with WEBAPP_BASE_URL set, review-link rating submits)
+are handled entirely by telegram_bot.py's long-polling loop / webapp.py;
+this script only ever sends. State lives in .grammar_srs.json
+(gitignored).
 
 Env vars (loaded via python-dotenv from ../telegram_bot.env and
 ../deploy/scheduled.env, real environment variables always win):
@@ -31,14 +32,18 @@ Env vars (loaded via python-dotenv from ../telegram_bot.env and
   GRAMMAR_BATCH_SIZE         optional, default 3 (patterns per push - see
                              srs.pick_batch; only matters with WEBAPP_BASE_URL set)
   GRAMMAR_NEW_PER_DAY        optional, default 4 (new patterns/UTC day)
-  GRAMMAR_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next -
-                             an opened-but-never-rated pattern comes back
-                             around as a "reminder" this many hours after
-                             you actually opened it (srs.mark_seen, set
-                             by webapp.py's GET /review), instead of
-                             vanishing forever. One you've never even
-                             opened does NOT resurface on a timer - it
-                             just waits until you look at it once)
+  GRAMMAR_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next).
+                             Only relevant to the plain-text fallback
+                             below (WEBAPP_BASE_URL unset): an opened-
+                             but-never-rated pattern comes back as a
+                             "reminder" this many hours after it was sent
+                             (srs.mark_seen, called at send time since
+                             the card is already fully visible in the
+                             message). With WEBAPP_BASE_URL set, seen is
+                             only recorded the moment you actually rate a
+                             card via the review link's POST /api/submit
+                             - one you never rate just waits, unsent
+                             again, until you go rate that same link)
   GRAMMAR_CSV_GLOB           optional, default ../n3_grammar_batch*.csv
   GRAMMAR_SRS_PATH           optional, default ../.grammar_srs.json
   GRAMMAR_ENRICH_CACHE_PATH  optional, default ../.grammar_enrich_cache.json
@@ -70,7 +75,7 @@ sys.path.insert(0, _SCHEDULED_DIR)
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "telegram_bot.env"))
 load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
-from telegram_bot import send_srs_card, send_web_app_card  # noqa: E402 - needs sys.path insert above
+from telegram_bot import send_srs_card, send_review_link_card  # noqa: E402 - needs sys.path insert above
 from grammar_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import llm_enrich  # noqa: E402 - needs sys.path insert above
 import srs  # noqa: E402 - needs sys.path insert above
@@ -112,8 +117,8 @@ def load_rows(glob_pattern: str) -> list:
 
 def find_row(key: str) -> dict:
     """The CSV row for one grammar pattern, or None - used by webapp.py
-    to look up a card's content from its Mini App review link (see
-    main()'s WEBAPP_BASE_URL branch)."""
+    to look up a card's content from its review link (see main()'s
+    WEBAPP_BASE_URL branch)."""
     for row in load_rows(GRAMMAR_CSV_GLOB):
         if (row.get("grammar") or "").strip() == key:
             return row
@@ -242,7 +247,7 @@ def main() -> None:
     picked_keys = [key for key, _ in picks]
 
     # One fresh AI example + usage tip per picked pattern, generated now
-    # (this push) and cached so the Mini App page (webapp.py, opened
+    # (this push) and cached so the review page (webapp.py, opened
     # later) shows the exact same content - see kanji_drip.py's identical
     # comment / llm_enrich.py.
     enrichments = {}
@@ -253,17 +258,14 @@ def main() -> None:
             llm_enrich.save_cache_entry(GRAMMAR_ENRICH_CACHE_PATH, key, result)
 
     if WEBAPP_BASE_URL:
-        # One short message with a single "Review" button that opens the
-        # whole batch as a swipeable flashcard deck inside Telegram (a
-        # Mini App - webapp.py) instead of a spoiler card + button row
-        # per pattern piling up in the chat.
+        # One short message with a single "Open in browser" button that
+        # opens the whole batch as a swipeable flashcard deck (webapp.py)
+        # instead of a spoiler card + button row per pattern piling up
+        # in the chat.
         review_url = webapp.build_review_url(WEBAPP_BASE_URL, "g", picked_keys, token)
         header = f"\U0001f210 {GRAMMAR_LEVEL} grammar review ({len(picks)} card{'s' if len(picks) != 1 else ''})"
-        send_web_app_card(
-            api_base, chat_id, header, "\U0001f4d6 Review", review_url,
-            browser_button_text="\U0001f310 Open in browser",
-        )
-        print(f"\n[grammar] sent {len(picks)} patterns via Mini App link from {GRAMMAR_CSV_GLOB}: {', '.join(picked_keys)}")
+        send_review_link_card(api_base, chat_id, header, "\U0001f310 Open in browser", review_url)
+        print(f"\n[grammar] sent {len(picks)} patterns via review link from {GRAMMAR_CSV_GLOB}: {', '.join(picked_keys)}")
     else:
         for key, is_new in picks:
             rec = state.get(key, {})
@@ -273,11 +275,12 @@ def main() -> None:
             html_text = format_card(row, status, box, GRAMMAR_LEVEL, enrichments.get(key))
             print(html_text)
             send_srs_card(api_base, chat_id, "g", key, html_text)
-        # Unlike the Mini App flow (marked seen when webapp.py later
-        # serves the review page - see srs.mark_seen), a card sent this
-        # way is already fully visible the moment it lands in the chat,
-        # so it counts as seen right now - otherwise an unrated pattern
-        # would never resurface as a reminder (see srs.pick_next).
+        # Unlike the review-link flow (marked seen only when webapp.py's
+        # POST /api/submit records an actual rating - see srs.mark_seen),
+        # a card sent this way is already fully visible the moment it
+        # lands in the chat, so it counts as seen right now - otherwise
+        # an unrated pattern would never resurface as a reminder (see
+        # srs.pick_next).
         now_seen = srs.now_utc()
         if any([srs.mark_seen(state, key, now_seen) for key in picked_keys]):
             srs.save_state(GRAMMAR_SRS_PATH, state)

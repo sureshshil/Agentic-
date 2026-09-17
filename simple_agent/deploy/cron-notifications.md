@@ -142,9 +142,10 @@ call (real environment variables always win):
    30 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 grammar_drip.py >> /var/log/grammar-drip.log 2>&1
    ```
 
-   With WEBAPP_BASE_URL set, each of these fires is ONE Mini App
-   message (the whole batch as a swipeable deck), not one message per
-   item - see the Mini App section below. This is still a lot of
+   With WEBAPP_BASE_URL set, each of these fires is ONE review-link
+   message (the whole batch as a swipeable deck, opened in the browser),
+   not one message per item - see the review section below. This is
+   still a lot of
    pushes/day (kanji hourly = 17/day, vocab + grammar every 2h = 9/day
    each => ~35/day across the 07:00-23:00 window) - widen the hour
    lists or drop to every-3/4-hours if that's too frequent for you.
@@ -195,11 +196,10 @@ content. Vocab is unaffected.
 - **Failure mode**: any error (quota, network, a malformed response)
   makes that one item's enrichment silently skipped for that push - it
   never fails the cron run or removes the curated card.
-- **Mini App caching**: the generated content is cached per item
+- **Review-page caching**: the generated content is cached per item
   (`.kanji_enrich_cache.json` / `.grammar_enrich_cache.json`) at push
-  time, so `webapp.py`'s Mini App review page (opened later) shows the
-  exact same content that went out with that push instead of re-rolling
-  it.
+  time, so `webapp.py`'s review page (opened later) shows the exact same
+  content that went out with that push instead of re-rolling it.
 
 ## Optional: archive each drip to Notion and a Google Doc
 
@@ -346,29 +346,35 @@ cd /home/projects/Agentic-/simple_agent/scheduled
 python3 jlpt_instructor.py
 ```
 
-## Optional: SRS review via Telegram Mini App instead of chat clutter
+## Optional: SRS review via browser link instead of chat clutter
 
 By default each drip sends one chunky set of messages *per item* (kanji:
 image + `<tg-spoiler>` card + button row; grammar: pattern + spoiler card
 + button row; vocab: a header message plus one spoiler block per word).
-`webapp.py` replaces that with a Telegram **Mini App**: each run's whole
-batch goes out as ONE short message with a single "Review" button that
-opens a swipeable flashcard deck inside Telegram itself - one card at a
-time (image for kanji, big text for grammar/vocab), tap to reveal, swipe
-or Prev/Next between cards, rate to advance, auto-closes once every card
-in the batch is rated. No browser tab, far less scrollback. Runs as a
-background thread inside `telegram_bot.py`'s own process (same systemd
-service, nothing new to manage or restart separately). Batch sizes are
-each deck's own `*_BATCH_SIZE` env var (defaults: kanji 3, grammar 3,
-vocab 10 - see `scheduled.env.example`).
+`webapp.py` replaces that with a single link: each run's whole batch
+goes out as ONE short message with an "Open in browser" button that
+opens a swipeable flashcard deck in the system browser (Safari/Chrome) -
+one card at a time (image for kanji, big text for grammar/vocab), tap to
+reveal, swipe or Prev/Next between cards, rate to advance. Far less
+scrollback than the per-item flow. Runs as a background thread inside
+`telegram_bot.py`'s own process (same systemd service, nothing new to
+manage or restart separately). Batch sizes are each deck's own
+`*_BATCH_SIZE` env var (defaults: kanji 3, grammar 3, vocab 10 - see
+`scheduled.env.example`).
 
-Telegram only allows a Mini App button to open an **HTTPS** URL with a
-real certificate - no plain HTTP, no self-signed cert - so this needs a
-public HTTPS front door pointed at the VPS. If you don't already own a
-domain, [sslip.io](https://sslip.io) gives you one for free with zero
-signup: `<your-ip-with-dashes>.sslip.io` resolves straight to your VPS's
-own public IP, and [Caddy](https://caddyserver.com) will get it a real
-Let's Encrypt certificate automatically.
+(This used to also offer a Telegram-native Mini App button that opened
+the same page in Telegram's own in-app webview, authenticated via
+Telegram's signed `initData`. Dropped in favor of one plain browser link
+and one auth mechanism - simpler to reason about, and the link opens
+fine on desktop too.)
+
+The review link still needs a public **HTTPS** URL with a real
+certificate to be usable from a phone's browser - so this needs a public
+HTTPS front door pointed at the VPS. If you don't already own a domain,
+[sslip.io](https://sslip.io) gives you one for free with zero signup:
+`<your-ip-with-dashes>.sslip.io` resolves straight to your VPS's own
+public IP, and [Caddy](https://caddyserver.com) will get it a real Let's
+Encrypt certificate automatically.
 
 1. **Install Caddy** (official apt repo - see
    <https://caddyserver.com/docs/install#debian-ubuntu-raspbian>), then
@@ -390,20 +396,22 @@ Let's Encrypt certificate automatically.
 3. **Set `WEBAPP_BASE_URL`** (the public origin from step 1) and
    optionally `WEBAPP_PORT` (default `8080`) in `../telegram_bot.env` -
    loaded by `telegram_bot.py` (which binds the port) and all three drip
-   scripts (which use the base URL to build their batch's Review link).
+   scripts (which use the base URL to build their batch's review link).
    Leave `WEBAPP_BASE_URL` unset to keep each script's old per-item
    message flow - they all fall back automatically.
-4. `systemctl restart telegram-bot` - watch for `[webapp] Mini App
-   review server listening on 127.0.0.1:8080` in `journalctl -u
-   telegram-bot`, then run `python3 kanji_drip.py` (or `grammar_drip.py`
-   / `vocab_drip.py`) manually to send a test batch.
+4. `systemctl restart telegram-bot` - watch for `[webapp] review server
+   listening on 127.0.0.1:8080` in `journalctl -u telegram-bot`, then
+   run `python3 kanji_drip.py` (or `grammar_drip.py` / `vocab_drip.py`)
+   manually to send a test batch.
 
-Auth: the Mini App page can't be opened or forged by a stranger who
-finds the URL - Telegram signs each page load's `initData` with an HMAC
-keyed on the bot token (`webapp.py`'s `verify_init_data`), and
-`/api/submit` checks the signed Telegram user id against
-`TELEGRAM_ALLOWED_CHAT_ID` before touching any SRS state file, the same
-guarantee `TELEGRAM_ALLOWED_CHAT_ID` already gives the polling loop.
+Auth: the review page can't be opened or forged by a stranger who finds
+the URL - each link is itself signed (an HMAC over kind+keys+an expiry,
+keyed on the bot token - see `webapp.py`'s `_sign_link`/`_verify_link`),
+and `/api/submit` checks that same signature (plus that the key being
+rated is actually one the link named) before touching any SRS state
+file. `TELEGRAM_ALLOWED_CHAT_ID` still gates the polling loop as before;
+the review link's own signature is what stands in for it here, since a
+plain browser page has no Telegram identity to check.
 
 All three decks (`kind="k"`/`"g"`/`"v"`) are wired up - see
 `_KIND_CONFIG` in `webapp.py` if you add a fourth deck later.

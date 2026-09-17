@@ -1,11 +1,9 @@
-"""Regression tests for webapp.py - the Telegram Mini App server that
-replaces kanji_drip.py/grammar_drip.py/vocab_drip.py's old per-item
+"""Regression tests for webapp.py - the browser-based SRS review server
+that replaces kanji_drip.py/grammar_drip.py/vocab_drip.py's old per-item
 messages (image+spoiler+button-row, or a spoiler card per word) with one
-"Review" button that opens a whole batch as a swipeable flashcard deck
-in-app (see webapp.py's module docstring).
+"Open in browser" button that opens a whole batch as a swipeable
+flashcard deck (see webapp.py's module docstring).
 
-verify_init_data is tested against hand-signed initData strings (same
-HMAC construction Telegram itself uses - no live Telegram call needed).
 The HTTP handler is tested by actually starting the server on a loopback
 port and issuing real requests - simplest way to catch routing/wiring
 bugs without mocking BaseHTTPRequestHandler's internals.
@@ -13,8 +11,6 @@ bugs without mocking BaseHTTPRequestHandler's internals.
 Run: python3 -m unittest tests.test_webapp -v   (from simple_agent/)
 """
 
-import hashlib
-import hmac
 import json
 import os
 import sys
@@ -30,37 +26,6 @@ import srs  # noqa: E402
 import webapp  # noqa: E402
 
 BOT_TOKEN = "TEST:TOKEN"
-
-
-def _sign(fields: dict, bot_token: str = BOT_TOKEN) -> str:
-    check_string = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
-    secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
-    signature = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
-    return urllib.parse.urlencode({**fields, "hash": signature})
-
-
-class VerifyInitDataTest(unittest.TestCase):
-    def test_correctly_signed_data_verifies(self):
-        init_data = _sign({"auth_date": str(int(time.time())), "user": json.dumps({"id": 42})})
-        result = webapp.verify_init_data(init_data, BOT_TOKEN)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["user"]["id"], 42)
-
-    def test_tampered_hash_is_rejected(self):
-        init_data = _sign({"auth_date": str(int(time.time())), "user": json.dumps({"id": 42})})
-        tampered = init_data[:-4] + "0000"
-        self.assertIsNone(webapp.verify_init_data(tampered, BOT_TOKEN))
-
-    def test_wrong_bot_token_is_rejected(self):
-        init_data = _sign({"auth_date": str(int(time.time())), "user": json.dumps({"id": 42})})
-        self.assertIsNone(webapp.verify_init_data(init_data, "OTHER:TOKEN"))
-
-    def test_stale_auth_date_is_rejected(self):
-        init_data = _sign({"auth_date": str(int(time.time()) - 999999), "user": json.dumps({"id": 42})})
-        self.assertIsNone(webapp.verify_init_data(init_data, BOT_TOKEN))
-
-    def test_missing_hash_is_rejected(self):
-        self.assertIsNone(webapp.verify_init_data("auth_date=123&user=%7B%7D", BOT_TOKEN))
 
 
 class BuildReviewUrlTest(unittest.TestCase):
@@ -117,10 +82,8 @@ class VerifyLinkTest(unittest.TestCase):
 class ReviewServerTest(unittest.TestCase):
     """Starts the real server on loopback and drives it with real HTTP
     requests - covers routing, each drip module's find_row lookup, and
-    the initData -> srs.record_review path together, for all three
+    the link-signature -> srs.record_review path together, for all three
     kinds."""
-
-    ALLOWED_CHAT_ID = "555"
 
     @classmethod
     def setUpClass(cls):
@@ -134,7 +97,7 @@ class ReviewServerTest(unittest.TestCase):
             os.environ[env_var] = path
         cls.port = 8098
         cls.base = f"http://127.0.0.1:{cls.port}"
-        cls.server = webapp.start_server(BOT_TOKEN, cls.ALLOWED_CHAT_ID, port=cls.port)
+        cls.server = webapp.start_server(BOT_TOKEN, port=cls.port)
         time.sleep(0.2)  # let the background thread actually start listening
 
     @classmethod
@@ -175,11 +138,24 @@ class ReviewServerTest(unittest.TestCase):
         self.assertEqual([c["key"] for c in cards], ["決", "続", "増"])
         self.assertTrue(all(c["image"] for c in cards))
 
-    def test_opening_the_review_page_marks_the_card_as_seen(self):
+    def test_opening_the_review_page_does_not_mark_the_card_as_seen(self):
+        # Just opening the deck link shouldn't start the unrated-resurface
+        # timer - only actually rating a card (via /api/submit) should.
         path = self.srs_paths["KANJI_SRS_PATH"]
         srs.save_state(path, {"減": {"box": 0, "reps": 0, "lapses": 0, "introduced_at": "2026-01-01T00:00:00+00:00"}})
         url = webapp.build_review_url("", "k", ["減"], BOT_TOKEN)
         status, _ = self._get(url)
+        self.assertEqual(status, 200)
+        self.assertNotIn("first_seen_at", srs.load_state(path)["減"])
+
+    def test_submitting_a_rating_marks_the_card_as_seen(self):
+        path = self.srs_paths["KANJI_SRS_PATH"]
+        srs.save_state(path, {"減": {"box": 0, "reps": 0, "lapses": 0, "introduced_at": "2026-01-01T00:00:00+00:00"}})
+        exp = int(time.time()) + 3600
+        sig = webapp._sign_link("k", "減", exp, BOT_TOKEN)
+        status, _ = self._post_submit({
+            "keysRaw": "減", "exp": str(exp), "sig": sig, "kind": "k", "key": "減", "action": "good",
+        })
         self.assertEqual(status, 200)
         self.assertIn("first_seen_at", srs.load_state(path)["減"])
 
@@ -243,49 +219,36 @@ class ReviewServerTest(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         self.assertTrue(resp.read().startswith(b"\x89PNG\r\n\x1a\n"))
 
-    def test_submit_with_valid_init_data_records_review_and_returns_interval(self):
-        init_data = _sign({"auth_date": str(int(time.time())), "user": json.dumps({"id": int(self.ALLOWED_CHAT_ID)})})
-        status, body = self._post_submit({"initData": init_data, "kind": "k", "key": "決", "action": "good"})
-        self.assertEqual(status, 200)
-        self.assertEqual(body["label"], "Good")
-        with open(self.srs_paths["KANJI_SRS_PATH"], encoding="utf-8") as f:
-            state = json.load(f)
-        self.assertIn("決", state)
-        self.assertEqual(state["決"]["last_result"], "good")
-
-    def test_submit_rejects_unauthorized_user(self):
-        init_data = _sign({"auth_date": str(int(time.time())), "user": json.dumps({"id": 111})})
-        status, body = self._post_submit({"initData": init_data, "kind": "k", "key": "決", "action": "good"})
-        self.assertEqual(status, 403)
-
-    def test_submit_rejects_invalid_init_data(self):
-        status, body = self._post_submit({"initData": "not-signed-at-all", "kind": "k", "key": "決", "action": "good"})
-        self.assertEqual(status, 401)
-
     def test_submit_rejects_unknown_action(self):
-        init_data = _sign({"auth_date": str(int(time.time())), "user": json.dumps({"id": int(self.ALLOWED_CHAT_ID)})})
-        status, body = self._post_submit({"initData": init_data, "kind": "k", "key": "決", "action": "whoops"})
+        exp = int(time.time()) + 3600
+        sig = webapp._sign_link("k", "決", exp, BOT_TOKEN)
+        status, body = self._post_submit({
+            "keysRaw": "決", "exp": str(exp), "sig": sig, "kind": "k", "key": "決", "action": "whoops",
+        })
         self.assertEqual(status, 400)
 
-    # "Open in browser" path - no Telegram initData at all, so the link's
-    # own signature is the credential instead (see webapp.py's module
+    # The link's own signature is the credential (see webapp.py's module
     # docstring / _verify_link).
 
-    def test_submit_via_link_signature_succeeds_with_no_init_data(self):
+    def test_submit_via_link_signature_records_review_and_returns_interval(self):
         exp = int(time.time()) + 3600
         sig = webapp._sign_link("k", "決,続", exp, BOT_TOKEN)
         status, body = self._post_submit({
-            "initData": "", "keysRaw": "決,続", "exp": str(exp), "sig": sig,
+            "keysRaw": "決,続", "exp": str(exp), "sig": sig,
             "kind": "k", "key": "決", "action": "easy",
         })
         self.assertEqual(status, 200)
         self.assertEqual(body["label"], "Easy")
+        with open(self.srs_paths["KANJI_SRS_PATH"], encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertIn("決", state)
+        self.assertEqual(state["決"]["last_result"], "easy")
 
     def test_submit_via_link_signature_rejects_a_key_not_in_the_link(self):
         exp = int(time.time()) + 3600
         sig = webapp._sign_link("k", "決,続", exp, BOT_TOKEN)  # signed for 決/続 only
         status, body = self._post_submit({
-            "initData": "", "keysRaw": "決,続", "exp": str(exp), "sig": sig,
+            "keysRaw": "決,続", "exp": str(exp), "sig": sig,
             "kind": "k", "key": "増", "action": "good",  # not part of this link
         })
         self.assertEqual(status, 401)
@@ -294,7 +257,7 @@ class ReviewServerTest(unittest.TestCase):
         exp = int(time.time()) + 3600
         sig = webapp._sign_link("k", "決", exp, BOT_TOKEN)
         status, body = self._post_submit({
-            "initData": "", "keysRaw": "決", "exp": str(exp), "sig": sig[:-4] + "0000",
+            "keysRaw": "決", "exp": str(exp), "sig": sig[:-4] + "0000",
             "kind": "k", "key": "決", "action": "good",
         })
         self.assertEqual(status, 401)
@@ -303,7 +266,7 @@ class ReviewServerTest(unittest.TestCase):
         exp = int(time.time()) - 10
         sig = webapp._sign_link("k", "決", exp, BOT_TOKEN)
         status, body = self._post_submit({
-            "initData": "", "keysRaw": "決", "exp": str(exp), "sig": sig,
+            "keysRaw": "決", "exp": str(exp), "sig": sig,
             "kind": "k", "key": "決", "action": "good",
         })
         self.assertEqual(status, 401)
