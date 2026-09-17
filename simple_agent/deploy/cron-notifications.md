@@ -134,25 +134,20 @@ call (real environment variables always win):
    # subset of kanji's hourly ones).
    15 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 vocab_drip.py >> /var/log/vocab-drip.log 2>&1
 
-   # Kanji active-recall drip (3-kanji batch) - 3x/day (09:00/15:00/21:00
-   # JST = UTC 0/6/12). Deliberately much sparser than an hourly cadence
-   # now that each push carries a full LLM-generated practice block (see
-   # "Optional: LLM-enhanced practice block" below) instead of a single
-   # line - a few dense sessions a day beats a constant trickle of pings.
-   0 0,6,12 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 kanji_drip.py >> /var/log/kanji-drip.log 2>&1
+   # Kanji active-recall drip (3-kanji batch) - every hour within that same window
+   0 22,23,0-14 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 kanji_drip.py >> /var/log/kanji-drip.log 2>&1
 
-   # Grammar active-recall drip (3-pattern batch) - 2x/day (10:30/20:30
-   # JST = UTC 1:30/11:30), same "denser but rarer" reasoning as kanji.
-   30 1,11 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 grammar_drip.py >> /var/log/grammar-drip.log 2>&1
+   # Grammar active-recall drip (3-pattern batch) - every 2 hours, offset
+   # 30min from vocab (and thus 30min from kanji's hourly :00 too)
+   30 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 grammar_drip.py >> /var/log/grammar-drip.log 2>&1
    ```
 
    With WEBAPP_BASE_URL set, each of these fires is ONE Mini App
    message (the whole batch as a swipeable deck), not one message per
-   item - see the Mini App section below. Adjust the hour lists to your
-   own waking hours/timezone, or back toward the old hourly/every-2h
-   cadence if 3x/2x a day is too sparse for your actual review habit -
-   there's no quiet-hours logic in the scripts themselves, only what
-   cron fires.
+   item - see the Mini App section below. This is still a lot of
+   pushes/day (kanji hourly = 17/day, vocab + grammar every 2h = 9/day
+   each => ~35/day across the 07:00-23:00 window) - widen the hour
+   lists or drop to every-3/4-hours if that's too frequent for you.
 
    Replace `/path/to/Agentic-` with the repo's actual path on the VPS,
    and `python3` with a full interpreter path (`which python3`) if
@@ -294,6 +289,61 @@ python3 kanji_drip.py
 python3 grammar_drip.py
 # Notion: added 1/1 grammar rows
 # Google Doc: appended 1 pattern(s) (740 chars) at index 940
+```
+
+## JLPT adaptive instructor (Notion daily plan + one morning email)
+
+`jlpt_instructor.py` is a separate module (`jlpt_item_bank.py` for the
+item-bank/evidence engine, `jlpt_notion.py` for block/page-level Notion
+access) that ports the ChatGPT/Codex "cowork" JLPT instructor workflow
+into this repo - see `../NOTION-FIRST-JLPT-ARCHITECTURE.md` for the
+design. It does not touch `kanji_sinks.py`/`grammar_sinks.py`/
+`vocab_sinks.py` or any of the Telegram drip scripts; it's a fully
+independent consumer of the same `N3_*_batch*` CSV/TSV source files,
+with its own state (`../.jlpt_item_bank.json`, `../.jlpt_email_ledger.json`)
+and its own local logs (`../outputs/Email-delivery.md`,
+`../outputs/Progress-log.md`).
+
+It determines the current Japan date/time itself and runs the morning
+branch (before noon JST: reconcile Notion evidence, plan today's bounded
+lesson, write/verify the one dated Notion row, send at most one Gmail
+summary per Japan-date) or the evening branch (from noon JST: read
+reported results, ingest evidence, write instructor feedback back to
+Notion - never sends email) - so it's safe to run more often than exactly
+twice a day; the ledger and JST-time check gate what it actually does.
+
+Env vars, on top of what's already in `../telegram_bot.env`
+(`NOTION_API_KEY`, `GCP_PROJECT_ID`, `GOOGLE_APPLICATION_CREDENTIALS`,
+`EMAIL_ADDRESS`/`EMAIL_APP_PASSWORD`):
+
+```bash
+# deploy/scheduled.env
+JLPT_NOTION_COLLECTION_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# JLPT_NOTION_TITLE_PROPERTY=Name
+# JLPT_EMAIL_TO=you@example.com
+```
+
+Setup: share the target Notion page/collection (the one with the
+existing dated rows) with the same integration used by `NOTION_API_KEY` -
+**Connections** on that page, same as the per-deck databases above, since
+an internal integration only sees pages/databases explicitly shared with
+it.
+
+Crontab - hourly is deliberate here rather than pinning exact UTC times
+for 07:00/23:00 JST: the script's own JST branch + email ledger decide
+whether to actually act, so an hourly tick is robust to a missed/late
+cron run in a way a once-a-day pinned time isn't (same reasoning as
+kanji_drip.py's multiple-times-a-day cadence above):
+
+```cron
+7 * * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 jlpt_instructor.py >> /var/log/jlpt-instructor.log 2>&1
+```
+
+Test manually first:
+
+```bash
+cd /home/projects/Agentic-/simple_agent/scheduled
+python3 jlpt_instructor.py
 ```
 
 ## Optional: SRS review via Telegram Mini App instead of chat clutter

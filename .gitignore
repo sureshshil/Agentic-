@@ -34,3 +34,7 @@ simple_agent/vocab_artifacts/audio/_parts/
 simple_agent/vocab_artifacts/audio/n3_day*.mp3
 
 .vercel
+
+# JLPT instructor local logs (Email-delivery.md / Progress-log.md) -
+# runtime state, same as the dotfile JSON state files above.
+simple_agent/outputs/
