@@ -39,7 +39,7 @@ class BuildBodyLinesTest(unittest.TestCase):
 
     def test_with_enrichment_appends_the_ai_practice_block(self):
         enrichment = {
-            "examples": [{"jp": "決断した。", "reading": "けつだんした。", "en": "I made a decision."}],
+            "examples": [{"jp": "決断[けつだん]した。", "reading": "けつだんした。", "en": "I made a decision."}],
             "explanation": "Uses 決断する for a weightier decision than 決める.",
             "dialogue": [{"speaker": "A", "jp": "もう決めた？", "en": "Have you decided yet?"}],
             "practice_question": {"question": "q", "options": ["a", "b"], "answer": "a"},
@@ -47,10 +47,10 @@ class BuildBodyLinesTest(unittest.TestCase):
         lines = kd.build_body_lines(_ROW, enrichment)
         joined = "\n".join(lines)
         self.assertIn("彼は決めた。", joined)  # curated example still present
-        self.assertIn("決断した。", joined)
+        self.assertIn("決断[けつだん]した。", joined)
         self.assertIn("I made a decision.", joined)
         self.assertIn("weightier decision", joined)
-        self.assertIn("もう決めた？", joined)
+        self.assertIn("もう決[き]めた？", joined)
         self.assertIn("\U0001f916", joined)
 
     def test_enrichment_without_examples_omits_the_example_blocks(self):
@@ -71,9 +71,9 @@ class BuildBodyLinesTest(unittest.TestCase):
         self.assertNotIn("ヒント", "\n".join(lines))
 
     def test_format_card_passes_enrichment_through(self):
-        enrichment = {"examples": [{"jp": "決断した。", "en": "I made a decision."}]}
+        enrichment = {"examples": [{"jp": "決断[けつだん]した。", "en": "I made a decision."}]}
         html_text = kd.format_card(_ROW, "new", 0, "N3", enrichment)
-        self.assertIn("決断した。", html_text)
+        self.assertIn("決断[けつだん]した。", html_text)
 
     def test_format_card_without_enrichment_is_unchanged(self):
         html_text = kd.format_card(_ROW, "new", 0, "N3")

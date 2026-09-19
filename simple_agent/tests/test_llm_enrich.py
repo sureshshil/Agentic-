@@ -214,23 +214,23 @@ class FormatBlocksTest(unittest.TestCase):
     def test_renders_numbered_examples_with_reading(self):
         enrichment = {
             "examples": [
-                {"jp": "決めた。", "reading": "きめた。", "en": "I decided."},
+                {"jp": "決[き]めた。", "reading": "きめた。", "en": "I decided."},
                 {"jp": "決まった？", "reading": "きまった？", "en": "Is it decided?"},
             ],
         }
         blocks = llm_enrich.format_blocks(enrichment)
         self.assertEqual(len(blocks), 2)
         self.assertIn("例文1", blocks[0])
-        self.assertIn("決めた。", blocks[0])
+        self.assertIn("決[き]めた。", blocks[0])
         self.assertIn("きめた。", blocks[0])
         self.assertIn("I decided.", blocks[0])
         self.assertIn("例文2", blocks[1])
 
     def test_renders_examples_without_reading_field(self):
-        enrichment = {"examples": [{"jp": "決めた。", "en": "I decided."}]}
+        enrichment = {"examples": [{"jp": "決[き]めた。", "en": "I decided."}]}
         blocks = llm_enrich.format_blocks(enrichment)
         self.assertEqual(len(blocks), 1)
-        self.assertIn("決めた。", blocks[0])
+        self.assertIn("決[き]めた。", blocks[0])
         self.assertIn("I decided.", blocks[0])
 
     def test_renders_explanation_block(self):
@@ -242,15 +242,15 @@ class FormatBlocksTest(unittest.TestCase):
     def test_renders_dialogue_block_with_all_turns(self):
         enrichment = {
             "dialogue": [
-                {"speaker": "A", "jp": "もう決めた？", "en": "Have you decided yet?"},
-                {"speaker": "B", "jp": "うん、決めたよ。", "en": "Yeah, I decided."},
+                {"speaker": "A", "jp": "もう決[き]めた？", "en": "Have you decided yet?"},
+                {"speaker": "B", "jp": "うん、決[き]めたよ。", "en": "Yeah, I decided."},
             ]
         }
         blocks = llm_enrich.format_blocks(enrichment)
         self.assertEqual(len(blocks), 1)
         self.assertIn("会話", blocks[0])
-        self.assertIn("もう決めた？", blocks[0])
-        self.assertIn("うん、決めたよ。", blocks[0])
+        self.assertIn("もう決[き]めた？", blocks[0])
+        self.assertIn("うん、決[き]めたよ。", blocks[0])
 
     def test_renders_practice_question_with_lettered_options_and_answer(self):
         enrichment = {
@@ -263,9 +263,9 @@ class FormatBlocksTest(unittest.TestCase):
         blocks = llm_enrich.format_blocks(enrichment)
         self.assertEqual(len(blocks), 1)
         self.assertIn("クイズ", blocks[0])
-        self.assertIn("A) 決めた", blocks[0])
-        self.assertIn("D) 決められた", blocks[0])
-        self.assertIn("答え: 決めた", blocks[0])
+        self.assertIn("A) 決[き]めた", blocks[0])
+        self.assertIn("D) 決[き]められた", blocks[0])
+        self.assertIn("答え: 決[き]めた", blocks[0])
 
     def test_missing_sections_are_simply_omitted(self):
         self.assertEqual(llm_enrich.format_blocks({}), [])
@@ -307,3 +307,14 @@ class CacheTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FuriganaAnnotateTest(unittest.TestCase):
+    def test_adds_readings_to_bare_kanji_and_keeps_existing_ones(self):
+        import furigana
+        self.assertEqual(furigana.annotate("部屋[へや]を片付けて"), "部屋[へや]を片付[かたづ]けて")
+        self.assertEqual(furigana.annotate("今日は明日行く"), "今日[きょう]は明日[あした]行[い]く")
+
+    def test_leaves_kana_and_ascii_alone(self):
+        import furigana
+        self.assertEqual(furigana.annotate("ひらがな ABC"), "ひらがな ABC")

@@ -102,14 +102,14 @@ class FormatWordBlockTest(unittest.TestCase):
 
     def test_word_is_visible_and_rest_is_wrapped_in_a_spoiler(self):
         block = vd.format_word_block(self.rows[0], "new")
-        self.assertIn("<b>場合</b>", block)
+        self.assertIn("<b>場合[ばあい]</b>", block)
         self.assertIn("<tg-spoiler>", block)
         self.assertIn("ばあい — case; situation", block)
         self.assertIn("\U0001f1f3\U0001f1f5 अवस्था", block)
-        self.assertIn("助詞: 〜の場合（は）", block)
+        self.assertIn("助詞: 〜の場合[ばあい]（は）", block)
         self.assertIn("例文:\n1. 雨[あめ]の場合[ばあい]は中止[ちゅうし]。", block)
         # the word itself must be OUTSIDE the spoiler span (it's the recall prompt)
-        self.assertLess(block.index("<b>場合</b>"), block.index("<tg-spoiler>"))
+        self.assertLess(block.index("<b>場合[ばあい]</b>"), block.index("<tg-spoiler>"))
 
     def test_status_marker_varies_by_status(self):
         self.assertTrue(vd.format_word_block(self.rows[0], "new").startswith("\U0001f210"))
@@ -148,18 +148,18 @@ class EnrichmentTest(unittest.TestCase):
 
     def test_with_enrichment_appends_the_ai_practice_block(self):
         enrichment = {
-            "examples": [{"jp": "場合による。", "en": "It depends on the situation."}],
+            "examples": [{"jp": "場合[ばあい]による。", "en": "It depends on the situation."}],
             "explanation": "Uses 場合 to hedge on a specific condition.",
-            "dialogue": [{"speaker": "A", "jp": "行く場合もある。", "en": "There are cases I'd go."}],
+            "dialogue": [{"speaker": "A", "jp": "行[い]く場合[ばあい]もある。", "en": "There are cases I'd go."}],
             "practice_question": {"question": "q", "options": ["a", "b"], "answer": "a"},
         }
         lines = vd.build_body_lines(self.rows[0], enrichment)
         joined = "\n".join(lines)
         self.assertIn("雨[あめ]の場合[ばあい]は中止[ちゅうし]。", joined)  # curated examples still present
-        self.assertIn("場合による。", joined)
+        self.assertIn("場合[ばあい]による。", joined)
         self.assertIn("It depends on the situation.", joined)
         self.assertIn("hedge on a specific condition", joined)
-        self.assertIn("行く場合もある。", joined)
+        self.assertIn("行[い]く場合[ばあい]もある。", joined)
         self.assertIn("\U0001f916", joined)
 
     def test_enrichment_without_examples_omits_the_example_blocks(self):
@@ -168,9 +168,9 @@ class EnrichmentTest(unittest.TestCase):
         self.assertNotIn("例文1", "\n".join(lines))
 
     def test_format_word_block_passes_enrichment_through(self):
-        enrichment = {"examples": [{"jp": "場合による。", "en": "It depends on the situation."}]}
+        enrichment = {"examples": [{"jp": "場合[ばあい]による。", "en": "It depends on the situation."}]}
         block = vd.format_word_block(self.rows[0], "new", enrichment)
-        self.assertIn("場合による。", block)
+        self.assertIn("場合[ばあい]による。", block)
 
     def test_format_word_block_without_enrichment_is_unchanged(self):
         block = vd.format_word_block(self.rows[0], "new")

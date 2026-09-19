@@ -101,6 +101,7 @@ from telegram_bot import send_photo, send_srs_card, send_review_link_card  # noq
 from kanji_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import kanji_image  # noqa: E402 - needs sys.path insert above
 import llm_enrich  # noqa: E402 - needs sys.path insert above
+import furigana  # noqa: E402
 import srs  # noqa: E402 - needs sys.path insert above
 import webapp  # noqa: E402 - needs sys.path insert above
 
@@ -190,6 +191,11 @@ def row_to_entry(row: dict) -> dict:
     }
 
 
+def _fx(text: str) -> str:
+    """HTML-escaped text with inline furigana added to any bare kanji."""
+    return html.escape(furigana.annotate(text))
+
+
 _STATUS_LABELS = {
     "new": "\U0001f210 New {level} kanji",
     "due": "\U0001f501 Review ({level}, box {box}/{top})",
@@ -220,11 +226,11 @@ def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
         body.append(f"\U0001f1f3\U0001f1f5 {html.escape(row['meaning_ne'].strip())}")
 
     if (row.get("component") or "").strip():
-        body.append(f"構成: {html.escape(row['component'].strip())}")
+        body.append(f"構成: {_fx(row['component'].strip())}")
     if (row.get("confusable") or "").strip():
-        body.append(f"似ている: {html.escape(row['confusable'].strip())}")
+        body.append(f"似ている: {_fx(row['confusable'].strip())}")
     if (row.get("disc_note") or "").strip():
-        body.append(f"\U0001f4a1 ヒント: {html.escape(row['disc_note'].strip())}")
+        body.append(f"\U0001f4a1 ヒント: {_fx(row['disc_note'].strip())}")
 
     words = _split_words(row.get("words", ""))
     if words:

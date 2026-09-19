@@ -121,6 +121,7 @@ load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 from telegram_bot import send_srs_card, send_telegram_reply, send_review_link_card  # noqa: E402 - needs sys.path insert above
 from vocab_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import llm_enrich  # noqa: E402 - needs sys.path insert above
+import furigana  # noqa: E402
 import srs  # noqa: E402 - needs sys.path insert above
 import webapp  # noqa: E402 - needs sys.path insert above
 
@@ -156,6 +157,11 @@ _SENTENCE_COLUMNS = [
 # them ("部屋[へや]を片付[かたづ]けて", not "部屋[へや]を 片付[かたづ]けて") - real
 # spaces around ASCII words ("JLPT N3") are left alone.
 _JP_WORD_SPACE_RE = re.compile(r"(?<=\]|[^\x00-\x7f])[ \t]+(?=[^\x00-\x7f])")
+
+def _fx(text: str) -> str:
+    """HTML-escaped text with inline furigana added to any bare kanji."""
+    return html.escape(furigana.annotate(text))
+
 
 _STATUS_MARKERS = {"new": "\U0001f210", "due": "\U0001f501", "reminder": "⏰"}
 
@@ -244,7 +250,7 @@ def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
     if entry["nepali"]:
         lines.append(f"\U0001f1f3\U0001f1f5 {html.escape(entry['nepali'])}")
     if entry["particles"]:
-        lines.append(f"助詞: {html.escape(entry['particles'])}")
+        lines.append(f"助詞: {_fx(entry['particles'])}")
     if entry["examples"]:
         lines.append("")
         lines.append("例文:")
@@ -268,7 +274,7 @@ def format_word_block(row: dict, status: str, enrichment: dict | None = None) ->
     entry = row_to_entry(row)
     lines = build_body_lines(row, enrichment)
     marker = _STATUS_MARKERS[status]
-    return f"{marker} <b>{html.escape(entry['word'])}</b>\n<tg-spoiler>{chr(10).join(lines)}</tg-spoiler>"
+    return f"{marker} <b>{_fx(row.get('word_furigana') or entry['word'])}</b>\n<tg-spoiler>{chr(10).join(lines)}</tg-spoiler>"
 
 
 def build_message(blocks: list) -> str:

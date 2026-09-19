@@ -66,6 +66,8 @@ import html
 import json
 import os
 
+import furigana
+
 _SIMPLE_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODEL = "gemini-3.7-flash"
@@ -416,6 +418,12 @@ def enrich_vocab(row: dict, level: str) -> dict | None:
     return _generate(prompt, _VOCAB_SCHEMA)
 
 
+def _fx(text) -> str:
+    """furigana-annotated, HTML-escaped text (Telegram has no <ruby>, so
+    readings go inline as 漢字[かんじ] - see furigana.py)."""
+    return html.escape(furigana.annotate(text or ""))
+
+
 def format_blocks(enrichment: dict) -> list:
     """An enrich_kanji()/enrich_grammar()/enrich_vocab() result rendered
     into HTML-escaped blocks - one string per section (examples,
@@ -430,29 +438,29 @@ def format_blocks(enrichment: dict) -> list:
 
     examples = enrichment.get("examples") or []
     for i, example in enumerate(examples, start=1):
-        line = f"\U0001f916 例文{i}: {html.escape(example['jp'])}"
+        line = f"\U0001f916 例文{i}: {_fx(example['jp'])}"
         if example.get("reading"):
-            line += f"\n{html.escape(example['reading'])}"
+            line += f"\n{html.escape(example['reading'])}"  # full-kana line, kept
         line += f"\n— {html.escape(example['en'])}"
         blocks.append(line)
 
     if enrichment.get("explanation"):
-        blocks.append(f"\U0001f916 解説: {html.escape(enrichment['explanation'])}")
+        blocks.append(f"\U0001f916 解説: {_fx(enrichment['explanation'])}")
 
     dialogue = enrichment.get("dialogue") or []
     if dialogue:
         dialogue_lines = ["\U0001f916 会話:"]
         for turn in dialogue:
             speaker = html.escape(turn.get("speaker") or "")
-            dialogue_lines.append(f"{speaker}: {html.escape(turn['jp'])} ({html.escape(turn['en'])})")
+            dialogue_lines.append(f"{speaker}: {_fx(turn['jp'])} ({html.escape(turn['en'])})")
         blocks.append("\n".join(dialogue_lines))
 
     question = enrichment.get("practice_question")
     if question:
-        question_lines = [f"\U0001f916 クイズ: {html.escape(question['question'])}"]
+        question_lines = [f"\U0001f916 クイズ: {_fx(question['question'])}"]
         for letter, option in zip("ABCD", question.get("options") or []):
-            question_lines.append(f"{letter}) {html.escape(option)}")
-        question_lines.append(f"✅ 答え: {html.escape(question.get('answer') or '')}")
+            question_lines.append(f"{letter}) {_fx(option)}")
+        question_lines.append(f"✅ 答え: {_fx(question.get('answer') or '')}")
         blocks.append("\n".join(question_lines))
 
     return blocks

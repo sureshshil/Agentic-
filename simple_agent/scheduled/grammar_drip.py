@@ -81,6 +81,7 @@ load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 from telegram_bot import send_srs_card, send_review_link_card  # noqa: E402 - needs sys.path insert above
 from grammar_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
 import llm_enrich  # noqa: E402 - needs sys.path insert above
+import furigana  # noqa: E402
 import srs  # noqa: E402 - needs sys.path insert above
 import webapp  # noqa: E402 - needs sys.path insert above
 
@@ -150,6 +151,11 @@ def row_to_entry(row: dict) -> dict:
     }
 
 
+def _fx(text: str) -> str:
+    """HTML-escaped text with inline furigana added to any bare kanji."""
+    return html.escape(furigana.annotate(text))
+
+
 _STATUS_LABELS = {
     "new": "\U0001f210 New {level} grammar",
     "due": "\U0001f501 Review ({level}, box {box}/{top})",
@@ -168,21 +174,21 @@ def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
     the curated content; the curated content itself is never replaced."""
     body = []
     if (row.get("formation") or "").strip():
-        body.append(f"形: {html.escape(row['formation'].strip())}")
+        body.append(f"形: {_fx(row['formation'].strip())}")
 
     body.append(html.escape((row.get("meaning_en") or "").strip()))
     if (row.get("meaning_ne") or "").strip():
         body.append(f"\U0001f1f3\U0001f1f5 {html.escape(row['meaning_ne'].strip())}")
 
     if (row.get("nuance") or "").strip():
-        body.append(f"ニュアンス: {html.escape(row['nuance'].strip())}")
+        body.append(f"ニュアンス: {_fx(row['nuance'].strip())}")
     if (row.get("contrast") or "").strip():
-        body.append(f"対比: {html.escape(row['contrast'].strip())}")
+        body.append(f"対比: {_fx(row['contrast'].strip())}")
 
     ex_jp = (row.get("ex1") or "").strip()
     if ex_jp:
         body.append("")
-        example_lines = [f"例文: {html.escape(ex_jp)}"]
+        example_lines = [f"例文: {_fx(ex_jp)}"]
         ex_reading = (row.get("ex1_reading") or "").strip()
         if ex_reading:
             example_lines.append(html.escape(ex_reading))
@@ -209,7 +215,7 @@ def format_card(row: dict, status: str, box: int, level: str, enrichment: dict |
         level=html.escape(level), box=box + 1, top=len(srs.BOX_HOURS_GRAMMAR)
     )
     body = build_body_lines(row, enrichment)
-    return f"{header}\n\n<b>{html.escape(pattern)}</b>\n\n<tg-spoiler>{chr(10).join(body)}</tg-spoiler>"
+    return f"{header}\n\n<b>{_fx(pattern)}</b>\n\n<tg-spoiler>{chr(10).join(body)}</tg-spoiler>"
 
 
 def main() -> None:
