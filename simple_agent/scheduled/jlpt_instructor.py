@@ -63,7 +63,10 @@ import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import edge_tts
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
 from dotenv import load_dotenv
 
 _SCHEDULED_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,6 +80,7 @@ load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 from telegram_bot import Agent, send_email  # noqa: E402 - needs sys.path insert above
 import jlpt_item_bank as bank  # noqa: E402
 import jlpt_notion as notion  # noqa: E402
+import jlpt_sinks as sinks  # noqa: E402
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -508,10 +512,8 @@ def _passage_only(visible_reading_text: str) -> str:
 
 
 async def _edge_tts_save(text: str, voice: str, path: str) -> None:
-    """Same retry shape as build_vocab_audio.py's own tts() helper - a
-    transient edge-tts/network hiccup gets a couple of retries before
-    giving up, rather than failing the whole Listening section over one
-    flaky request."""
+    if edge_tts is None:
+        raise RuntimeError("edge-tts package is not installed")
     last_exc = None
     for attempt in range(_TTS_RETRIES):
         try:
@@ -765,6 +767,11 @@ def run_morning(now_jst: datetime) -> str:
             notion.upload_audio(row["page_id"], listening_audio_mp3, f"{reading_item['id']}.mp3")
         except Exception as exc:
             print(f"Warning: uploading listening audio to Notion failed ({exc})")
+
+    # Best-effort append to Google Doc for NotebookLM if configured
+    gdoc_msg = sinks.gdoc_append_instructor_day(plan_result, reading_item, grammar_blocks_content, date_str)
+    if not gdoc_msg.startswith("Google Doc: skipped"):
+        print(gdoc_msg)
 
     expect = [fields["Vocabulary"][:40]] if plan_result["blocks"] else [date_str]
     if not notion.verify_row_saved(collection_id, date_str, expect):

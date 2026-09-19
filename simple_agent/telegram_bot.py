@@ -105,6 +105,7 @@ This has to keep running somewhere to be useful - see README for hosting
 options (it long-polls, so no public URL/webhook is needed).
 """
 
+from datetime import datetime
 import json
 import logging
 import os
@@ -1404,6 +1405,109 @@ def format_recap(messages: list, limit: int = RECAP_CHAR_LIMIT) -> str:
     return f"[{len(lines) - len(kept)} earlier lines omitted]\n" + "\n".join(kept)
 
 
+def handle_jlpt_command() -> str:
+    """Returns a summary of today's JLPT instructor plan and item status."""
+    from scheduled import jlpt_instructor as inst
+    from scheduled import jlpt_item_bank as bank
+
+    now_jst = datetime.now(inst.JST)
+    date_str = now_jst.date().isoformat()
+
+    try:
+        catalog = bank.load_catalog(inst.VOCAB_TSV_GLOB, inst.KANJI_CSV_GLOB, inst.GRAMMAR_CSV_GLOB)
+        state = bank.load_state(inst.ITEM_BANK_PATH)
+    except Exception as exc:
+        return f"Error loading JLPT catalog/item bank: {exc}"
+
+    items = state.get("items", {})
+    pending = state.get("pending", [])
+
+    lines = [f"📚 JLPT Instructor Plan — {date_str}"]
+    if pending:
+        lines.append(f"\nPending Items ({len(pending)}): {', '.join(pending)}")
+
+    today_items = [
+        sid for sid, rec in items.items()
+        if rec.get("introduced_date") == date_str or rec.get("next_review") == date_str or sid in pending
+    ]
+    if today_items:
+        lines.append("\nToday's Active Items:")
+        for sid in today_items:
+            rec = items[sid]
+            lines.append(
+                f"• {sid} {rec.get('item', '')} [{rec.get('type')}] — "
+                f"State: {rec.get('state')} (Cadence: {rec.get('cadence_index')})"
+            )
+    else:
+        lines.append("\nNo items currently active for today.")
+
+    lines.append("\nTo report results: /report <ID> <pass|partial|fail> [note]\nExample: /report V011 pass")
+    return "\n".join(lines)
+
+
+def handle_jlpt_report_command(text: str) -> str:
+    """Parses /report <id> <verdict> [note] and updates item bank & Notion."""
+    parts = text.strip().split(maxsplit=3)
+    if len(parts) < 3:
+        return (
+            "Usage: /report <source_id> <pass|partial|fail|unknown> [note]\n"
+            "Example: /report V011 pass\n"
+            "Example: /report K004 fail mixed up with 快"
+        )
+
+    sid = parts[1].upper()
+    verdict = parts[2].lower()
+    note = parts[3] if len(parts) > 3 else ""
+
+    if verdict not in ("pass", "partial", "fail", "unknown"):
+        return f"Invalid verdict '{verdict}'. Allowed: pass, partial, fail, unknown."
+
+    from scheduled import jlpt_instructor as inst
+    from scheduled import jlpt_item_bank as bank
+    from scheduled import jlpt_notion as notion
+
+    now_jst = datetime.now(inst.JST)
+    date_str = now_jst.date().isoformat()
+
+    try:
+        catalog = bank.load_catalog(inst.VOCAB_TSV_GLOB, inst.KANJI_CSV_GLOB, inst.GRAMMAR_CSV_GLOB)
+        state = bank.load_state(inst.ITEM_BANK_PATH)
+    except Exception as exc:
+        return f"Error loading JLPT catalog/item bank: {exc}"
+
+    if sid not in catalog and sid not in state.get("items", {}):
+        return f"Error: item '{sid}' not found in catalog or item bank."
+
+    reports = {"items": [{"source_id": sid, "result": verdict, "note": note}]}
+    bank.ingest_evidence(state, catalog, reports, now_jst)
+    bank.save_state(inst.ITEM_BANK_PATH, state)
+
+    updated_rec = state.get("items", {}).get(sid, {})
+    new_state = updated_rec.get("state", "UNKNOWN")
+    next_rev = updated_rec.get("next_review", "DONE")
+
+    notion_msg = ""
+    if os.environ.get("NOTION_API_KEY") and os.environ.get("JLPT_NOTION_COLLECTION_ID"):
+        try:
+            coll_id = os.environ["JLPT_NOTION_COLLECTION_ID"]
+            row = notion.find_row_for_date(coll_id, date_str)
+            if row:
+                note_line = f"{sid} {verdict}" + (f" - {note}" if note else "")
+                notion.append_instructor_notes(
+                    row["page_id"],
+                    row.get("Instructor Notes", ""),
+                    [f"{date_str} (via Telegram): {note_line}"],
+                )
+                notion_msg = " (Notion updated)"
+        except Exception as exc:
+            notion_msg = f" (Notion update failed: {exc})"
+
+    return (
+        f"✅ Recorded {sid} as {verdict.upper()}{notion_msg}.\n"
+        f"State: {new_state} | Next review: {next_rev}"
+    )
+
+
 def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     allowed_chat_id = str(os.environ["TELEGRAM_ALLOWED_CHAT_ID"])
@@ -1519,6 +1623,14 @@ def main() -> None:
                                 f"Switched to session {n} (cost so far "
                                 f"${agent.session_cost_usd:.4f}). Recap:\n\n{recap}"
                             )
+                if text.strip().lower() == "/jlpt":
+                    reply = handle_jlpt_command()
+                    print(f"Agent: {reply}")
+                    send_telegram_reply(api_base, chat_id, reply)
+                    continue
+
+                if text.strip().lower().startswith("/report"):
+                    reply = handle_jlpt_report_command(text)
                     print(f"Agent: {reply}")
                     send_telegram_reply(api_base, chat_id, reply)
                     continue

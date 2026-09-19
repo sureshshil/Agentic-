@@ -162,17 +162,22 @@ class StripFuriganaTest(unittest.TestCase):
 
 
 class GenerateReadingAudioMp3Test(unittest.TestCase):
+    def setUp(self):
+        if inst.edge_tts is None:
+            inst.edge_tts = MagicMock()
+            inst.edge_tts.Communicate.return_value.save = AsyncMock()
+
     def test_returns_the_saved_files_bytes(self):
-        async def fake_save(self_communicate, path, *_args, **_kwargs):
+        async def fake_save(path, *_args, **_kwargs):
             with open(path, "wb") as f:
                 f.write(b"FAKE MP3 BYTES")
 
-        with patch.object(inst.edge_tts.Communicate, "save", new=fake_save):
+        with patch.object(inst.edge_tts.Communicate.return_value, "save", new=AsyncMock(side_effect=fake_save)):
             mp3_bytes = inst._generate_reading_audio_mp3("こんにちは")
         self.assertEqual(mp3_bytes, b"FAKE MP3 BYTES")
 
     def test_propagates_a_generation_failure_after_retries(self):
-        with patch.object(inst.edge_tts.Communicate, "save", new=AsyncMock(side_effect=RuntimeError("network error"))):
+        with patch.object(inst.edge_tts.Communicate.return_value, "save", new=AsyncMock(side_effect=RuntimeError("network error"))):
             with patch.object(inst.asyncio, "sleep", new=AsyncMock()):
                 with self.assertRaises(RuntimeError):
                     inst._generate_reading_audio_mp3("text")
