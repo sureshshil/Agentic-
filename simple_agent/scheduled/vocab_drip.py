@@ -33,6 +33,25 @@ tab-separated row per word):
 `frame` is the 助詞 / particle-pattern line; `note` is unused here. The
 three sentences already carry inline [furigana].
 
+Optionally, ON TOP of that curated content, a full AI practice block
+(2-3 example sentences, a short explanation, a mini dialogue, and a
+multiple-choice practice question) gets generated ONCE per word, the
+first time it's ever picked, via Gemini (see ../llm_enrich.py) and shown
+as extra "AI" sections - same mechanism as kanji_drip.py/grammar_drip.py.
+This is where sentence variety comes from: when `frame` lists more than
+one particle-affinity pattern, the curated TSV still only ships one
+fixed sentence per pattern, so enrich_vocab is told about all the listed
+patterns and asked to generate examples that actually exercise each one
+- rather than hand-editing the TSV (the source of truth) for variety.
+This block is generated once and then permanently cached
+(VOCAB_ENRICH_CACHE_PATH), reused on every later review of that word -
+never regenerated - so it becomes as stable a memory aid as the curated
+card itself instead of showing different examples on every review; see
+llm_enrich.load_cache's docstring for the full rationale. This is
+additive and fails soft, so a model outage never removes the curated
+card, and webapp.py's review page reads the same cache, so it always
+shows this exact content.
+
 Button taps are handled by telegram_bot.py's own long-polling loop
 (handle_srs_callback), not by this script - this script only ever sends;
 it never listens. State lives in .vocab_srs.json (gitignored, replacing
@@ -61,6 +80,13 @@ telegram_bot.py - real environment variables always win):
                             until you go rate that same link)
   VOCAB_TSV_GLOB            optional, default ../N3_vocab_batch*.tsv
   VOCAB_SRS_PATH            optional, default ../.vocab_srs.json
+  VOCAB_ENRICH_CACHE_PATH   optional, default ../.vocab_enrich_cache.json
+  GCP_PROJECT_ID            optional - enables the per-push LLM practice
+                            block (see ../llm_enrich.py); unset means the
+                            drip behaves exactly as before.
+  DRIP_ENRICH_MAX_COST_USD  optional, default 1.00 - lifetime cap shared
+                            with kanji_drip.py/grammar_drip.py's
+                            enrichment - see ../llm_enrich.py.
 
 Optional extra sinks (each best-effort - a failure is logged and the
 Telegram drip still goes out; skipped entirely unless its vars are set).
@@ -94,6 +120,7 @@ load_dotenv(os.path.join(_SIMPLE_AGENT_DIR, "deploy", "scheduled.env"))
 
 from telegram_bot import send_srs_card, send_telegram_reply, send_review_link_card  # noqa: E402 - needs sys.path insert above
 from vocab_sinks import gdoc_append, notion_add_row  # noqa: E402 - needs sys.path insert above
+import llm_enrich  # noqa: E402 - needs sys.path insert above
 import srs  # noqa: E402 - needs sys.path insert above
 import webapp  # noqa: E402 - needs sys.path insert above
 
@@ -106,6 +133,9 @@ VOCAB_TSV_GLOB = os.environ.get("VOCAB_TSV_GLOB") or os.path.join(
 )
 VOCAB_SRS_PATH = os.environ.get("VOCAB_SRS_PATH") or os.path.join(
     _SIMPLE_AGENT_DIR, ".vocab_srs.json"
+)
+VOCAB_ENRICH_CACHE_PATH = os.environ.get("VOCAB_ENRICH_CACHE_PATH") or os.path.join(
+    _SIMPLE_AGENT_DIR, ".vocab_enrich_cache.json"
 )
 # See kanji_drip.py's WEBAPP_BASE_URL comment - same opt-in switch. When
 # set, the whole batch goes out as one browser review link (swipeable
@@ -202,9 +232,11 @@ def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
     HTML-escaped lines (see kanji_drip.build_body_lines - same
     join-with-'\\n' convention, shared by format_word_block's
     <tg-spoiler> body and webapp.py's browser-rendered review page).
-    `enrichment` is accepted only so webapp.py can call every drip
-    module's build_body_lines the same way - vocab has no LLM enrichment
-    (see llm_enrich.py) and this is always None/ignored here."""
+    `enrichment` is an optional llm_enrich.enrich_vocab() result - when
+    present, its AI-generated practice block (examples, explanation,
+    dialogue, practice question - see llm_enrich.format_blocks) is
+    appended after the curated content; the curated content itself is
+    never replaced."""
     entry = row_to_entry(row)
     lines = [
         f"{html.escape(entry['reading'])} — {html.escape(entry['meaning'])}"
@@ -218,16 +250,23 @@ def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
         lines.append("例文:")
         for i, example in enumerate(entry["examples"], 1):
             lines.append(f"{i}. {html.escape(example)}")
+
+    if enrichment:
+        for block in llm_enrich.format_blocks(enrichment):
+            lines.append("")
+            lines.append(block)
+
     return lines
 
 
-def format_word_block(row: dict, status: str) -> str:
+def format_word_block(row: dict, status: str, enrichment: dict | None = None) -> str:
     """One word's HTML (parse_mode=HTML) block within a batch message:
     the word itself visible, everything else under its own <tg-spoiler>
     (each spoiler in a message reveals independently on tap). `status` is
-    "new" / "due" / "reminder" - see kanji_drip.format_card."""
+    "new" / "due" / "reminder" - see kanji_drip.format_card. `enrichment`
+    - see build_body_lines."""
     entry = row_to_entry(row)
-    lines = build_body_lines(row)
+    lines = build_body_lines(row, enrichment)
     marker = _STATUS_MARKERS[status]
     return f"{marker} <b>{html.escape(entry['word'])}</b>\n<tg-spoiler>{chr(10).join(lines)}</tg-spoiler>"
 
@@ -274,6 +313,23 @@ def main() -> None:
     picked_keys = [key for key, _ in picks]
     entries = [row_to_entry(row_by_key[key]) for key in picked_keys]
 
+    # A practice block generated ONCE per word, the first time it's ever
+    # picked, then reused on every later review from the persistent cache
+    # - see kanji_drip.py's identical comment / llm_enrich.py. No-op
+    # (skipped/None) when GCP_PROJECT_ID isn't set or the lifetime cost
+    # cap has been reached; either way the curated TSV content below is
+    # unaffected.
+    enrich_cache = llm_enrich.load_cache(VOCAB_ENRICH_CACHE_PATH)
+    enrichments = {}
+    for key in picked_keys:
+        if key in enrich_cache:
+            enrichments[key] = enrich_cache[key]
+            continue
+        result = llm_enrich.enrich_vocab(row_by_key[key], VOCAB_LEVEL)
+        if result:
+            enrichments[key] = result
+            llm_enrich.save_cache_entry(VOCAB_ENRICH_CACHE_PATH, key, result)
+
     if WEBAPP_BASE_URL:
         # One short message with a single "Open in browser" button that
         # opens the whole batch as a swipeable flashcard deck (webapp.py)
@@ -290,7 +346,7 @@ def main() -> None:
             rec = state.get(key, {})
             status = "new" if is_new else ("due" if rec.get("due") else "reminder")
             row = row_by_key[key]
-            blocks.append(format_word_block(row, status))
+            blocks.append(format_word_block(row, status, enrichments.get(key)))
             statuses.append(f"{key} ({status})")
 
         print(build_message(blocks))  # cron log only - not what gets sent

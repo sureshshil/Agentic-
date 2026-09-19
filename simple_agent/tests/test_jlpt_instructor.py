@@ -10,17 +10,35 @@ send_email are all mocked/patched.
 Run: python3 -m unittest tests.test_jlpt_instructor -v   (from simple_agent/)
 """
 
+import contextlib
 import os
 import sys
 import unittest
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scheduled"))
 import jlpt_instructor as inst  # noqa: E402
 
 JST = ZoneInfo("Asia/Tokyo")
+
+
+class FormatFieldTest(unittest.TestCase):
+    def test_uses_plain_language_not_raw_engine_kind(self):
+        blocks = [{"source_id": "V001", "item": "場合", "kind": "ADVANCE", "type": "vocab"}]
+        text = inst._format_field(blocks)
+        self.assertIn("(new)", text)
+        self.assertNotIn("ADVANCE", text)
+
+    def test_covers_every_kind_the_planner_can_emit(self):
+        for kind in ("CARRY_FORWARD", "REPAIR", "REVIEW", "ADVANCE"):
+            blocks = [{"source_id": "V001", "item": "場合", "kind": kind, "type": "vocab"}]
+            text = inst._format_field(blocks)
+            self.assertEqual(text, f"V001 場合 ({inst._KIND_LABELS[kind]})")
+
+    def test_no_blocks_message(self):
+        self.assertEqual(inst._format_field([]), "No items scheduled.")
 
 
 class BranchSelectionTest(unittest.TestCase):
@@ -72,9 +90,14 @@ class LedgerTest(unittest.TestCase):
 
 
 class ParseReadingAttemptedTest(unittest.TestCase):
-    def test_matches_the_learner_report_convention(self):
-        ids = inst.parse_reading_attempted(["Reading R-N3-002: READING R-N3-002 attempted", "unrelated"])
+    def test_matches_once_the_blank_is_filled_in(self):
+        ids = inst.parse_reading_attempted(["Reading R-N3-002 attempted: yes (change to yes once you've done it)", "unrelated"])
         self.assertEqual(ids, {"R-N3-002"})
+
+    def test_unfilled_placeholder_does_not_match(self):
+        # The template's own unfilled blank ("___") must never read as attempted.
+        ids = inst.parse_reading_attempted(["Reading R-N3-002 attempted: ___ (change to yes once you've done it, else leave as-is)"])
+        self.assertEqual(ids, set())
 
     def test_no_match_returns_empty_set(self):
         self.assertEqual(inst.parse_reading_attempted(["nothing about reading here"]), set())
@@ -93,6 +116,111 @@ class SplitReadingContentTest(unittest.TestCase):
         visible, _ = inst._split_reading_content("PASSAGE: 昨日映画を見た。\nQ1: what?")
         self.assertNotIn("PASSAGE:", visible)
         self.assertTrue(visible.startswith("昨日映画を見た。"))
+
+
+class ReadingContentBlocksTest(unittest.TestCase):
+    def test_passage_and_each_question_become_separate_blocks(self):
+        visible = "昨日映画を見た。\nQ1: what?\nA) x\nB) y\nQ2: what2?\nA) z\nB) w"
+        blocks = inst._reading_content_blocks(visible)
+        self.assertEqual(len(blocks), 3)
+        self.assertTrue(all(kind == "paragraph" for kind, _ in blocks))
+        self.assertEqual(blocks[0][1], "昨日映画を見た。")
+        self.assertTrue(blocks[1][1].startswith("Q1:"))
+        self.assertTrue(blocks[2][1].startswith("Q2:"))
+
+    def test_no_question_lines_yields_a_single_block(self):
+        blocks = inst._reading_content_blocks("just a passage, no questions.")
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0], ("paragraph", "just a passage, no questions."))
+
+
+class PassageOnlyTest(unittest.TestCase):
+    def test_strips_trailing_questions(self):
+        visible = "昨日映画を見た。とても面白かった。\nQ1: what?\nA) x\nB) y"
+        self.assertEqual(inst._passage_only(visible), "昨日映画を見た。とても面白かった。")
+
+    def test_no_questions_returns_the_whole_text(self):
+        self.assertEqual(inst._passage_only("just a passage."), "just a passage.")
+
+    def test_strips_furigana_annotations_for_narration(self):
+        visible = "図書館（としょかん）から、お知らせ（おしらせ）です。\nQ1: what?"
+        self.assertEqual(inst._passage_only(visible), "図書館から、お知らせです。")
+
+
+class StripFuriganaTest(unittest.TestCase):
+    def test_removes_fullwidth_paren_annotations(self):
+        self.assertEqual(inst._strip_furigana("図書館（としょかん）から"), "図書館から")
+
+    def test_removes_multiple_annotations(self):
+        self.assertEqual(
+            inst._strip_furigana("変わります（かわります）ようになる（ようになる）"),
+            "変わりますようになる",
+        )
+
+    def test_text_without_furigana_is_unchanged(self):
+        self.assertEqual(inst._strip_furigana("plain text"), "plain text")
+
+
+class GenerateReadingAudioMp3Test(unittest.TestCase):
+    def test_returns_the_saved_files_bytes(self):
+        async def fake_save(self_communicate, path, *_args, **_kwargs):
+            with open(path, "wb") as f:
+                f.write(b"FAKE MP3 BYTES")
+
+        with patch.object(inst.edge_tts.Communicate, "save", new=fake_save):
+            mp3_bytes = inst._generate_reading_audio_mp3("こんにちは")
+        self.assertEqual(mp3_bytes, b"FAKE MP3 BYTES")
+
+    def test_propagates_a_generation_failure_after_retries(self):
+        with patch.object(inst.edge_tts.Communicate, "save", new=AsyncMock(side_effect=RuntimeError("network error"))):
+            with patch.object(inst.asyncio, "sleep", new=AsyncMock()):
+                with self.assertRaises(RuntimeError):
+                    inst._generate_reading_audio_mp3("text")
+
+
+class ParseLabeledBlocksTest(unittest.TestCase):
+    def test_examples_become_numbered_others_become_paragraphs(self):
+        raw = (
+            "EXAMPLE: 一つ目の文。\n"
+            "EXAMPLE: 二つ目の文。\n"
+            "QUESTION: どちらが正しいですか。\n"
+            "EXPLANATION: ニュアンスの違いです。"
+        )
+        blocks = inst._parse_labeled_blocks(raw, "grammar practice")
+        self.assertEqual(
+            blocks,
+            [
+                ("numbered", "一つ目の文。"),
+                ("numbered", "二つ目の文。"),
+                ("paragraph", "どちらが正しいですか。"),
+                ("paragraph", "ニュアンスの違いです。"),
+            ],
+        )
+
+    def test_unlabeled_output_falls_back_to_one_raw_paragraph(self):
+        blocks = inst._parse_labeled_blocks("the model just wrote free text instead", "grammar practice")
+        self.assertEqual(blocks, [("paragraph", "the model just wrote free text instead")])
+
+    def test_empty_output_falls_back_to_a_placeholder(self):
+        blocks = inst._parse_labeled_blocks("", "grammar practice")
+        self.assertEqual(blocks, [("paragraph", "(no grammar practice generated)")])
+
+
+class ComposeGrammarPracticeBlocksTest(unittest.TestCase):
+    def test_no_grammar_scheduled_skips_the_agent_call(self):
+        with patch.object(inst, "Agent") as mock_agent_cls:
+            blocks = inst._compose_grammar_practice_blocks([])
+        mock_agent_cls.assert_not_called()
+        self.assertEqual(blocks, [("paragraph", "No grammar scheduled today.")])
+
+    def test_parses_the_agents_labeled_response(self):
+        with patch.object(inst, "Agent") as mock_agent_cls:
+            mock_agent_cls.return_value.send.return_value = "EXAMPLE: 文。\nQUESTION: 質問？\nEXPLANATION: 説明。"
+            blocks = inst._compose_grammar_practice_blocks([{"source_id": "G001", "item": "ことにする"}])
+        self.assertEqual(
+            blocks,
+            [("numbered", "文。"), ("paragraph", "質問？"), ("paragraph", "説明。")],
+        )
 
 
 class ExtractIdsTest(unittest.TestCase):
@@ -169,6 +297,20 @@ class GetOrStartReadingTest(unittest.TestCase):
         self.assertEqual(item["id"], "R-N3-002")
         self.assertEqual(len(state["reading_bank"]), 2)
 
+    def test_genre_cycles_by_reading_bank_index(self):
+        num_genres = len(inst._READING_GENRES)
+        existing_count = num_genres + 1  # one full cycle plus one, so the wrap is exercised
+        state = {"reading_bank": [
+            {"id": f"R-N3-{i:03d}", "visible": "x", "answers": "", "attempted": True}
+            for i in range(existing_count)
+        ]}
+        with patch.object(inst, "Agent") as mock_agent_cls:
+            mock_agent_cls.return_value.send.return_value = "PASSAGE: text"
+            inst._get_or_start_reading(state, {"blocks": []})
+        prompt = mock_agent_cls.return_value.send.call_args.args[0]
+        expected_genre = inst._READING_GENRES[existing_count % num_genres]
+        self.assertIn(expected_genre, prompt)
+
 
 class DayPropagationTest(unittest.TestCase):
     """Day N only checks day N-1 (not full history) - jlpt_notion.
@@ -215,7 +357,9 @@ class DayPropagationTest(unittest.TestCase):
              patch.object(inst.notion, "find_row_for_date", return_value=self.today_row), \
              patch.object(inst.notion, "update_row"), \
              patch.object(inst, "_get_or_start_reading", return_value={"id": "R-N3-001", "visible": "p", "answers": "", "attempted": False}), \
-             patch.object(inst, "_compose_grammar_practice", return_value="practice"), \
+             patch.object(inst, "_compose_grammar_practice_blocks", return_value=[("paragraph", "practice")]), \
+             patch.object(inst, "_generate_reading_audio_mp3", return_value=b"MP3DATA"), \
+             patch.object(inst.notion, "upload_audio"), \
              patch.object(inst.notion, "append_body_blocks"), \
              patch.object(inst.notion, "verify_row_saved", return_value=True), \
              patch.object(inst, "send_email", return_value="Email sent."):
@@ -254,6 +398,27 @@ class ParseEvidenceTest(unittest.TestCase):
         reports = inst.parse_evidence(["Great session today!", "Finished 8 new cards."])
         self.assertEqual(reports["items"], [])
 
+    def test_the_generated_learner_report_never_self_parses_as_evidence(self):
+        # Regression: an earlier version of _format_learner_report wrote a
+        # literal "e.g. \"G001 pass\"" example, which this exact parser
+        # then matched as if the learner had reported it the moment the
+        # row got read back - fabricating evidence out of the instructions
+        # meant for a human. The whole checklist, as actually generated,
+        # must never itself look like a report.
+        plan_result = {
+            "date": "2026-09-17", "estimated_minutes": 38,
+            "blocks": [
+                {"kind": "CARRY_FORWARD", "source_id": "G001", "item": "〜ようになる", "type": "grammar"},
+                {"kind": "ADVANCE", "source_id": "V011", "item": "決まる", "type": "vocab"},
+                {"kind": "ADVANCE", "source_id": "K004", "item": "増", "type": "kanji"},
+            ],
+        }
+        reading_item = {"id": "R-N3-001", "visible": "text", "answers": "", "attempted": False}
+        lines = inst._format_learner_report(plan_result, reading_item)
+        self.assertEqual(inst.parse_evidence(lines)["items"], [])
+        # Same failure mode, same fix, for the reading-attempted marker.
+        self.assertEqual(inst.parse_reading_attempted(lines), set())
+
 
 class RunMorningTest(unittest.TestCase):
     def setUp(self):
@@ -284,7 +449,9 @@ class RunMorningTest(unittest.TestCase):
              patch.object(inst.bank, "save_state"), \
              patch.object(inst.notion, "update_row"), \
              patch.object(inst, "_get_or_start_reading", return_value={"id": "R-N3-001", "visible": "passage", "answers": "", "attempted": False}), \
-             patch.object(inst, "_compose_grammar_practice", return_value="practice"), \
+             patch.object(inst, "_compose_grammar_practice_blocks", return_value=[("paragraph", "practice")]), \
+             patch.object(inst, "_generate_reading_audio_mp3", return_value=b"MP3DATA"), \
+             patch.object(inst.notion, "upload_audio"), \
              patch.object(inst.notion, "append_body_blocks"), \
              patch.object(inst.notion, "verify_row_saved", return_value=True), \
              patch.object(inst, "send_email", return_value="Email sent to me@example.com."):
@@ -322,7 +489,9 @@ class RunMorningTest(unittest.TestCase):
              patch.object(inst.bank, "save_state"), \
              patch.object(inst.notion, "update_row"), \
              patch.object(inst, "_get_or_start_reading", return_value={"id": "R-N3-001", "visible": "passage", "answers": "", "attempted": False}), \
-             patch.object(inst, "_compose_grammar_practice", return_value="practice"), \
+             patch.object(inst, "_compose_grammar_practice_blocks", return_value=[("paragraph", "practice")]), \
+             patch.object(inst, "_generate_reading_audio_mp3", return_value=b"MP3DATA"), \
+             patch.object(inst.notion, "upload_audio"), \
              patch.object(inst.notion, "append_body_blocks"), \
              patch.object(inst.notion, "verify_row_saved", return_value=False), \
              patch.object(inst, "send_email") as mock_send:
@@ -339,27 +508,34 @@ class RunMorningTest(unittest.TestCase):
         ledger_path = os.path.join(os.environ.get("CLAUDE_JOB_DIR", "/tmp"), "jlpt_ledger_run_test.json")
         if os.path.exists(ledger_path):
             os.remove(ledger_path)
-        with patch.dict(os.environ, self.env), \
-             patch.object(inst, "EMAIL_LEDGER_PATH", ledger_path), \
-             patch.object(inst, "EMAIL_DELIVERY_LOG", ledger_path + ".md"), \
-             patch.object(inst.notion, "find_row_for_date", side_effect=[None, self.new_row]), \
-             patch.object(inst.notion, "find_previous_dated_row", return_value=None), \
-             patch.object(inst.notion, "list_dated_rows_before", return_value=[]), \
-             patch.object(inst.notion, "next_dated_day_number", return_value=4), \
-             patch.object(inst.notion, "create_daily_row", return_value=self.new_row), \
-             patch.object(inst.bank, "load_catalog", return_value={}), \
-             patch.object(inst.bank, "load_state", return_value={"items": {}, "pending": []}), \
-             patch.object(inst.bank, "validate", return_value=[]), \
-             patch.object(inst.bank, "plan", return_value=plan_result), \
-             patch.object(inst.bank, "save_state"), \
-             patch.object(inst.notion, "update_row"), \
-             patch.object(inst, "_get_or_start_reading", return_value={"id": "R-N3-001", "visible": "passage", "answers": "", "attempted": False}), \
-             patch.object(inst, "_compose_grammar_practice", return_value="practice"), \
-             patch.object(inst.notion, "append_body_blocks"), \
-             patch.object(inst.notion, "read_comments", return_value=[]), \
-             patch.object(inst.notion, "read_body_text", return_value=[]), \
-             patch.object(inst.notion, "verify_row_saved", return_value=True), \
-             patch.object(inst, "send_email", return_value="Email sent to me@example.com.") as mock_send:
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, self.env))
+            stack.enter_context(patch.object(inst, "EMAIL_LEDGER_PATH", ledger_path))
+            stack.enter_context(patch.object(inst, "EMAIL_DELIVERY_LOG", ledger_path + ".md"))
+            stack.enter_context(patch.object(inst.notion, "find_row_for_date", side_effect=[None, self.new_row]))
+            stack.enter_context(patch.object(inst.notion, "find_previous_dated_row", return_value=None))
+            stack.enter_context(patch.object(inst.notion, "list_dated_rows_before", return_value=[]))
+            stack.enter_context(patch.object(inst.notion, "next_dated_day_number", return_value=4))
+            stack.enter_context(patch.object(inst.notion, "create_daily_row", return_value=self.new_row))
+            stack.enter_context(patch.object(inst.bank, "load_catalog", return_value={}))
+            stack.enter_context(patch.object(inst.bank, "load_state", return_value={"items": {}, "pending": []}))
+            stack.enter_context(patch.object(inst.bank, "validate", return_value=[]))
+            stack.enter_context(patch.object(inst.bank, "plan", return_value=plan_result))
+            stack.enter_context(patch.object(inst.bank, "save_state"))
+            stack.enter_context(patch.object(inst.notion, "update_row"))
+            stack.enter_context(patch.object(
+                inst, "_get_or_start_reading",
+                return_value={"id": "R-N3-001", "visible": "passage", "answers": "", "attempted": False},
+            ))
+            stack.enter_context(patch.object(inst, "_compose_grammar_practice_blocks", return_value=[("paragraph", "practice")]))
+            stack.enter_context(patch.object(inst, "_generate_reading_audio_mp3", return_value=b"MP3DATA"))
+            stack.enter_context(patch.object(inst.notion, "upload_audio"))
+            stack.enter_context(patch.object(inst.notion, "append_body_blocks"))
+            stack.enter_context(patch.object(inst.notion, "read_comments", return_value=[]))
+            stack.enter_context(patch.object(inst.notion, "read_body_text", return_value=[]))
+            stack.enter_context(patch.object(inst.notion, "verify_row_saved", return_value=True))
+            mock_send = stack.enter_context(patch.object(inst, "send_email", return_value="Email sent to me@example.com."))
+
             inst.run_morning(self.now)
             self.assertEqual(mock_send.call_count, 1)
             # A second morning run the same Japan-date must not send again.

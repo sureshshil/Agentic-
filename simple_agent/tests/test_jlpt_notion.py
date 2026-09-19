@@ -188,6 +188,53 @@ class AppendInstructorNotesTest(unittest.TestCase):
         self.assertEqual(new_text, "first entry")
 
 
+class UploadAudioTest(unittest.TestCase):
+    def test_creates_uploads_and_appends_an_audio_block(self):
+        create_resp = _resp(200, {"id": "upload-1", "upload_url": "https://api.notion.com/v1/file_uploads/upload-1/send"})
+        send_resp = _resp(200, {"id": "upload-1", "status": "uploaded"})
+        append_resp = _resp(200, {"results": [{"id": "block-1"}]})
+        with patch.dict(os.environ, ENV), patch.object(jn, "requests") as rq:
+            rq.post.side_effect = [create_resp, send_resp]
+            rq.patch.return_value = append_resp
+            jn.upload_audio("page-1", b"RIFF....", "reading.wav")
+
+        create_call, send_call = rq.post.call_args_list
+        self.assertEqual(create_call.args[0], "https://api.notion.com/v1/file_uploads")
+        self.assertEqual(send_call.args[0], "https://api.notion.com/v1/file_uploads/upload-1/send")
+        self.assertEqual(send_call.kwargs["files"]["file"], ("reading.wav", b"RIFF....", "audio/wav"))
+        # the multipart send must NOT carry a JSON content-type header
+        self.assertNotIn("Content-Type", send_call.kwargs["headers"])
+
+        block_payload = rq.patch.call_args.kwargs["json"]["children"][0]
+        self.assertEqual(block_payload["type"], "audio")
+        self.assertEqual(block_payload["audio"]["file_upload"]["id"], "upload-1")
+
+    def test_raises_if_the_upload_target_creation_fails(self):
+        with patch.dict(os.environ, ENV), patch.object(jn, "requests") as rq:
+            rq.post.return_value = _resp(500)
+            with self.assertRaises(RuntimeError):
+                jn.upload_audio("page-1", b"data", "reading.wav")
+
+    def test_infers_content_type_from_extension(self):
+        create_resp = _resp(200, {"id": "upload-1", "upload_url": "https://x/send"})
+        send_resp = _resp(200, {"id": "upload-1", "status": "uploaded"})
+        with patch.dict(os.environ, ENV), patch.object(jn, "requests") as rq:
+            rq.post.side_effect = [create_resp, send_resp]
+            rq.patch.return_value = _resp(200, {"results": []})
+            jn.upload_audio("page-1", b"ID3....", "reading.mp3")
+        _, send_call = rq.post.call_args_list
+        self.assertEqual(send_call.kwargs["files"]["file"], ("reading.mp3", b"ID3....", "audio/mpeg"))
+
+    def test_raises_if_the_binary_send_fails(self):
+        with patch.dict(os.environ, ENV), patch.object(jn, "requests") as rq:
+            rq.post.side_effect = [
+                _resp(200, {"id": "upload-1", "upload_url": "https://x/send"}),
+                _resp(500),
+            ]
+            with self.assertRaises(RuntimeError):
+                jn.upload_audio("page-1", b"data", "reading.wav")
+
+
 class VerifyRowSavedTest(unittest.TestCase):
     def test_returns_false_when_expected_content_missing(self):
         page = _page("2026-09-17 — Day 04", date="2026-09-17", vocabulary="V061-V080")

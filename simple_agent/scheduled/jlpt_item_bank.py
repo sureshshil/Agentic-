@@ -35,7 +35,10 @@ Hard invariants (enforced by validate() / ingest_evidence()):
     state from explicit, named per-item evidence. An aggregate session
     count (e.g. "8 new cards done") updates completion bookkeeping only
     (see `session` in ingest_evidence) and never infers which items, if
-    any, were retained.
+    any, were retained. MASTERED is real too, not just a schema value
+    nobody reaches: a "pass" recorded while already at the top cadence
+    step graduates the item to state DONE - it stops being reviewed at
+    all rather than cycling at the 30-day interval forever.
   - Missing evidence stays "unknown" - it's appended as such rather than
     silently skipped, so a gap is visible in the record instead of looking
     like nothing happened.
@@ -57,7 +60,16 @@ CADENCE_DAYS = [1, 3, 7, 14, 30]
 NEW_CEILINGS = {"vocab": 10, "grammar": 3, "kanji": 3}
 
 CAPACITY_MINUTES = 40
-MAX_BLOCKS = 3
+# Minutes each item type costs to study/review once - drives how many
+# items fit inside CAPACITY_MINUTES's shared budget. Replaces a flat
+# per-day item-count cap (a prior MAX_BLOCKS=3 total across ALL of
+# CARRY_FORWARD+REPAIR+REVIEW+ADVANCE combined), which under-delivered
+# relative to the ported design's own "10 vocab + 3 grammar + 3 kanji"
+# normal-day target - at these costs, a fresh day with nothing due or in
+# repair spends ~15 + 12 + 7.5 = 34.5 of the 35 working minutes (after
+# RETRIEVAL_PROBE_MINUTES) introducing almost exactly that many new items,
+# not just 3 total regardless of type.
+MINUTES_PER_ITEM = {"vocab": 1.5, "kanji": 2.5, "grammar": 4}
 MAX_REPAIR_TARGETS = 2
 RETRIEVAL_PROBE_MINUTES = 5
 
@@ -284,10 +296,18 @@ def ingest_evidence(state: dict, catalog: dict, reports: dict, now: datetime) ->
             if _recent_fail_streak(rec["evidence"]) >= REPEATED_FAIL_THRESHOLD:
                 rec["open_errors"].append("NEEDS_INTERVENTION")
         else:  # pass / partial
+            was_at_top_cadence = rec.get("cadence_index", 0) == len(CADENCE_DAYS) - 1
             rec["cadence_index"] = _shift_cadence(rec.get("cadence_index", 0), result)
-            rec["state"] = "REVIEW"
-            next_review_date = now.date() + timedelta(days=CADENCE_DAYS[rec["cadence_index"]])
-            rec["next_review"] = next_review_date.isoformat()
+            if result == "pass" and was_at_top_cadence:
+                # Mastered: a "pass" recorded while already at the longest
+                # cadence step graduates the item out of rotation entirely,
+                # rather than cycling it at the 30-day interval forever.
+                rec["state"] = "DONE"
+                rec.pop("next_review", None)
+            else:
+                rec["state"] = "REVIEW"
+                next_review_date = now.date() + timedelta(days=CADENCE_DAYS[rec["cadence_index"]])
+                rec["next_review"] = next_review_date.isoformat()
             if result == "pass" and rec.get("open_errors"):
                 rec["open_errors"] = [e for e in rec["open_errors"] if e != "NEEDS_INTERVENTION"]
 
@@ -300,14 +320,24 @@ def ingest_evidence(state: dict, catalog: dict, reports: dict, now: datetime) ->
 
 # ---- planning ----------------------------------------------------------
 
+def _item_cost(item_type: str) -> float:
+    return MINUTES_PER_ITEM.get(item_type, 1)
+
+
 def plan(state: dict, catalog: dict, now: datetime) -> dict:
     """Bounded today's-lesson selection, priority CARRY_FORWARD > REPAIR >
-    REVIEW > ADVANCE. Does not mutate `state` except to record the newly
-    selected block's source_ids into state["pending"] (cleared by
-    ingest_evidence once evidence comes in) and to register brand-new
-    ADVANCE picks as LEARNING records (their one-and-only NEW STUDY).
-    Returns a plain dict describing the lesson - jlpt_instructor.py is
-    responsible for turning it into Notion content."""
+    REVIEW > ADVANCE. Each phase spends from ONE shared CAPACITY_MINUTES
+    budget at a per-item-type cost (MINUTES_PER_ITEM) - not a flat
+    per-day item-COUNT cap - so e.g. many cheap due vocab reviews don't
+    starve out expensive-but-important grammar repair, and a fresh day
+    with nothing due can actually reach NEW_CEILINGS's full "10 vocab +
+    3 grammar + 3 kanji" normal-day target instead of stopping at some
+    fixed number of items regardless of type. Does not mutate `state`
+    except to record the newly selected block's source_ids into
+    state["pending"] (cleared by ingest_evidence once evidence comes in)
+    and to register brand-new ADVANCE picks as LEARNING records (their
+    one-and-only NEW STUDY). Returns a plain dict describing the lesson -
+    jlpt_instructor.py is responsible for turning it into Notion content."""
     state.setdefault("items", {})
     state.setdefault("pending", [])
     today = today_str(now)
@@ -316,7 +346,9 @@ def plan(state: dict, catalog: dict, now: datetime) -> dict:
     blocks = []
     repair_targets = []
     used_minutes = RETRIEVAL_PROBE_MINUTES
-    minutes_per_block = max(1, (CAPACITY_MINUTES - RETRIEVAL_PROBE_MINUTES) // MAX_BLOCKS)
+
+    def remaining_minutes():
+        return CAPACITY_MINUTES - used_minutes
 
     def add_block(sid, kind):
         rec = items.get(sid)
@@ -327,22 +359,31 @@ def plan(state: dict, catalog: dict, now: datetime) -> dict:
 
     # 1. CARRY_FORWARD - selected last time, still no evidence.
     for sid in list(state["pending"]):
-        if len(blocks) >= MAX_BLOCKS:
+        rec = items.get(sid)
+        if rec is None:
+            continue
+        cost = _item_cost(rec["type"])
+        if remaining_minutes() < cost:
             break
         if add_block(sid, "CARRY_FORWARD"):
-            used_minutes += minutes_per_block
+            used_minutes += cost
 
-    # 2. REPAIR - failed items, capped at MAX_REPAIR_TARGETS.
+    # 2. REPAIR - failed items, capped at MAX_REPAIR_TARGETS (breadth is
+    #    capped even though there'd be budget for more - repair benefits
+    #    from a few items drilled properly, not as many as time allows).
     repair_candidates = sorted(
         sid for sid, rec in items.items()
         if rec.get("state") == "REPAIR" and sid not in {b["source_id"] for b in blocks}
     )
     for sid in repair_candidates:
-        if len(blocks) >= MAX_BLOCKS or len(repair_targets) >= MAX_REPAIR_TARGETS:
+        if len(repair_targets) >= MAX_REPAIR_TARGETS:
+            break
+        cost = _item_cost(items[sid]["type"])
+        if remaining_minutes() < cost:
             break
         if add_block(sid, "REPAIR"):
             repair_targets.append(sid)
-            used_minutes += minutes_per_block
+            used_minutes += cost
 
     # 3. REVIEW - due by cadence.
     review_candidates = sorted(
@@ -352,17 +393,18 @@ def plan(state: dict, catalog: dict, now: datetime) -> dict:
         and sid not in {b["source_id"] for b in blocks}
     )
     for sid in review_candidates:
-        if len(blocks) >= MAX_BLOCKS:
+        cost = _item_cost(items[sid]["type"])
+        if remaining_minutes() < cost:
             break
         if add_block(sid, "REVIEW"):
-            used_minutes += minutes_per_block
+            used_minutes += cost
 
     # 4. ADVANCE - brand-new items, ceilings not quotas; only fills
-    #    whatever capacity is left after carry-forward/repair/review.
+    #    whatever budget is left after carry-forward/repair/review.
     #    Candidates are drawn ROUND-ROBIN across types (not a flat sort
     #    over all source_ids) - "V..." < "K..." < "G..." alphabetically
     #    would otherwise let vocab silently starve grammar/kanji (or vice
-    #    versa) whenever remaining block capacity is scarce, since a plain
+    #    versa) whenever remaining budget is scarce, since a plain
     #    sorted() walk exhausts one type's candidates before touching the
     #    next.
     new_items = {"vocab": [], "grammar": [], "kanji": []}
@@ -373,8 +415,6 @@ def plan(state: dict, catalog: dict, now: datetime) -> dict:
         )
         for t in NEW_CEILINGS
     }
-    remaining_blocks = MAX_BLOCKS - len(blocks)
-    remaining_minutes = CAPACITY_MINUTES - used_minutes
 
     candidates_by_type = {t: [] for t in NEW_CEILINGS}
     for sid, entry in sorted(catalog.items()):
@@ -382,36 +422,35 @@ def plan(state: dict, catalog: dict, now: datetime) -> dict:
             continue  # NEW STUDY happens once - already introduced (or in progress)
         candidates_by_type.setdefault(entry["type"], []).append((sid, entry))
 
-    if remaining_blocks > 0 and remaining_minutes >= minutes_per_block:
-        progressed = True
-        while progressed and remaining_blocks > 0 and remaining_minutes >= minutes_per_block:
-            progressed = False
-            for t in ("vocab", "kanji", "grammar"):
-                if remaining_blocks <= 0 or remaining_minutes < minutes_per_block:
-                    break
-                if introduced_today[t] >= NEW_CEILINGS[t] or not candidates_by_type[t]:
-                    continue
-                sid, entry = candidates_by_type[t].pop(0)
-                items[sid] = {
-                    "type": t,
-                    "item": entry["item"],
-                    "jlpt_level": entry.get("jlpt_level", "N3"),
-                    "state": "LEARNING",
-                    "introduced_date": today,
-                    "next_review": today,
-                    "cadence_index": 0,
-                    "open_errors": [],
-                    "evidence": [],
-                    "source_id": sid,
-                    "first_pass_target": True,
-                }
-                new_items[t].append(sid)
-                introduced_today[t] += 1
-                blocks.append({"kind": "ADVANCE", "source_id": sid, "item": entry["item"], "type": t})
-                remaining_blocks -= 1
-                remaining_minutes -= minutes_per_block
-                used_minutes += minutes_per_block
-                progressed = True
+    cheapest_item_cost = min(MINUTES_PER_ITEM.values())
+    progressed = True
+    while progressed and remaining_minutes() >= cheapest_item_cost:
+        progressed = False
+        for t in ("vocab", "kanji", "grammar"):
+            cost = _item_cost(t)
+            if remaining_minutes() < cost:
+                continue
+            if introduced_today[t] >= NEW_CEILINGS[t] or not candidates_by_type[t]:
+                continue
+            sid, entry = candidates_by_type[t].pop(0)
+            items[sid] = {
+                "type": t,
+                "item": entry["item"],
+                "jlpt_level": entry.get("jlpt_level", "N3"),
+                "state": "LEARNING",
+                "introduced_date": today,
+                "next_review": today,
+                "cadence_index": 0,
+                "open_errors": [],
+                "evidence": [],
+                "source_id": sid,
+                "first_pass_target": True,
+            }
+            new_items[t].append(sid)
+            introduced_today[t] += 1
+            blocks.append({"kind": "ADVANCE", "source_id": sid, "item": entry["item"], "type": t})
+            used_minutes += cost
+            progressed = True
 
     state["pending"] = [b["source_id"] for b in blocks]
 

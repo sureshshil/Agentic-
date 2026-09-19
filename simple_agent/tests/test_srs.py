@@ -235,5 +235,92 @@ class FormatIntervalTest(unittest.TestCase):
         self.assertEqual(srs.format_interval(36), "1.5d")
 
 
+class AddNoteTest(unittest.TestCase):
+    def test_appends_a_note_to_an_existing_item(self):
+        state = {"決": {"box": 1, "reps": 1, "lapses": 0}}
+        changed = srs.add_note(state, "決", "confused with 快い", NOW)
+        self.assertTrue(changed)
+        self.assertEqual(state["決"]["notes"][-1]["note"], "confused with 快い")
+        self.assertEqual(state["決"]["notes"][-1]["at"], NOW.isoformat())
+
+    def test_unknown_key_is_a_no_op(self):
+        state = {}
+        changed = srs.add_note(state, "決", "note", NOW)
+        self.assertFalse(changed)
+        self.assertEqual(state, {})
+
+    def test_keeps_only_the_most_recent_ten_notes(self):
+        state = {"決": {"box": 1, "reps": 1, "lapses": 0}}
+        for i in range(12):
+            srs.add_note(state, "決", f"note {i}", NOW)
+        notes = state["決"]["notes"]
+        self.assertEqual(len(notes), 10)
+        self.assertEqual(notes[0]["note"], "note 2")
+        self.assertEqual(notes[-1]["note"], "note 11")
+
+
+class DueItemsTest(unittest.TestCase):
+    def test_returns_due_items_most_overdue_first(self):
+        state = {
+            "決": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW - timedelta(hours=1)).isoformat()},
+            "作": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW - timedelta(hours=5)).isoformat()},
+            "動": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW + timedelta(hours=1)).isoformat()},
+        }
+        self.assertEqual(srs.due_items(state, NOW), ["作", "決"])
+
+    def test_respects_the_limit(self):
+        state = {
+            k: {"box": 0, "reps": 0, "lapses": 0, "due": (NOW - timedelta(hours=1)).isoformat()}
+            for k in ("決", "作", "動")
+        }
+        self.assertEqual(len(srs.due_items(state, NOW, limit=2)), 2)
+
+
+class WeakestItemsTest(unittest.TestCase):
+    def test_orders_by_lapses_then_box(self):
+        state = {
+            "決": {"box": 2, "reps": 3, "lapses": 1},
+            "作": {"box": 0, "reps": 5, "lapses": 3},
+            "動": {"box": 0, "reps": 1, "lapses": 0},
+        }
+        self.assertEqual(srs.weakest_items(state), ["作", "決"])
+
+
+class ReviewCandidatesTest(unittest.TestCase):
+    def test_due_items_come_before_weak_items(self):
+        state = {
+            "決": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW - timedelta(hours=1)).isoformat()},
+            "作": {"box": 0, "reps": 5, "lapses": 3},
+        }
+        self.assertEqual(srs.review_candidates(state, NOW, limit=5), ["決", "作"])
+
+    def test_falls_back_to_weak_items_when_nothing_is_due(self):
+        state = {"作": {"box": 0, "reps": 5, "lapses": 3}}
+        self.assertEqual(srs.review_candidates(state, NOW, limit=5), ["作"])
+
+    def test_no_due_or_weak_items_returns_empty(self):
+        state = {"決": {"box": 1, "reps": 1, "lapses": 0}}
+        self.assertEqual(srs.review_candidates(state, NOW, limit=5), [])
+
+
+class DeckStatsTest(unittest.TestCase):
+    def test_counts_total_due_and_lapses(self):
+        state = {
+            "決": {"box": 1, "reps": 1, "lapses": 1, "due": (NOW - timedelta(hours=1)).isoformat()},
+            "作": {"box": 1, "reps": 1, "lapses": 0, "due": (NOW + timedelta(hours=1)).isoformat()},
+            "動": {"box": 0, "reps": 0, "lapses": 0},
+        }
+        stats = srs.deck_stats(state, NOW)
+        self.assertEqual(stats["total"], 3)
+        self.assertEqual(stats["due_now"], 1)
+        self.assertEqual(stats["total_lapses"], 1)
+        self.assertEqual(stats["box_counts"], {1: 2, 0: 1})
+
+    def test_empty_state(self):
+        stats = srs.deck_stats({}, NOW)
+        self.assertEqual(stats["total"], 0)
+        self.assertEqual(stats["due_now"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

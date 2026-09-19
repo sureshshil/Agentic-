@@ -130,6 +130,53 @@ class BuildMessageTest(unittest.TestCase):
         self.assertEqual(message, "BLOCK_A\n\nBLOCK_B")
 
 
+class EnrichmentTest(unittest.TestCase):
+    """build_body_lines/format_word_block must show the curated content
+    exactly as before when no enrichment is given, only ADDING the AI
+    practice block (via llm_enrich.format_blocks) - never replacing
+    anything - when llm_enrich.enrich_vocab() did produce a result. Same
+    contract as kanji_drip.py/grammar_drip.py - see test_kanji_drip.py."""
+
+    def setUp(self):
+        self.rows = vd.load_rows(_write_tsv_and_track(self))
+
+    def test_without_enrichment_matches_the_original_curated_output(self):
+        lines = vd.build_body_lines(self.rows[0])
+        joined = "\n".join(lines)
+        self.assertIn("雨[あめ]の場合[ばあい]は中止[ちゅうし]。", joined)
+        self.assertNotIn("\U0001f916", joined)  # no AI-labelled line
+
+    def test_with_enrichment_appends_the_ai_practice_block(self):
+        enrichment = {
+            "examples": [{"jp": "場合による。", "en": "It depends on the situation."}],
+            "explanation": "Uses 場合 to hedge on a specific condition.",
+            "dialogue": [{"speaker": "A", "jp": "行く場合もある。", "en": "There are cases I'd go."}],
+            "practice_question": {"question": "q", "options": ["a", "b"], "answer": "a"},
+        }
+        lines = vd.build_body_lines(self.rows[0], enrichment)
+        joined = "\n".join(lines)
+        self.assertIn("雨[あめ]の場合[ばあい]は中止[ちゅうし]。", joined)  # curated examples still present
+        self.assertIn("場合による。", joined)
+        self.assertIn("It depends on the situation.", joined)
+        self.assertIn("hedge on a specific condition", joined)
+        self.assertIn("行く場合もある。", joined)
+        self.assertIn("\U0001f916", joined)
+
+    def test_enrichment_without_examples_omits_the_example_blocks(self):
+        enrichment = {"explanation": "just a note"}
+        lines = vd.build_body_lines(self.rows[0], enrichment)
+        self.assertNotIn("例文1", "\n".join(lines))
+
+    def test_format_word_block_passes_enrichment_through(self):
+        enrichment = {"examples": [{"jp": "場合による。", "en": "It depends on the situation."}]}
+        block = vd.format_word_block(self.rows[0], "new", enrichment)
+        self.assertIn("場合による。", block)
+
+    def test_format_word_block_without_enrichment_is_unchanged(self):
+        block = vd.format_word_block(self.rows[0], "new")
+        self.assertNotIn("\U0001f916", block)
+
+
 class DespaceTest(unittest.TestCase):
     def test_drops_word_spacing_between_japanese_chars(self):
         self.assertEqual(

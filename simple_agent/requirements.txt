@@ -4,3 +4,4 @@ requests
 python-dotenv
 google-auth  # only for scheduled/vocab_sinks.py's optional Google Doc sink
 Pillow  # kanji_image.py - renders the kanji_drip.py glyph image sent to Telegram
+edge-tts  # jlpt_instructor.py's Listening narration, same voice as artifact_creation/build_vocab_audio.py

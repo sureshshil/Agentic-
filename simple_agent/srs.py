@@ -29,6 +29,15 @@ State shape (one JSON file per deck, e.g. .kanji_srs.json):
                                      first rating comes in (an
                                      introduced-but-not-yet-rated item is
                                      never "due" again on its own)
+      "notes": [{"note": "...", "at": "<iso8601>"}, ...]   optional, most
+                                     recent 10 kept - see add_note(). Free-
+                                     text context (e.g. what the user
+                                     confused this item with) attached by
+                                     telegram_bot.py's srs_record_review
+                                     tool when the chat agent quizzes the
+                                     user directly, so a repeated mix-up is
+                                     visible on the item itself rather than
+                                     evaporating into chat history.
     },
     ...
   }
@@ -217,3 +226,78 @@ def record_review(state: dict, key: str, action: str, box_hours: list, now: date
     rec["last_reviewed"] = now.isoformat()
     rec["due"] = (now + timedelta(hours=interval_hours)).isoformat()
     return interval_hours
+
+
+def add_note(state: dict, key: str, note: str, now: datetime) -> bool:
+    """Attaches a free-text note to an EXISTING item (e.g. "confused with
+    怠い" from a chat-driven quiz - see telegram_bot.py's srs_record_review
+    tool). Returns False without mutating anything if `key` isn't already
+    in `state` - notes annotate a real item, they never create one. Keeps
+    only the most recent 10 notes per item so this can't grow unbounded."""
+    rec = state.get(key)
+    if rec is None:
+        return False
+    notes = rec.setdefault("notes", [])
+    notes.append({"note": note, "at": now.isoformat()})
+    del notes[:-10]
+    return True
+
+
+def due_items(state: dict, now: datetime, limit: int = 5) -> list:
+    """Up to `limit` item keys currently due for review, most overdue
+    first - the same "due" notion pick_next uses, but listing candidates
+    instead of picking one, for telegram_bot.py's on-demand quiz tool."""
+    now_iso = now.isoformat()
+    due = [key for key, rec in state.items() if rec.get("due") and rec["due"] <= now_iso]
+    due.sort(key=lambda k: state[k]["due"])
+    return due[:limit]
+
+
+def weakest_items(state: dict, limit: int = 5) -> list:
+    """Up to `limit` item keys with at least one lapse, worst first (most
+    lapses, then lowest box) - so there's always something worth quizzing
+    even when nothing is strictly due yet."""
+    candidates = [(key, rec) for key, rec in state.items() if rec.get("lapses", 0) > 0]
+    candidates.sort(key=lambda kv: (-kv[1].get("lapses", 0), kv[1].get("box", 0)))
+    return [key for key, _rec in candidates[:limit]]
+
+
+def review_candidates(state: dict, now: datetime, limit: int = 5) -> list:
+    """Due items first (most overdue first), then - if there's still room -
+    the highest-lapse items not already included. Backs telegram_bot.py's
+    srs_due_items tool: "what should I quiz the user on right now."""
+    picks = due_items(state, now, limit)
+    if len(picks) < limit:
+        seen = set(picks)
+        for key in weakest_items(state, limit * 2):
+            if key in seen:
+                continue
+            picks.append(key)
+            seen.add(key)
+            if len(picks) >= limit:
+                break
+    return picks
+
+
+def deck_stats(state: dict, now: datetime) -> dict:
+    """A quick progress summary for one deck - total items introduced, how
+    many are due right now, lifetime lapse count, and a box->count
+    histogram. Backs telegram_bot.py's srs_deck_stats tool and /progress
+    command."""
+    now_iso = now.isoformat()
+    box_counts: dict = {}
+    total_lapses = 0
+    due_now = 0
+    for rec in state.values():
+        box = rec.get("box", 0)
+        box_counts[box] = box_counts.get(box, 0) + 1
+        total_lapses += rec.get("lapses", 0)
+        due = rec.get("due")
+        if due and due <= now_iso:
+            due_now += 1
+    return {
+        "total": len(state),
+        "due_now": due_now,
+        "box_counts": box_counts,
+        "total_lapses": total_lapses,
+    }

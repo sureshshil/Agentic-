@@ -79,6 +79,7 @@ _KIND_CONFIG = {
     "v": {
         "module": "vocab_drip", "env_var": "VOCAB_SRS_PATH", "default_path": ".vocab_srs.json",
         "box_hours": srs.BOX_HOURS_VOCAB, "front_field": "word", "has_image": False, "label": "Vocab",
+        "enrich_env_var": "VOCAB_ENRICH_CACHE_PATH", "enrich_default_path": ".vocab_enrich_cache.json",
     },
 }
 
@@ -95,10 +96,11 @@ def _srs_state_path(kind: str) -> str:
 
 
 def _enrich_cache(kind: str) -> dict:
-    """The kanji_drip.py/grammar_drip.py enrichment cache (see
-    llm_enrich.py) for `kind`, or {} for a deck with no enrichment
-    support (currently vocab) - so a card renders with its curated
-    content alone, exactly as if enrichment were never generated."""
+    """The kanji_drip.py/grammar_drip.py/vocab_drip.py enrichment cache
+    (see llm_enrich.py) for `kind`, or {} for a deck with no
+    `enrich_env_var` configured above - so a card renders with its
+    curated content alone, exactly as if enrichment were never
+    generated."""
     cfg = _KIND_CONFIG[kind]
     if "enrich_env_var" not in cfg:
         return {}

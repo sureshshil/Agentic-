@@ -66,10 +66,12 @@ class PlanAdvanceTest(unittest.TestCase):
         self.assertLessEqual(types_introduced.count("grammar"), 1)
 
     def test_new_items_are_a_ceiling_not_a_quota(self):
-        # All MAX_BLOCKS slots are already consumed by due REVIEW items -
-        # ADVANCE can legitimately contribute zero new items.
+        # Enough due REVIEW items to exhaust the whole CAPACITY_MINUTES
+        # budget on their own - ADVANCE can legitimately contribute zero
+        # new items once nothing is left to spend.
         state = fresh_state()
-        for i in range(bank.MAX_BLOCKS):
+        num_review_items = int(bank.CAPACITY_MINUTES // bank.MINUTES_PER_ITEM["kanji"]) + 3
+        for i in range(num_review_items):
             sid = f"kanji:x{i}"
             state["items"][sid] = {
                 "source_id": sid, "type": "kanji", "item": f"x{i}", "jlpt_level": "N3",
@@ -243,6 +245,63 @@ class IngestEvidenceTest(unittest.TestCase):
         bank.ingest_evidence(state, CATALOG, reports, NOW)
         self.assertIn("kanji:決", state["items"])
         self.assertEqual(state["items"]["kanji:決"]["item"], "決")
+
+    def test_pass_at_top_cadence_graduates_to_done(self):
+        state = fresh_state()
+        state["items"]["kanji:決"] = {
+            "source_id": "kanji:決", "type": "kanji", "item": "決", "jlpt_level": "N3",
+            "state": "REVIEW", "introduced_date": "2026-01-01", "next_review": "2026-09-16",
+            "cadence_index": len(bank.CADENCE_DAYS) - 1, "open_errors": [], "evidence": [],
+            "first_pass_target": False,
+        }
+        reports = {"items": [{"source_id": "kanji:決", "result": "pass", "note": ""}]}
+        bank.ingest_evidence(state, CATALOG, reports, NOW)
+        rec = state["items"]["kanji:決"]
+        self.assertEqual(rec["state"], "DONE")
+        self.assertNotIn("next_review", rec)
+
+    def test_partial_at_top_cadence_does_not_graduate(self):
+        state = fresh_state()
+        state["items"]["kanji:決"] = {
+            "source_id": "kanji:決", "type": "kanji", "item": "決", "jlpt_level": "N3",
+            "state": "REVIEW", "introduced_date": "2026-01-01", "next_review": "2026-09-16",
+            "cadence_index": len(bank.CADENCE_DAYS) - 1, "open_errors": [], "evidence": [],
+            "first_pass_target": False,
+        }
+        reports = {"items": [{"source_id": "kanji:決", "result": "partial", "note": ""}]}
+        bank.ingest_evidence(state, CATALOG, reports, NOW)
+        self.assertEqual(state["items"]["kanji:決"]["state"], "REVIEW")
+
+    def test_done_items_are_never_replanned_as_review(self):
+        state = fresh_state()
+        state["items"]["kanji:決"] = {
+            "source_id": "kanji:決", "type": "kanji", "item": "決", "jlpt_level": "N3",
+            "state": "DONE", "introduced_date": "2026-01-01", "open_errors": [], "evidence": [],
+            "first_pass_target": False,
+        }
+        result = bank.plan(state, CATALOG, NOW)
+        self.assertNotIn("kanji:決", {b["source_id"] for b in result["blocks"]})
+
+
+class PlanVolumeTest(unittest.TestCase):
+    def test_a_fresh_day_introduces_close_to_the_full_new_ceilings(self):
+        # A completely empty state (nothing due, nothing in repair) should
+        # spend most of CAPACITY_MINUTES on ADVANCE, reaching close to the
+        # full "10 vocab + 3 grammar + 3 kanji" normal-day target instead
+        # of stopping after some fixed small number of items regardless
+        # of type (the old MAX_BLOCKS=3-total behavior).
+        catalog = {}
+        for i in range(bank.NEW_CEILINGS["vocab"]):
+            catalog[f"vocab:v{i}"] = {"type": "vocab", "item": f"V{i}", "jlpt_level": "N3", "row": {}}
+        for i in range(bank.NEW_CEILINGS["grammar"]):
+            catalog[f"grammar:g{i}"] = {"type": "grammar", "item": f"G{i}", "jlpt_level": "N3", "row": {}}
+        for i in range(bank.NEW_CEILINGS["kanji"]):
+            catalog[f"kanji:k{i}"] = {"type": "kanji", "item": f"K{i}", "jlpt_level": "N3", "row": {}}
+
+        state = fresh_state()
+        result = bank.plan(state, catalog, NOW)
+        self.assertGreater(len(result["blocks"]), 3)
+        self.assertEqual(len(result["new_items"]["vocab"]), bank.NEW_CEILINGS["vocab"])
 
 
 if __name__ == "__main__":

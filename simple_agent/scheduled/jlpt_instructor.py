@@ -54,13 +54,16 @@ non-zero so cron logs surface it. Routine successful runs print nothing
 beyond a one-line summary (quiet by design).
 """
 
+import asyncio
 import json
 import os
 import re
 import sys
+import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import edge_tts
 from dotenv import load_dotenv
 
 _SCHEDULED_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -193,10 +196,17 @@ def parse_evidence(lines: list) -> dict:
     return {"items": items}
 
 
-# Reported directly in the Learner report checklist, e.g. "READING
-# R-N3-002 attempted" - the only way a carried-over reading item is ever
-# marked done (there's no automated grading of the embedded questions).
-_READING_ATTEMPTED_RE = re.compile(r"READING\s+(R-N3-\d+)\s+attempted", re.IGNORECASE)
+# Reported directly in the Learner report checklist - the only way a
+# carried-over reading item is ever marked done (there's no automated
+# grading of the embedded questions). Requires "yes" to immediately
+# follow "<id> attempted:" - the template's own unfilled placeholder is
+# "___", never "yes", so this only ever matches once the learner has
+# actually edited the blank in. (A prior version matched on the mere
+# co-occurrence of "READING <id> attempted" - which the template's own
+# instructional example text also contained verbatim, so it silently
+# self-matched as "already attempted" the moment the row was written,
+# never letting the learner actually attempt it - see git history.)
+_READING_ATTEMPTED_RE = re.compile(r"(R-N3-\d+)\s+attempted:\s*yes\b", re.IGNORECASE)
 
 
 def parse_reading_attempted(lines: list) -> set:
@@ -265,10 +275,26 @@ def _grouped_by_type(blocks: list) -> dict:
     return grouped
 
 
+# Plain-language stand-ins for plan()'s internal scheduling-kind labels
+# (CARRY_FORWARD/REPAIR/REVIEW/ADVANCE) - matching the original ChatGPT/
+# Codex-authored rows' own phrasing ("10 new cards: ..."), which never
+# surfaced that engine jargon to the learner at all. A prior version of
+# this generator printed the raw kind verbatim (e.g. "V001 場合
+# (ADVANCE)") on every single item, everywhere - confusing on a day like
+# Day 1 where EVERYTHING is new, since "ADVANCE" reads like a difficulty
+# level, not "this is being introduced for the first time."
+_KIND_LABELS = {
+    "CARRY_FORWARD": "carried over",
+    "REPAIR": "repair",
+    "REVIEW": "review",
+    "ADVANCE": "new",
+}
+
+
 def _format_field(blocks: list) -> str:
     if not blocks:
         return "No items scheduled."
-    return "; ".join(f"{b['source_id']} {b['item']} ({b['kind']})" for b in blocks)
+    return "; ".join(f"{b['source_id']} {b['item']} ({_KIND_LABELS[b['kind']]})" for b in blocks)
 
 
 def _format_lesson_fields(plan_result: dict) -> dict:
@@ -295,6 +321,39 @@ def _format_lesson_fields(plan_result: dict) -> dict:
 # engine's own capacity accounting (jlpt_item_bank.plan) is unaffected.
 BLOCK_MINUTES = {"due_repair": 15, "grammar": 8, "reading": 10, "optional_new": 7}
 
+# Static "how to work this block" coaching text - shown unconditionally,
+# even when a block has nothing scheduled - matching the original
+# ChatGPT/Codex-authored rows (Day 03), which always paired a block's
+# content with an instruction on how to actually work it ("stop at the
+# cap even if unfinished", "don't open the answer key first"), not just
+# a bare list of what's scheduled. A prior version of this generator
+# omitted this text entirely, which read as noticeably thinner than the
+# original rows despite carrying the same underlying content.
+BLOCK_GUIDANCE = {
+    "due_repair": (
+        "Work only items that are genuinely due or in repair below - don't "
+        "manually search ahead to future items. Stop this block at the time "
+        "cap even if unfinished; anything left over carries forward as "
+        "repair tomorrow rather than vanishing."
+    ),
+    "grammar": (
+        "Answer the embedded question yourself before reading the "
+        "explanation below it - the explanation is there to check your "
+        "reasoning, not replace it."
+    ),
+    "reading": (
+        "Answer the question(s) below from the passage BEFORE marking this "
+        "attempted in the Learner report - the answer key is kept separate "
+        "specifically so your first attempt is cold."
+    ),
+    "optional_new": (
+        "Only attempt this block if Blocks 1-3 left capacity inside today's "
+        "overall time cap. Completion standard: vocabulary = main meaning + "
+        "primary reading + one context use; kanji = component breakdown + "
+        "one compound; grammar = a correct embedded-question answer."
+    ),
+}
+
 
 _READING_ANSWER_RE = re.compile(r"^ANSWER\d*:\s*[A-D]\b", re.IGNORECASE)
 _PASSAGE_LABEL_RE = re.compile(r"^PASSAGE:\s*", re.IGNORECASE)
@@ -314,6 +373,59 @@ def _split_reading_content(raw: str) -> tuple:
     return "\n".join(visible).strip(), "\n".join(answers)
 
 
+_QUESTION_START_RE = re.compile(r"^Q\d+:", re.IGNORECASE)
+
+# Matches the original ChatGPT/Codex-authored rows' own furigana style
+# (fullwidth parentheses directly after each kanji word, e.g.
+# "図書館（としょかん）から") - every kanji word gets one, not just the
+# unfamiliar ones, since generated text has no way to know which kanji a
+# given learner already reads on sight. Deliberately fullwidth （） rather
+# than the vocab TSVs' [bracket] convention, so it stays visually
+# distinct from - and doesn't get accidentally stripped by - the
+# PASSAGE:/ANSWER-line parsing in _split_reading_content, which only
+# matches square brackets/labels, never parentheses.
+_FURIGANA_INSTRUCTION = (
+    "Add furigana in fullwidth parentheses directly after EVERY kanji "
+    "word in the Japanese text, e.g. 図書館（としょかん）から - never "
+    "skip a kanji word just because it seems common. Only annotate actual "
+    "kanji - never add a parenthetical gloss next to an English word."
+)
+
+
+def _reading_content_blocks(visible: str) -> list:
+    """Learner-visible reading text -> [(kind, text), ...] paragraph
+    blocks: the passage itself, then each Qn/its answer choices as its
+    own block - split on lines starting "Qn:" - instead of one flat
+    wall-of-text block, matching the original ChatGPT/Codex-authored
+    rows' own per-question block breakdown."""
+    groups, current = [], []
+    for line in visible.splitlines():
+        if _QUESTION_START_RE.match(line.strip()) and current:
+            groups.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        groups.append(current)
+    return [("paragraph", "\n".join(g).strip()) for g in groups if "\n".join(g).strip()]
+
+
+# Real JLPT N3 reading sections rotate through several genres, not just
+# first-person narrative - the original ChatGPT/Codex-authored Day 01's
+# own passage was a formal library-hours-change notice (お知らせ), a
+# genre a plain "write a reading passage" prompt never reaches on its
+# own since the model defaults to casual narrative every time. Cycled by
+# reading_bank index (deterministic, not random) so consecutive days
+# don't repeat a genre back to back.
+_READING_GENRES = [
+    "a formal public notice or announcement (お知らせ) about a change - "
+    "e.g. a facility's hours, a schedule, or a rule change",
+    "a short work or school email/memo with a request or update",
+    "brief formal instructions or a how-to notice (e.g. a sign, a manual excerpt)",
+    "a short first-person narrative or diary-style passage",
+]
+
+
 def _get_or_start_reading(state: dict, plan_result: dict) -> dict:
     """Reuses an unattempted reading item from a previous day (cross-day
     carryover) instead of generating a fresh one every run, matching
@@ -326,17 +438,25 @@ def _get_or_start_reading(state: dict, plan_result: dict) -> dict:
         if not item.get("attempted"):
             return item
 
+    genre = _READING_GENRES[len(reading_bank) % len(_READING_GENRES)]
     items_line = ", ".join(b["item"] for b in plan_result["blocks"]) or "basic daily-life vocabulary"
     agent = Agent()
     raw = agent.send(
-        "Write one short original JLPT N3-level Japanese reading passage "
-        f"(3-5 sentences) naturally using some of these items: {items_line}, "
-        "followed by exactly 2 comprehension questions in English, each "
-        "with 4 answer choices labeled A-D and one correct answer. Use "
-        "exactly this plain-text format, no markdown, no extra commentary:\n"
+        "Write one short original JLPT N3-level Japanese reading passage, "
+        f"written as {genre}. "
+        f"3-5 sentences, naturally using some of these items: {items_line}. "
+        "Match the register to the genre (a notice/instructions should "
+        "read formal, an email/memo semi-formal, a narrative can be "
+        "casual). Follow with exactly 2 comprehension questions in "
+        "English, each with 4 answer choices labeled A-D and one correct "
+        "answer. Use exactly this plain-text format, no markdown, no "
+        "extra commentary:\n"
         "PASSAGE: <passage>\n"
         "Q1: <question>\nA) <opt>\nB) <opt>\nC) <opt>\nD) <opt>\nANSWER1: <letter>\n"
-        "Q2: <question>\nA) <opt>\nB) <opt>\nC) <opt>\nD) <opt>\nANSWER2: <letter>"
+        "Q2: <question>\nA) <opt>\nB) <opt>\nC) <opt>\nD) <opt>\nANSWER2: <letter>\n"
+        f"{_FURIGANA_INSTRUCTION} This applies ONLY to the PASSAGE line - "
+        "the questions and answer choices are in English, so leave them "
+        "as plain English with no parenthetical glosses at all."
     )
     visible, answers = _split_reading_content(raw)
     item = {
@@ -349,23 +469,125 @@ def _get_or_start_reading(state: dict, plan_result: dict) -> dict:
     return item
 
 
-def _compose_grammar_practice(grammar_blocks: list) -> str:
-    """One short contrast/practice block (example sentence(s) + an
-    embedded question + a one-line nuance note) for today's grammar
-    items, via a single Agent turn - matching Day 03's embedded
-    ことにする/ことになる contrast practice, not just a bare id list."""
+# ---- listening (TTS narration of the reading passage) ---------------------
+
+# Same edge-tts + voice (ja-JP-NanamiNeural) as artifact_creation/
+# build_vocab_audio.py's vocab drip narration - reusing the proven,
+# free, no-quota pipeline instead of a separate Vertex TTS model/billing
+# path. edge_tts.Communicate.save() only writes to a real file path (no
+# in-memory stream option), so _generate_reading_audio_mp3 round-trips
+# through a temp file and returns its bytes.
+_TTS_VOICE = "ja-JP-NanamiNeural"
+_TTS_RETRIES = 3
+
+
+_FURIGANA_ANNOTATION_RE = re.compile(r"（[^（）]*）")
+
+
+def _strip_furigana(text: str) -> str:
+    """Drops the （reading） annotations _FURIGANA_INSTRUCTION asks the
+    model to add - needed before TTS narration, since a voice model reads
+    a parenthetical literally rather than treating it as a pronunciation
+    hint, so "図書館（としょかん）から" would come out as two mangled
+    readings back to back instead of one clean "としょかんから"."""
+    return _FURIGANA_ANNOTATION_RE.sub("", text)
+
+
+def _passage_only(visible_reading_text: str) -> str:
+    """The passage itself, without the trailing comprehension questions -
+    those are meant to be read from the Notion row and answered, not
+    narrated for the learner (that would hand them the questions' exact
+    wording alongside the answer choices before they've engaged with the
+    passage). Furigana annotations are stripped too - see _strip_furigana."""
+    lines = []
+    for line in visible_reading_text.splitlines():
+        if _QUESTION_START_RE.match(line.strip()):
+            break
+        lines.append(line)
+    return _strip_furigana("\n".join(lines).strip())
+
+
+async def _edge_tts_save(text: str, voice: str, path: str) -> None:
+    """Same retry shape as build_vocab_audio.py's own tts() helper - a
+    transient edge-tts/network hiccup gets a couple of retries before
+    giving up, rather than failing the whole Listening section over one
+    flaky request."""
+    last_exc = None
+    for attempt in range(_TTS_RETRIES):
+        try:
+            await edge_tts.Communicate(text, voice).save(path)
+            if os.path.getsize(path) > 0:
+                return
+        except Exception as exc:  # noqa: BLE001 - retried below, re-raised after
+            last_exc = exc
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"edge-tts failed after {_TTS_RETRIES} attempts: {last_exc}")
+
+
+def _generate_reading_audio_mp3(passage_text: str) -> bytes:
+    """Narrates `passage_text` via edge-tts (ja-JP-NanamiNeural, same
+    voice as the vocab drip's own audio), returned as MP3 bytes. Raises
+    on failure - run_morning catches this and falls back to the old
+    text-only Listening note rather than aborting the whole run over an
+    optional feature."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        asyncio.run(_edge_tts_save(passage_text, _TTS_VOICE, tmp_path))
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(tmp_path)
+
+
+_LABELED_LINE_RE = re.compile(r"^(EXAMPLE|QUESTION|EXPLANATION):\s*(.*)$", re.IGNORECASE)
+
+
+def _parse_labeled_blocks(raw: str, fallback_label: str) -> list:
+    """EXAMPLE:/QUESTION:/EXPLANATION:-labeled lines -> [(kind, text), ...]
+    blocks - EXAMPLE lines become their own numbered_list_item (matching
+    Day 03's separate numbered example sentences), everything else its
+    own paragraph. Falls back to one raw paragraph if the model didn't
+    follow the requested format - fails soft rather than dropping the
+    content silently."""
+    blocks = []
+    for line in raw.splitlines():
+        m = _LABELED_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        label, text = m.group(1).upper(), m.group(2).strip()
+        if not text:
+            continue
+        kind = "numbered" if label == "EXAMPLE" else "paragraph"
+        blocks.append((kind, text))
+    return blocks or [("paragraph", raw.strip() or f"(no {fallback_label} generated)")]
+
+
+def _compose_grammar_practice_blocks(grammar_blocks: list) -> list:
+    """Block 2's content as [(kind, text), ...] - one numbered_list_item
+    per example sentence, then a separate paragraph for the embedded
+    question and one for the nuance explanation, via a single Agent
+    turn - matching Day 03's embedded ことにする/ことになる contrast
+    practice's own multi-block breakdown, not one flat wall-of-text
+    paragraph."""
     if not grammar_blocks:
-        return "No grammar scheduled today."
+        return [("paragraph", "No grammar scheduled today.")]
     items_line = "; ".join(f"{b['source_id']} {b['item']}" for b in grammar_blocks)
     agent = Agent()
-    return agent.send(
+    raw = agent.send(
         f"For this JLPT N3 grammar practice set: {items_line}\n"
-        "Write ONE short contrast/practice block: one or two example "
-        "Japanese sentences using the pattern(s) naturally, one short "
-        "embedded question testing whether the learner can tell them "
-        "apart or use them correctly, and a one-sentence nuance "
-        "explanation. Plain text, no markdown, no headings, concise."
+        "Write a short contrast/practice block using EXACTLY this plain-text "
+        "format (one item per line, no markdown, no extra commentary):\n"
+        "EXAMPLE: <one Japanese example sentence using the pattern(s) naturally>\n"
+        "EXAMPLE: <a second example sentence - omit this line if one is enough>\n"
+        "QUESTION: <one short embedded question testing whether the learner "
+        "can tell the pattern(s) apart or use them correctly>\n"
+        "EXPLANATION: <one-sentence nuance explanation>\n"
+        f"{_FURIGANA_INSTRUCTION} Apply this to the EXAMPLE and QUESTION "
+        "lines (whichever contain Japanese text) - EXPLANATION can stay "
+        "in English."
     )
+    return _parse_labeled_blocks(raw, "grammar practice")
 
 
 def _format_learner_report(plan_result: dict, reading_item: dict) -> list:
@@ -373,26 +595,49 @@ def _format_learner_report(plan_result: dict, reading_item: dict) -> list:
     report — edit this row" section. This is the loop's only real
     mechanism for getting evidence back: the evening branch's
     parse_evidence/parse_reading_attempted read exactly this section
-    once the learner has filled it in."""
+    once the learner has filled it in.
+
+    Deliberately never embeds a real "<id> pass/partial/fail"-shaped
+    example anywhere in this INSTRUCTIONAL text - a prior version wrote
+    literally `e.g. "G001 pass"` as an example, which parse_evidence then
+    matched as if it were YOUR actual reported result the moment this row
+    got read back, silently fabricating evidence. Placeholder text like
+    "id pass/fail" (no real id) is safe; a real id next to a real verdict
+    word never is, however "obviously" instructional it reads to a human."""
     grouped = _grouped_by_type(plan_result["blocks"])
     return [
         f"Total minutes: ___ / {plan_result['estimated_minutes']} max",
         "Due reviews/repair: minutes ___; remaining ___",
-        f"Grammar ({_format_field(grouped['grammar'])}): report pass/partial/fail per id, e.g. \"G001 pass\"",
-        f"Reading {reading_item['id']}: report your answers, or write \"READING {reading_item['id']} attempted\" once done",
-        f"New vocabulary studied ({_format_field(grouped['vocab'])}): report pass/partial/fail per id",
-        f"New kanji studied ({_format_field(grouped['kanji'])}): report pass/partial/fail per id",
+        f"Grammar ({_format_field(grouped['grammar'])}): after each id above, write pass, partial, or fail",
+        f"Reading {reading_item['id']} attempted: ___ (change to yes once you've done it, else leave as-is)",
+        f"New vocabulary studied ({_format_field(grouped['vocab'])}): after each id above, write pass, partial, or fail",
+        f"New kanji studied ({_format_field(grouped['kanji'])}): after each id above, write pass, partial, or fail",
         "Difficulty or reason for stopping: ___",
     ]
 
 
-def _format_lesson_body(plan_result: dict, reading_item: dict, grammar_practice: str, date_str: str) -> list:
+_LISTENING_NOTE_NO_AUDIO = (
+    "Audio: not available for this row. Achievable alternative: read "
+    "today's grammar/reading sentences aloud once each."
+)
+_LISTENING_NOTE_WITH_AUDIO = (
+    "Audio: narrated reading passage attached at the end of this page "
+    "(synthesized voice, Japanese only - not official JLPT material)."
+)
+
+
+def _format_lesson_body(
+    plan_result: dict, reading_item: dict, grammar_blocks_content: list, date_str: str,
+    listening_note: str = _LISTENING_NOTE_NO_AUDIO,
+) -> list:
     """(text, style) tuples for the row's page BODY - the same 4-block +
     Listening + Learner-report structure the original ChatGPT/Codex-
     authored rows already use (see Day 03's 29 body blocks), not just
-    the short Vocabulary/Grammar/Kanji property text. Each block also
-    lists items with their rank-based ids so the evening branch's
-    parse_evidence can match reported results back against them."""
+    the short Vocabulary/Grammar/Kanji property text. Each block pairs
+    static "how to work this block" guidance (BLOCK_GUIDANCE) with its
+    actual content, and lists items with their rank-based ids so the
+    evening branch's parse_evidence can match reported results back
+    against them."""
     due_repair_review = [b for b in plan_result["blocks"] if b["kind"] in ("CARRY_FORWARD", "REPAIR", "REVIEW")]
     advance = [b for b in plan_result["blocks"] if b["kind"] == "ADVANCE"]
 
@@ -401,27 +646,31 @@ def _format_lesson_body(plan_result: dict, reading_item: dict, grammar_practice:
         ("paragraph", f"Instructor-generated plan (~{plan_result['estimated_minutes']} min total)."),
 
         ("heading", f"Block 1 — Due reviews & repair ({BLOCK_MINUTES['due_repair']} minutes maximum)"),
+        ("paragraph", BLOCK_GUIDANCE["due_repair"]),
         ("paragraph", _format_field(due_repair_review) if due_repair_review else "Nothing due or in repair today."),
 
         ("heading", f"Block 2 — Grammar ({BLOCK_MINUTES['grammar']} minutes maximum)"),
-        ("paragraph", grammar_practice),
+        ("paragraph", BLOCK_GUIDANCE["grammar"]),
+        *grammar_blocks_content,
 
         ("heading", f"Block 3 — Reading practice ({BLOCK_MINUTES['reading']} minutes maximum)"),
+        ("paragraph", BLOCK_GUIDANCE["reading"]),
         ("paragraph", f"{reading_item['id']} (generated training - not official JLPT material)."),
-        ("paragraph", reading_item["visible"]),
+        *_reading_content_blocks(reading_item["visible"]),
         ("paragraph", "Answers kept separate - see instructor feedback after your first attempt."),
 
         ("heading", f"Block 4 — Optional new items ({BLOCK_MINUTES['optional_new']} minutes maximum)"),
+        ("paragraph", BLOCK_GUIDANCE["optional_new"]),
         ("paragraph", _format_field(advance) if advance else "None scheduled today."),
 
         ("heading", "Listening"),
-        ("paragraph", "Audio: pending - not yet verified as accessible for this row. Achievable alternative: read today's grammar/reading sentences aloud once each."),
+        ("paragraph", listening_note),
 
         ("heading", "Learner report — edit this row"),
         *[("bullet", line) for line in _format_learner_report(plan_result, reading_item)],
         ("paragraph", "Set Status to Done when the capped session is complete, In progress if you stop early, or Not started if you did not study."),
     ]
-    style_map = {"heading": "heading_2", "paragraph": "paragraph", "bullet": "bulleted_list_item"}
+    style_map = {"heading": "heading_2", "paragraph": "paragraph", "bullet": "bulleted_list_item", "numbered": "numbered_list_item"}
     return [(text, style_map[kind]) for kind, text in paragraphs]
 
 
@@ -492,10 +741,30 @@ def run_morning(now_jst: datetime) -> str:
     notion.update_row(row["page_id"], date_str=date_str, status="In progress", fields=fields)
 
     grammar_blocks = [b for b in plan_result["blocks"] if b["type"] == "grammar"]
-    grammar_practice = _compose_grammar_practice(grammar_blocks)
+    grammar_blocks_content = _compose_grammar_practice_blocks(grammar_blocks)
+
+    # Best-effort real narration of today's reading passage - additive and
+    # fails soft (same pattern as llm_enrich's practice blocks): a TTS or
+    # upload hiccup falls back to the old text-only note rather than
+    # aborting a run that's otherwise perfectly fine.
+    listening_audio_mp3 = None
+    listening_note = _LISTENING_NOTE_NO_AUDIO
+    try:
+        listening_audio_mp3 = _generate_reading_audio_mp3(_passage_only(reading_item["visible"]))
+        listening_note = _LISTENING_NOTE_WITH_AUDIO
+    except Exception as exc:
+        print(f"Warning: listening audio generation failed, falling back to text-only note ({exc})")
+
     notion.append_body_blocks(
-        row["page_id"], _format_lesson_body(plan_result, reading_item, grammar_practice, date_str)
+        row["page_id"],
+        _format_lesson_body(plan_result, reading_item, grammar_blocks_content, date_str, listening_note),
     )
+
+    if listening_audio_mp3 is not None:
+        try:
+            notion.upload_audio(row["page_id"], listening_audio_mp3, f"{reading_item['id']}.mp3")
+        except Exception as exc:
+            print(f"Warning: uploading listening audio to Notion failed ({exc})")
 
     expect = [fields["Vocabulary"][:40]] if plan_result["blocks"] else [date_str]
     if not notion.verify_row_saved(collection_id, date_str, expect):

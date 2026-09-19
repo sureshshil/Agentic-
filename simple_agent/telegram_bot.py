@@ -38,6 +38,13 @@ Commands:
                  wait for the hard-stop message to check spend. Replies also
                  carry an automatic warning once lifetime cost crosses 80%
                  of the cap.
+  /progress      One-line-per-deck spaced-repetition summary (kanji/
+                 grammar/vocab): total items, how many are due right now,
+                 and lifetime lapse count - reads the same .{kanji,grammar,
+                 vocab}_srs.json files the drip scripts and handle_srs_
+                 callback maintain. The model can also pull this (and quiz
+                 you) mid-conversation via the srs_deck_stats/srs_due_items/
+                 srs_record_review tools - see SYSTEM_PROMPT_BASE.
 
 Long-term memory: 'remember' skips a fact that's already stored (exact
 match, case-insensitive) instead of piling up duplicates, and stamps each
@@ -258,7 +265,22 @@ SYSTEM_PROMPT_BASE = (
     "Memory: only call 'remember' for durable facts or preferences that "
     "should still matter in a future conversation (e.g. dietary "
     "restrictions, timezone, ongoing projects) - not incidental details "
-    "from a single one-off question.\n\n"
+    "from a single one-off question. Tag study-related facts (recurring "
+    "mix-ups, weak areas) with topic='jlpt' so they can be recalled "
+    "together later.\n\n"
+    "Quizzing on kanji/grammar/vocab: you have srs_deck_stats, "
+    "srs_due_items, and srs_record_review for the user's spaced-repetition "
+    "decks (the same ones their Telegram drip pushes from). Only reach for "
+    "these when the user actually asks about their progress or asks to be "
+    "quizzed/tested/reviewed - never start a quiz unprompted. To quiz: "
+    "call srs_due_items first, then ask about items ONE at a time from "
+    "your own knowledge (don't reveal the answer first). After they "
+    "answer, judge it yourself and call srs_record_review with an honest "
+    "rating - 'good'/'easy' only for answers that were actually correct; "
+    "never rate generously to be encouraging. If they got it wrong or "
+    "mixed it up with something else, say so plainly and pass a short "
+    "'note' describing the mix-up so it's visible next time they review "
+    "that item.\n\n"
     "Reasoning before acting: whenever you're about to call a tool, first "
     "write one short sentence stating what's actually missing from your "
     "own knowledge that the tool provides - not just what the tool does "
@@ -302,7 +324,10 @@ def _request_with_retry(method: str, url: str, attempts: int = 2, timeout: int =
 # ---- tools ------------------------------------------------------------
 
 def load_memory() -> list:
-    """Each entry is {"fact": str, "remembered_at": "YYYY-MM-DD" or None}."""
+    """Each entry is {"fact": str, "remembered_at": "YYYY-MM-DD" or None,
+    "topic": str}. "topic" is optional on read (old entries predate it and
+    fall back to DEFAULT_MEMORY_TOPIC via .get) but always written on new
+    entries - see remember()."""
     if not os.path.exists(MEMORY_PATH):
         return []
     try:
@@ -327,11 +352,19 @@ def save_memory(memory: list) -> None:
         json.dump(memory, f, indent=2)
 
 
-def remember(fact: str) -> str:
+DEFAULT_MEMORY_TOPIC = "general"
+
+
+def remember(fact: str, topic: str | None = None) -> str:
     memory = load_memory()
+    topic = (topic or DEFAULT_MEMORY_TOPIC).strip().lower() or DEFAULT_MEMORY_TOPIC
     if any(entry["fact"].strip().lower() == fact.strip().lower() for entry in memory):
         return f"Already remembered: {fact}"
-    memory.append({"fact": fact, "remembered_at": time.strftime("%Y-%m-%d", time.gmtime())})
+    memory.append({
+        "fact": fact,
+        "remembered_at": time.strftime("%Y-%m-%d", time.gmtime()),
+        "topic": topic,
+    })
 
     evicted = None
     if len(memory) > MAX_MEMORY_FACTS:
@@ -340,23 +373,32 @@ def remember(fact: str) -> str:
 
     if evicted:
         return (
-            f"Remembered: {fact}\n"
+            f"Remembered ({topic}): {fact}\n"
             f"(Memory was at the {MAX_MEMORY_FACTS}-fact cap, so the oldest "
             f"fact was dropped to make room: \"{evicted['fact']}\". Call "
             "'forget' proactively on facts you no longer need if you want "
             "to control what gets dropped.)"
         )
-    return f"Remembered: {fact}"
+    return f"Remembered ({topic}): {fact}"
 
 
-def recall() -> str:
+def recall(topic: str | None = None) -> str:
+    """Numbered list of stored facts - numbers always index the FULL
+    memory list (so they stay valid for forget()) even when `topic`
+    filters what's shown."""
     memory = load_memory()
     if not memory:
         return "No memories stored yet."
-    return "\n".join(
-        f"{i}. [{entry['remembered_at'] or 'date unknown'}] {entry['fact']}"
+    topic_filter = topic.strip().lower() if topic else None
+    lines = [
+        f"{i}. [{entry['remembered_at'] or 'date unknown'}] "
+        f"({entry.get('topic', DEFAULT_MEMORY_TOPIC)}) {entry['fact']}"
         for i, entry in enumerate(memory, start=1)
-    )
+        if topic_filter is None or entry.get("topic", DEFAULT_MEMORY_TOPIC) == topic_filter
+    ]
+    if not lines:
+        return f"No memories stored under topic '{topic}'."
+    return "\n".join(lines)
 
 
 def forget(index: int) -> str:
@@ -471,6 +513,80 @@ def send_email(to: str, subject: str, body: str) -> str:
         return f"Error: failed to send email ({exc})"
 
 
+DECK_KIND = {"kanji": "k", "grammar": "g", "vocab": "v"}
+
+
+def _format_deck_stats(label: str, stats: dict) -> str:
+    if stats["total"] == 0:
+        return f"{label}: no items introduced yet."
+    box_line = ", ".join(f"box {b}: {c}" for b, c in sorted(stats["box_counts"].items()))
+    return (
+        f"{label}: {stats['total']} item(s) total, {stats['due_now']} due now, "
+        f"{stats['total_lapses']} lifetime lapse(s) ({box_line})"
+    )
+
+
+def srs_deck_stats(deck: str) -> str:
+    kind = DECK_KIND.get(deck)
+    if kind is None:
+        return f"Error: unknown deck '{deck}' - must be kanji, grammar, or vocab."
+    path, _ = SRS_KIND_PATHS[kind]
+    state = srs.load_state(path)
+    return _format_deck_stats(deck.capitalize(), srs.deck_stats(state, srs.now_utc()))
+
+
+def srs_due_items(deck: str, limit: int = 5) -> str:
+    """Due-first, weakest-next candidates worth quizzing the user on right
+    now - see srs.review_candidates. Only ever returns items already
+    introduced by that deck's drip (kanji_drip.py etc.); this tool never
+    invents new ones."""
+    kind = DECK_KIND.get(deck)
+    if kind is None:
+        return f"Error: unknown deck '{deck}' - must be kanji, grammar, or vocab."
+    path, _ = SRS_KIND_PATHS[kind]
+    state = srs.load_state(path)
+    picks = srs.review_candidates(state, srs.now_utc(), limit)
+    if not picks:
+        return f"No items in the {deck} deck yet - nothing to quiz on."
+    lines = []
+    for key in picks:
+        rec = state[key]
+        note_hint = ""
+        notes = rec.get("notes")
+        if notes:
+            note_hint = f", last note: {notes[-1]['note']}"
+        lines.append(
+            f"{key} (box {rec.get('box', 0)}, {rec.get('lapses', 0)} lapse(s), "
+            f"last rated: {rec.get('last_result', 'never')}{note_hint})"
+        )
+    return "\n".join(lines)
+
+
+def srs_record_review(deck: str, item: str, rating: str, note: str | None = None) -> str:
+    """Applies a rating (and optional note) to an item already introduced
+    by the deck's drip - the chat-driven equivalent of tapping an Again/
+    Hard/Good/Easy button, so a quiz conducted in conversation feeds the
+    same SRS state the scheduled reviews use. Refuses to rate an item
+    that isn't already in the deck's state (see srs.add_note) rather than
+    silently creating one - only srs.pick_next/pick_batch (via the drip
+    scripts) are allowed to introduce brand-new items."""
+    kind = DECK_KIND.get(deck)
+    if kind is None:
+        return f"Error: unknown deck '{deck}' - must be kanji, grammar, or vocab."
+    if rating not in srs.ACTIONS:
+        return f"Error: unknown rating '{rating}' - must be one of {', '.join(srs.ACTIONS)}."
+    path, box_hours = SRS_KIND_PATHS[kind]
+    state = srs.load_state(path)
+    if item not in state:
+        return f"Error: '{item}' is not in the {deck} deck's SRS state yet - only rate items returned by srs_due_items."
+    interval_hours = srs.record_review(state, item, rating, box_hours, srs.now_utc())
+    if note:
+        srs.add_note(state, item, note, srs.now_utc())
+    srs.save_state(path, state)
+    suffix = f" Note saved: {note}" if note else ""
+    return f"Recorded '{rating}' for {item} ({deck}) - next review in {srs.format_interval(interval_hours)}.{suffix}"
+
+
 def build_tools() -> list:
     tools = [
         {
@@ -483,14 +599,30 @@ def build_tools() -> list:
                         "type": "string",
                         "description": "A concise fact to remember, e.g. 'Prefers metric units.'",
                     },
+                    "topic": {
+                        "type": "string",
+                        "description": (
+                            "Optional short topic tag, e.g. 'jlpt' for a recurring study "
+                            "mix-up ('always confuses 快い/怠い') so it can be recalled by "
+                            "topic later. Defaults to 'general' if omitted."
+                        ),
+                    },
                 },
                 "required": ["fact"],
             },
         },
         {
             "name": "recall",
-            "description": "List everything currently stored in long-term memory, numbered.",
-            "input_schema": {"type": "object", "properties": {}},
+            "description": "List facts stored in long-term memory, numbered. Optionally filter to one topic.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Optional - only list facts saved under this topic, e.g. 'jlpt'.",
+                    },
+                },
+            },
         },
         {
             "name": "forget",
@@ -518,6 +650,63 @@ def build_tools() -> list:
                     },
                 },
                 "required": ["location"],
+            },
+        },
+        {
+            "name": "srs_deck_stats",
+            "description": (
+                "Quick progress summary for one of the user's spaced-repetition decks "
+                "(kanji, grammar, or vocab, shared with their Telegram drip): total items, "
+                "how many are due for review right now, and lifetime lapse count. Use when "
+                "the user asks how they're doing, their progress, or their review load."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {"deck": {"type": "string", "enum": ["kanji", "grammar", "vocab"]}},
+                "required": ["deck"],
+            },
+        },
+        {
+            "name": "srs_due_items",
+            "description": (
+                "List items from one SRS deck worth quizzing the user on right now - due "
+                "reviews first, then (if nothing's due) the items they've struggled with "
+                "most. Call this BEFORE quizzing/testing the user on kanji, grammar, or "
+                "vocab so you pick from what's actually due or weak, not something at random."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "deck": {"type": "string", "enum": ["kanji", "grammar", "vocab"]},
+                    "limit": {"type": "integer", "description": "Max items to return, default 5."},
+                },
+                "required": ["deck"],
+            },
+        },
+        {
+            "name": "srs_record_review",
+            "description": (
+                "Record the result of quizzing the user on one SRS item you already "
+                "retrieved via srs_due_items. Rate their ACTUAL recall honestly: 'again' if "
+                "wrong or they didn't know it, 'hard' if they struggled or hesitated, "
+                "'good' for a correct normal-effort answer, 'easy' if instant/confident. "
+                "Never rate an item you didn't actually test them on, and never rate "
+                "generously just to be encouraging. If they got it wrong or confused it "
+                "with something else, pass a short 'note' describing the mix-up so it's "
+                "visible on their next review."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "deck": {"type": "string", "enum": ["kanji", "grammar", "vocab"]},
+                    "item": {"type": "string", "description": "The exact item key, as returned by srs_due_items."},
+                    "rating": {"type": "string", "enum": list(srs.ACTIONS)},
+                    "note": {
+                        "type": "string",
+                        "description": "Optional short note about the mistake or nuance, shown on future reviews.",
+                    },
+                },
+                "required": ["deck", "item", "rating"],
             },
         },
     ]
@@ -578,13 +767,21 @@ def build_tools() -> list:
 
 def execute_tool(name: str, tool_input: dict) -> str:
     if name == "remember":
-        return remember(tool_input["fact"])
+        return remember(tool_input["fact"], tool_input.get("topic"))
     if name == "recall":
-        return recall()
+        return recall(tool_input.get("topic"))
     if name == "forget":
         return forget(tool_input["index"])
     if name == "get_weather":
         return get_weather(tool_input["location"])
+    if name == "srs_deck_stats":
+        return srs_deck_stats(tool_input["deck"])
+    if name == "srs_due_items":
+        return srs_due_items(tool_input["deck"], tool_input.get("limit", 5))
+    if name == "srs_record_review":
+        return srs_record_review(
+            tool_input["deck"], tool_input["item"], tool_input["rating"], tool_input.get("note")
+        )
     if name == "web_search":
         return web_search(tool_input["query"], tool_input.get("freshness"))
     if name == "send_email":
@@ -1286,6 +1483,17 @@ def main() -> None:
                         f"Session cost: ${agent.session_cost_usd:.4f}\n"
                         f"Lifetime cost: ${agent.total_cost_usd:.4f} / ${MAX_COST_USD:.2f} cap"
                     )
+                    print(f"Agent: {reply}")
+                    send_telegram_reply(api_base, chat_id, reply)
+                    continue
+
+                if text.strip().lower() == "/progress":
+                    now = srs.now_utc()
+                    lines = [
+                        _format_deck_stats(label, srs.deck_stats(srs.load_state(SRS_KIND_PATHS[kind][0]), now))
+                        for label, kind in (("Kanji", "k"), ("Grammar", "g"), ("Vocab", "v"))
+                    ]
+                    reply = "\n".join(lines)
                     print(f"Agent: {reply}")
                     send_telegram_reply(api_base, chat_id, reply)
                     continue

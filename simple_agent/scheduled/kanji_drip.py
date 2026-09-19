@@ -30,15 +30,18 @@ Kanji content comes from the hand-curated CSVs next to this repo
 from an LLM call - this includes each kanji's own mnemonic (`component`'s
 "X + Y (story → meaning)" breakdown) and, for many confusable-kanji
 rows, a `disc_note` distinguishing tip, both shown directly. Optionally,
-ON TOP of that curated content, a full AI practice block (2-3 fresh
-example sentences, a short explanation, a mini dialogue, and a
-multiple-choice practice question) gets generated per push via Gemini
-(see ../llm_enrich.py) and shown as extra "AI" sections - deliberately no
-AI-generated mnemonic/component-breakdown, since the CSV's own is better
-than anything an LLM would reinvent here. This is additive and fails
-soft, so a model outage never removes the curated card. Cached in
-KANJI_ENRICH_CACHE_PATH so webapp.py's review page shows the exact same
-generated content as whatever went out with the push, not a re-roll.
+ON TOP of that curated content, a full AI practice block (2-3 example
+sentences, a short explanation, a mini dialogue, and a multiple-choice
+practice question) gets generated ONCE per kanji, the first time it's
+ever picked, via Gemini (see ../llm_enrich.py) and shown as extra "AI"
+sections - deliberately no AI-generated mnemonic/component-breakdown,
+since the CSV's own is better than anything an LLM would reinvent here.
+This is additive and fails soft, so a model outage never removes the
+curated card. Cached permanently in KANJI_ENRICH_CACHE_PATH and reused
+on every later review of that kanji - never regenerated - so the AI
+content becomes as stable a memory aid as the curated card itself
+instead of reshuffling under you each time it comes up; webapp.py's
+review page reads the same cache, so it always shows this exact content.
 
 Env vars (loaded via python-dotenv from ../telegram_bot.env and
 ../deploy/scheduled.env, same fill-in-what's-unset behavior as
@@ -297,14 +300,21 @@ def main() -> None:
     api_base = f"https://api.telegram.org/bot{token}"
     picked_keys = [key for key, _ in picks]
 
-    # One fresh AI example sentence per picked kanji, generated now (this
-    # push) and cached so the review page (webapp.py, opened later)
-    # shows the exact same content rather than re-rolling it - see
-    # llm_enrich.py. No-op (skipped/None) when GCP_PROJECT_ID isn't set
-    # or the lifetime cost cap has been reached; either way the CSV
-    # content below is unaffected.
+    # A practice block generated ONCE per kanji, the first time it's ever
+    # picked, then reused on every later review from the persistent cache
+    # (see llm_enrich.load_cache's docstring for why - regenerating on
+    # every push would mean the AI examples/dialogue keep changing under
+    # a card you're trying to build a stable memory of). webapp.py reads
+    # the same cache when it later renders the review page, so it always
+    # shows this exact content, never a re-roll. No-op (skipped/None) when
+    # GCP_PROJECT_ID isn't set or the lifetime cost cap has been reached;
+    # either way the CSV content below is unaffected.
+    enrich_cache = llm_enrich.load_cache(KANJI_ENRICH_CACHE_PATH)
     enrichments = {}
     for key in picked_keys:
+        if key in enrich_cache:
+            enrichments[key] = enrich_cache[key]
+            continue
         result = llm_enrich.enrich_kanji(row_by_key[key], KANJI_LEVEL)
         if result:
             enrichments[key] = result

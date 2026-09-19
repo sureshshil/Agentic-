@@ -166,6 +166,49 @@ class EnrichKanjiGrammarTest(unittest.TestCase):
         self.assertIn("N3", captured["prompt"])
         self.assertEqual(captured["schema"], llm_enrich._GRAMMAR_SCHEMA)
 
+    def test_enrich_vocab_passes_word_fields_into_the_prompt(self):
+        captured = {}
+
+        def fake_generate(prompt, schema):
+            captured["prompt"] = prompt
+            captured["schema"] = schema
+            return {"examples": [], "explanation": "x", "dialogue": [], "practice_question": {}}
+
+        llm_enrich._generate = fake_generate
+        row = {"word": "含む", "reading": "ふくむ", "english": "to include; to contain"}
+        result = llm_enrich.enrich_vocab(row, "N3")
+        self.assertEqual(result["explanation"], "x")
+        self.assertIn("含む", captured["prompt"])
+        self.assertIn("N3", captured["prompt"])
+        self.assertEqual(captured["schema"], llm_enrich._VOCAB_SCHEMA)
+
+    def test_enrich_vocab_includes_the_frame_field_so_every_pattern_gets_exercised(self):
+        captured = {}
+
+        def fake_generate(prompt, schema):
+            captured["prompt"] = prompt
+            return {"examples": [], "explanation": "x", "dialogue": [], "practice_question": {}}
+
+        llm_enrich._generate = fake_generate
+        row = {
+            "word": "含む", "reading": "ふくむ", "english": "to include",
+            "frame": "AはBを含む／Aを含めて／Bが含まれている",
+        }
+        llm_enrich.enrich_vocab(row, "N3")
+        self.assertIn("AはBを含む／Aを含めて／Bが含まれている", captured["prompt"])
+
+    def test_enrich_vocab_omits_frame_instructions_when_frame_is_blank(self):
+        captured = {}
+
+        def fake_generate(prompt, schema):
+            captured["prompt"] = prompt
+            return {"examples": [], "explanation": "x", "dialogue": [], "practice_question": {}}
+
+        llm_enrich._generate = fake_generate
+        row = {"word": "含む", "reading": "ふくむ", "english": "to include"}
+        llm_enrich.enrich_vocab(row, "N3")
+        self.assertNotIn("particle-affinity patterns are", captured["prompt"])
+
 
 class FormatBlocksTest(unittest.TestCase):
     def test_renders_numbered_examples_with_reading(self):

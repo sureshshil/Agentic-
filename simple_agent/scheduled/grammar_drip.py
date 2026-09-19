@@ -12,13 +12,16 @@ browser review link when WEBAPP_BASE_URL is set).
 Grammar content comes from the hand-curated CSVs next to this repo
 (../n3_grammar_batch*.csv by default, override with GRAMMAR_CSV_GLOB),
 not from an LLM call. Optionally, ON TOP of that curated content, a full
-AI practice block (2-3 fresh example sentences, a short explanation, a
-mini dialogue, and a multiple-choice practice question) gets generated
-per push via Gemini (see ../llm_enrich.py) and shown as extra "AI"
-sections alongside the CSV's own content - additive and fails soft, same
-as kanji_drip.py. Cached in GRAMMAR_ENRICH_CACHE_PATH so webapp.py's
-review page shows the exact same generated content as whatever went out
-with the push.
+AI practice block (2-3 example sentences, a short explanation, a mini
+dialogue, and a multiple-choice practice question) gets generated ONCE
+per pattern, the first time it's ever picked, via Gemini (see
+../llm_enrich.py) and shown as extra "AI" sections alongside the CSV's
+own content - additive and fails soft, same as kanji_drip.py. Cached
+permanently in GRAMMAR_ENRICH_CACHE_PATH and reused on every later
+review of that pattern - never regenerated - so webapp.py's review page
+always shows this exact content, and the AI examples stay a stable
+memory aid instead of reshuffling on every review (see
+llm_enrich.load_cache's docstring for the full rationale).
 Button taps (or, with WEBAPP_BASE_URL set, review-link rating submits)
 are handled entirely by telegram_bot.py's long-polling loop / webapp.py;
 this script only ever sends. State lives in .grammar_srs.json
@@ -246,12 +249,15 @@ def main() -> None:
     api_base = f"https://api.telegram.org/bot{token}"
     picked_keys = [key for key, _ in picks]
 
-    # One fresh AI example + usage tip per picked pattern, generated now
-    # (this push) and cached so the review page (webapp.py, opened
-    # later) shows the exact same content - see kanji_drip.py's identical
-    # comment / llm_enrich.py.
+    # A practice block generated ONCE per pattern, the first time it's
+    # ever picked, then reused on every later review from the persistent
+    # cache - see kanji_drip.py's identical comment / llm_enrich.py.
+    enrich_cache = llm_enrich.load_cache(GRAMMAR_ENRICH_CACHE_PATH)
     enrichments = {}
     for key in picked_keys:
+        if key in enrich_cache:
+            enrichments[key] = enrich_cache[key]
+            continue
         result = llm_enrich.enrich_grammar(row_by_key[key], GRAMMAR_LEVEL)
         if result:
             enrichments[key] = result

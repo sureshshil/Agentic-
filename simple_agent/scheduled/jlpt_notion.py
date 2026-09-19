@@ -267,6 +267,54 @@ def _body_block(text: str, style: str = "paragraph") -> dict:
     }
 
 
+_AUDIO_CONTENT_TYPES = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".ogg": "audio/ogg"}
+
+
+def upload_audio(page_id: str, audio_bytes: bytes, filename: str) -> None:
+    """Uploads `audio_bytes` via Notion's Direct File Upload API and
+    appends it to the page as a playable audio block - used for the
+    Listening section's real narration (see jlpt_instructor.py's
+    edge-tts generation), replacing the old static "Audio: pending"
+    placeholder text. Content-Type is inferred from `filename`'s
+    extension (_AUDIO_CONTENT_TYPES), defaulting to MP3 - edge-tts's own
+    output format, same as the vocab drip's audio. Two Notion API calls:
+    create the upload target, POST the bytes to its upload_url
+    (multipart, so no Content-Type: application/json header - unlike
+    every other call in this module, requests must set its own multipart
+    boundary), then reference the resulting file_upload id in an audio
+    block. `page_id` is unused by the upload itself but kept in the
+    signature so a caller can't accidentally upload without also wiring
+    in where it's meant to be appended."""
+    resp = requests.post(
+        "https://api.notion.com/v1/file_uploads",
+        headers=_headers(),
+        json={},
+        timeout=_TIMEOUT,
+    )
+    _raise_for_api(resp, "Notion create file upload")
+    upload_url = resp.json()["upload_url"]
+    file_upload_id = resp.json()["id"]
+
+    ext = os.path.splitext(filename)[1].lower()
+    content_type = _AUDIO_CONTENT_TYPES.get(ext, "audio/mpeg")
+    send_resp = requests.post(
+        upload_url,
+        headers={"Authorization": _headers()["Authorization"], "Notion-Version": NOTION_VERSION},
+        files={"file": (filename, audio_bytes, content_type)},
+        timeout=_TIMEOUT,
+    )
+    _raise_for_api(send_resp, "Notion send file upload")
+
+    block = {"object": "block", "type": "audio", "audio": {"type": "file_upload", "file_upload": {"id": file_upload_id}}}
+    append_resp = requests.patch(
+        f"https://api.notion.com/v1/blocks/{page_id}/children",
+        headers=_headers(),
+        json={"children": [block]},
+        timeout=_TIMEOUT,
+    )
+    _raise_for_api(append_resp, "Notion append audio block")
+
+
 def append_body_blocks(page_id: str, paragraphs: list) -> None:
     """Appends real page BODY content (not just a property) - each row is
     itself a page and can carry the same "Block 1 / Block 2 / Block 3"
