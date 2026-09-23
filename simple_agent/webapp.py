@@ -120,6 +120,32 @@ def _status_badge(rec: dict, box_hours: list) -> str:
     return f"\U0001f501 Review (box {box + 1}/{len(box_hours)})"
 
 
+def _body_html(lines: list) -> str:
+    """A drip module's build_body_lines output (already HTML-escaped) as
+    one <div class="sec"> per blank-line-separated group, with
+    llm_enrich.SECTION_RULE turned into a real divider - the Telegram
+    spoiler needs that plain-text layout, but in a browser each group
+    reads better as its own styled block than as one pre-line blob."""
+    out = []
+    current = []
+
+    def flush():
+        if current:
+            out.append('<div class="sec">' + "<br>".join(current) + "</div>")
+            current.clear()
+
+    for line in "\n".join(lines).split("\n"):
+        if line == "":
+            flush()
+        elif line == llm_enrich.SECTION_RULE:
+            flush()
+            out.append('<hr class="rule">')
+        else:
+            current.append(line)
+    flush()
+    return "".join(out)
+
+
 def _sign_link(kind: str, keys_raw: str, exp: int, bot_token: str) -> str:
     """HMAC over exactly what a request can present back (kind, the raw
     comma-joined keys string as it appears in the URL, and the expiry) -
@@ -162,55 +188,131 @@ PAGE_TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Review</title>
 <style>
-  :root { color-scheme: light; }
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f1ea; --surface: #fffdf8; --surface-2: #f7f3ea; --text: #1f1d1a; --muted: #77716a;
+    --border: #e6dfd2; --shadow: 0 1px 2px rgba(60, 45, 20, 0.06), 0 8px 24px rgba(60, 45, 20, 0.08);
+    --again: #c8423b; --hard: #c7801f; --good: #2f8a4c; --easy: #2f6fc7;
+    --accent: #b8452f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151412; --surface: #1f1d1a; --surface-2: #26241f; --text: #ece7de; --muted: #9a9389;
+      --border: #34312b; --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.35);
+      --again: #e0655e; --hard: #e09d44; --good: #55b074; --easy: #5b95e3;
+      --accent: #e0765f;
+    }
+  }
+  body.kind-g { --accent: #6d4bc4; }
+  body.kind-v { --accent: #1f8077; }
+  @media (prefers-color-scheme: dark) {
+    body.kind-g { --accent: #a58be8; }
+    body.kind-v { --accent: #4fb8ad; }
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; padding: 16px; padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
-    background: #fafaf7; color: #1a1a1a;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Hiragino Sans",
+      "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic UI", Meiryo, sans-serif;
+    -webkit-font-smoothing: antialiased;
   }
   .deck { max-width: 480px; margin: 0 auto; }
-  .progress { text-align: center; font-size: 14px; opacity: 0.65; margin-bottom: 12px; }
+
+  .topbar { display: flex; justify-content: space-between; align-items: baseline; margin: 4px 2px 8px; }
+  .deck-label { font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+  .progress { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .progress-bar { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; margin-bottom: 16px; }
+  .progress-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.3s ease; }
+
   .card { display: none; }
-  .card.active { display: block; }
-  .badge { font-size: 15px; opacity: 0.75; margin-bottom: 12px; }
-  .kanji-img { width: 100%; max-width: 260px; display: block; margin: 0 auto 18px; border-radius: 12px; }
+  .card.active { display: block; animation: cardIn 0.22s ease; }
+  @keyframes cardIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .surface {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
+    box-shadow: var(--shadow); overflow: hidden;
+  }
+  .front { padding: 16px 16px 24px; border-bottom: 1px solid var(--border); }
+  .badge {
+    display: inline-block; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
+    background: var(--surface-2); color: var(--muted); border: 1px solid var(--border);
+  }
+  .kanji-img {
+    width: 100%; max-width: 220px; display: block; margin: 16px auto 0; border-radius: 14px;
+    background: #fff;
+  }
   .front-text {
-    font-size: 32px; font-weight: 700; text-align: center; padding: 28px 12px;
-    margin-bottom: 18px; background: #fff; border: 1px solid #e5e5e0; border-radius: 12px;
+    font-size: clamp(28px, 9vw, 42px); font-weight: 700; text-align: center; line-height: 1.35;
+    padding: 28px 8px 8px; word-break: keep-all; overflow-wrap: anywhere;
   }
+
+  .answer-wrap { position: relative; }
   .answer {
-    white-space: pre-line; line-height: 1.6; font-size: 16px;
-    padding: 16px; border-radius: 12px; background: #fff; border: 1px solid #e5e5e0;
-    filter: blur(6px); user-select: none; cursor: pointer; transition: filter 0.15s;
-    min-height: 24px;
+    line-height: 1.7; font-size: 16px; padding: 4px 18px 18px;
+    filter: blur(7px); user-select: none; transition: filter 0.2s; min-height: 120px;
   }
-  .answer.revealed { filter: none; user-select: text; cursor: text; }
-  .hint { text-align: center; font-size: 13px; opacity: 0.6; margin: 8px 0 20px; }
+  .answer.revealed { filter: none; user-select: text; }
+  .answer .sec { padding: 14px 0; border-bottom: 1px dashed var(--border); }
+  .answer .sec:last-child { border-bottom: none; }
+  .answer .sec:first-child { font-size: 18px; }
+  .answer b { font-weight: 700; }
+  .answer i { color: var(--muted); }
+  .answer code {
+    font-family: inherit; font-size: 0.92em; padding: 1px 6px; border-radius: 6px;
+    background: var(--surface-2); border: 1px solid var(--border);
+  }
+  .answer hr.rule { border: none; height: 2px; background: var(--accent); opacity: 0.35; margin: 8px 0; border-radius: 1px; }
+  .reveal-btn {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: transparent; border: none; cursor: pointer; font: inherit; color: var(--text);
+  }
+  .reveal-btn span {
+    padding: 10px 20px; border-radius: 999px; font-size: 15px; font-weight: 600;
+    background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow);
+  }
+  .reveal-btn[hidden] { display: none; }
+
+  .hint { text-align: center; font-size: 13px; color: var(--muted); margin: 14px 0 10px; }
   .ratings { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
   .ratings button {
-    padding: 12px 4px; border: none; border-radius: 10px; font-size: 14px; font-weight: 600;
-    cursor: pointer; color: #fff;
+    padding: 12px 4px 10px; border-radius: 14px; font: inherit; font-size: 15px; font-weight: 700;
+    cursor: pointer; color: var(--c); background: var(--surface);
+    border: 1.5px solid color-mix(in srgb, var(--c) 45%, transparent);
+    transition: transform 0.08s, background 0.15s, opacity 0.15s;
   }
-  .ratings button:disabled { opacity: 0.4; }
-  .again { background: #d64545; }
-  .hard { background: #d68c2e; }
-  .good { background: #3a9152; }
-  .easy { background: #2e7dd6; }
-  .nav { display: flex; justify-content: space-between; margin-top: 20px; }
+  .ratings button small { display: block; font-size: 11px; font-weight: 500; opacity: 0.8; margin-top: 2px; }
+  .ratings button:not(:disabled):hover { background: color-mix(in srgb, var(--c) 10%, var(--surface)); }
+  .ratings button:not(:disabled):active { transform: scale(0.96); }
+  .ratings button:disabled { opacity: 0.35; cursor: default; }
+  .ratings button.chosen { opacity: 1; color: #fff; background: var(--c); border-color: var(--c); }
+  .again { --c: var(--again); }
+  .hard { --c: var(--hard); }
+  .good { --c: var(--good); }
+  .easy { --c: var(--easy); }
+
+  .done-check { text-align: center; font-size: 13px; color: var(--good); margin-top: 10px; min-height: 18px; }
+  .nav { display: flex; justify-content: space-between; margin-top: 12px; }
   .nav button {
-    padding: 10px 18px; border: 1px solid #ddd; border-radius: 10px; background: #fff;
-    font-size: 14px; cursor: pointer;
+    padding: 8px 14px; border: none; border-radius: 10px; background: transparent; color: var(--muted);
+    font: inherit; font-size: 14px; cursor: pointer;
   }
-  .nav button:disabled { opacity: 0.35; }
-  .done-check { text-align: center; font-size: 13px; color: #3a9152; margin-top: 10px; min-height: 18px; }
-  .toast { text-align: center; margin-top: 16px; font-size: 15px; min-height: 20px; }
-  .finished { text-align: center; padding: 60px 12px; font-size: 18px; }
+  .nav button:not(:disabled):hover { color: var(--text); background: var(--surface-2); }
+  .nav button:disabled { opacity: 0.3; cursor: default; }
+  .toast { text-align: center; margin-top: 8px; font-size: 14px; min-height: 20px; color: var(--again); }
+  .finished { text-align: center; padding: 56px 16px; }
+  .finished .big { font-size: 44px; margin-bottom: 8px; }
+  .finished .title { font-size: 20px; font-weight: 700; }
+  .finished .sub { font-size: 14px; color: var(--muted); margin-top: 6px; }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
 </head>
-<body>
+<body class="kind-__KIND__">
 <div class="deck">
-  <div class="progress" id="progress"></div>
+  <div class="topbar">
+    <div class="deck-label">__KIND_LABEL__ review</div>
+    <div class="progress" id="progress"></div>
+  </div>
+  <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
   <div id="deckRoot"></div>
   <div class="nav">
     <button id="prevBtn" onclick="go(-1)">&#8249; Prev</button>
@@ -240,43 +342,61 @@ PAGE_TEMPLATE = """<!doctype html>
     el.className = 'card';
     el.id = 'card-' + i;
 
+    var surface = document.createElement('div');
+    surface.className = 'surface';
+    el.appendChild(surface);
+
+    var frontBox = document.createElement('div');
+    frontBox.className = 'front';
+    surface.appendChild(frontBox);
+
     var badge = document.createElement('div');
     badge.className = 'badge';
     badge.textContent = card.badge;
-    el.appendChild(badge);
+    frontBox.appendChild(badge);
 
     if (card.image) {
       var img = document.createElement('img');
       img.className = 'kanji-img';
       img.src = card.image;
       img.alt = card.front;
-      el.appendChild(img);
+      frontBox.appendChild(img);
     } else {
       var front = document.createElement('div');
       front.className = 'front-text';
       front.textContent = card.front;
-      el.appendChild(front);
+      frontBox.appendChild(front);
     }
+
+    var answerWrap = document.createElement('div');
+    answerWrap.className = 'answer-wrap';
+    surface.appendChild(answerWrap);
 
     var answer = document.createElement('div');
     answer.className = 'answer';
+    answer.setAttribute('aria-hidden', 'true');
     answer.innerHTML = card.body_html;
-    answer.addEventListener('click', function () { reveal(i); });
-    el.appendChild(answer);
+    answerWrap.appendChild(answer);
+
+    var revealBtn = document.createElement('button');
+    revealBtn.className = 'reveal-btn';
+    revealBtn.innerHTML = '<span>Show answer</span>';
+    revealBtn.onclick = function () { reveal(i); };
+    answerWrap.appendChild(revealBtn);
 
     var hint = document.createElement('div');
     hint.className = 'hint';
-    hint.textContent = 'Tap the card to reveal, then rate your recall';
+    hint.textContent = 'Try to recall it first, then show the answer';
     el.appendChild(hint);
 
     var ratings = document.createElement('div');
     ratings.className = 'ratings';
-    [['again', 'Again'], ['hard', 'Hard'], ['good', 'Good'], ['easy', 'Easy']].forEach(function (pair) {
+    [['again', 'Again', 'forgot'], ['hard', 'Hard', 'struggled'], ['good', 'Good', 'recalled'], ['easy', 'Easy', 'instant']].forEach(function (opt) {
       var btn = document.createElement('button');
-      btn.className = pair[0];
-      btn.textContent = pair[1];
+      btn.className = opt[0];
+      btn.innerHTML = opt[1] + '<small>' + opt[2] + '</small>';
       btn.disabled = true;
-      btn.onclick = function () { submitRating(i, pair[0]); };
+      btn.onclick = function () { submitRating(i, opt[0]); };
       ratings.appendChild(btn);
     });
     el.appendChild(ratings);
@@ -294,8 +414,11 @@ PAGE_TEMPLATE = """<!doctype html>
     if (revealed[i]) return;
     revealed[i] = true;
     var el = elFor(i);
-    el.querySelector('.answer').classList.add('revealed');
-    el.querySelector('.hint').textContent = 'Rate your recall';
+    var answer = el.querySelector('.answer');
+    answer.classList.add('revealed');
+    answer.removeAttribute('aria-hidden');
+    el.querySelector('.reveal-btn').hidden = true;
+    el.querySelector('.hint').textContent = 'How well did you remember it?';
     if (!rated[i]) {
       el.querySelectorAll('.ratings button').forEach(function (b) { b.disabled = false; });
     }
@@ -303,7 +426,9 @@ PAGE_TEMPLATE = """<!doctype html>
 
   function render() {
     CARDS.forEach(function (_, i) { elFor(i).classList.toggle('active', i === index); });
-    progress.textContent = 'Card ' + (index + 1) + ' of ' + CARDS.length;
+    progress.textContent = (index + 1) + ' / ' + CARDS.length;
+    var ratedCount = rated.filter(function (r) { return r; }).length;
+    document.getElementById('progressFill').style.width = (ratedCount / CARDS.length * 100) + '%';
     document.getElementById('prevBtn').disabled = index === 0;
     document.getElementById('nextBtn').disabled = index === CARDS.length - 1;
     toast.textContent = '';
@@ -339,6 +464,9 @@ PAGE_TEMPLATE = """<!doctype html>
           return;
         }
         rated[i] = true;
+        el.querySelector('.ratings .' + action).classList.add('chosen');
+        document.getElementById('progressFill').style.width =
+          (rated.filter(function (r) { return r; }).length / CARDS.length * 100) + '%';
         el.querySelector('.done-check').textContent =
           '✓ ' + res.body.label + ' — next review in ' + res.body.interval;
         setTimeout(function () {
@@ -356,7 +484,9 @@ PAGE_TEMPLATE = """<!doctype html>
   }
 
   function finish() {
-    root.innerHTML = '<div class="finished">All done for this batch 🎉<br><span style="font-size:14px;opacity:0.6;">You can close this tab now.</span></div>';
+    root.innerHTML = '<div class="finished surface"><div class="big">🎉</div>' +
+      '<div class="title">All done for this batch</div>' +
+      '<div class="sub">You can close this tab now.</div></div>';
     document.querySelector('.nav').style.display = 'none';
   }
 
@@ -437,12 +567,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 # kanji_drip.py/grammar_drip.py have no such thing since
                 # they only ever have one card type per item.
                 front = module.card_front(key, row)
-                body_html = "\n".join(
+                body_html = _body_html(
                     module.build_body_lines(row, enrich_cache.get(module.base_word(key)), key=key)
-                ).replace("\n", "<br>")
+                )
             else:
                 front = (row.get(cfg["front_field"]) or "").strip()
-                body_html = "\n".join(module.build_body_lines(row, enrich_cache.get(key))).replace("\n", "<br>")
+                body_html = _body_html(module.build_body_lines(row, enrich_cache.get(key)))
             card = {
                 "key": key,
                 "badge": _status_badge(rec, cfg["box_hours"]),
@@ -459,7 +589,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         cards_json = json.dumps(cards, ensure_ascii=False).replace("</", "<\\/")
         page = (
-            PAGE_TEMPLATE.replace("__KIND__", kind)
+            PAGE_TEMPLATE.replace("__KIND_LABEL__", cfg["label"])
+            .replace("__KIND__", kind)
             .replace("__CARDS_JSON__", cards_json)
             .replace("__KEYS_RAW__", json.dumps(keys_raw))
             .replace("__EXP__", json.dumps(exp))

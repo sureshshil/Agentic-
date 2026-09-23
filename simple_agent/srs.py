@@ -58,10 +58,25 @@ State shape (one JSON file per deck, e.g. .kanji_srs.json):
 Box tables are hours-until-next-review at each box, tuned to each deck's
 cadence (kanji hourly, grammar every 2h) so a fresh item's first review
 lands roughly one cadence step later, not days out.
+
+Rating rules (record_review) - plain Leitner, with a few standard tweaks:
+  - "again" halves the box index instead of resetting to 0, so one slip on
+    a month-old item costs a few boxes, not all of them.
+  - "hard" keeps the box (same interval again) - it means "recalled, with
+    effort", not "forgot".
+  - "good"/"easy" first credit a late review: if you recalled it after
+    longer than a higher box's interval, you're treated as already in that
+    box before advancing.
+  - Intervals of a day or more get +/-10% fuzz so items introduced
+    together drift apart instead of always coming due in one clump.
+A "leech" (is_leech) is an item with LEECH_LAPSES+ lifetime lapses that
+still hasn't climbed to LEECH_CLEAR_BOX - derived from existing fields,
+not stored, so it needs no migration and clears itself once learned.
 """
 
 import json
 import os
+import random
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -77,6 +92,14 @@ BOX_HOURS_GRAMMAR = [2, 6, 16, 40, 96, 240, 600, 1440]
 # words per push instead of one, via pick_batch() below.
 BOX_HOURS_VOCAB = [2, 6, 16, 40, 96, 240, 600, 1440]
 
+# Below a day the drip cadence already jitters due times by up to an
+# hour or two, so fuzz only matters (and is only applied) past this.
+FUZZ_MIN_HOURS = 24
+FUZZ_FRACTION = 0.1
+
+LEECH_LAPSES = 6
+LEECH_CLEAR_BOX = 4
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -86,7 +109,7 @@ def format_interval(hours: float) -> str:
     if hours < 24:
         return f"{hours:g}h"
     days = hours / 24
-    return f"{days:g}d"
+    return f"{round(days, 1):g}d"
 
 
 def load_state(path: str) -> dict:
@@ -212,9 +235,39 @@ def pick_batch(
     return picks
 
 
-def record_review(state: dict, key: str, action: str, box_hours: list, now: datetime) -> float:
+def _credited_box(rec: dict, box: int, box_hours: list, now: datetime) -> int:
+    """The highest box whose interval you've already survived since the
+    last rating - `box` itself if the review was on time (or this is the
+    first rating). Recalling something 3 days after a 20h interval is
+    evidence you'd have passed the 48h box too."""
+    last = rec.get("last_reviewed")
+    if not last:
+        return box
+    elapsed_hours = (now - datetime.fromisoformat(last)).total_seconds() / 3600
+    credited = box
+    for i in range(box + 1, len(box_hours)):
+        if box_hours[i] <= elapsed_hours:
+            credited = i
+    return credited
+
+
+def _fuzz(hours: float, rng) -> float:
+    if hours < FUZZ_MIN_HOURS:
+        return hours
+    return float(round(hours * rng.uniform(1 - FUZZ_FRACTION, 1 + FUZZ_FRACTION)))
+
+
+def is_leech(rec: dict) -> bool:
+    """Repeatedly forgotten and still not stable - worth a mnemonic or a
+    different angle, not just more of the same reviews."""
+    return rec.get("lapses", 0) >= LEECH_LAPSES and rec.get("box", 0) < LEECH_CLEAR_BOX
+
+
+def record_review(state: dict, key: str, action: str, box_hours: list, now: datetime, rng=random) -> float:
     """Apply a rating to `key` (mutates `state` in place) and return the
-    resulting interval in hours until it's next due."""
+    resulting interval in hours until it's next due. See the module
+    docstring for the rating rules; `rng` is only for fuzz, so tests can
+    pin it."""
     if action not in ACTIONS:
         raise ValueError(f"unknown action: {action!r}")
 
@@ -224,16 +277,15 @@ def record_review(state: dict, key: str, action: str, box_hours: list, now: date
     top = len(box_hours) - 1
 
     if action == "again":
-        box = 0
+        box = box // 2
         rec["lapses"] = rec.get("lapses", 0) + 1
-    elif action == "hard":
-        box = max(0, box - 1)
     elif action == "good":
-        box = min(box + 1, top)
+        box = min(_credited_box(rec, box, box_hours, now) + 1, top)
     elif action == "easy":
-        box = min(box + 2, top)
+        box = min(_credited_box(rec, box, box_hours, now) + 2, top)
+    # "hard": box unchanged
 
-    interval_hours = box_hours[box]
+    interval_hours = _fuzz(box_hours[box], rng)
     rec["box"] = box
     rec["reps"] = rec.get("reps", 0) + 1
     rec["last_result"] = action
@@ -272,10 +324,10 @@ def due_items(state: dict, now: datetime, limit: int = 5) -> list:
 
 def weakest_items(state: dict, limit: int = 5) -> list:
     """Up to `limit` item keys with at least one lapse, worst first (most
-    lapses, then lowest box) - so there's always something worth quizzing
-    even when nothing is strictly due yet."""
+    lapses, then lowest box, with leeches ahead of everything) - so there's
+    always something worth quizzing even when nothing is strictly due yet."""
     candidates = [(key, rec) for key, rec in state.items() if rec.get("lapses", 0) > 0]
-    candidates.sort(key=lambda kv: (-kv[1].get("lapses", 0), kv[1].get("box", 0)))
+    candidates.sort(key=lambda kv: (not is_leech(kv[1]), -kv[1].get("lapses", 0), kv[1].get("box", 0)))
     return [key for key, _rec in candidates[:limit]]
 
 
@@ -305,10 +357,12 @@ def deck_stats(state: dict, now: datetime) -> dict:
     box_counts: dict = {}
     total_lapses = 0
     due_now = 0
+    leeches = 0
     for rec in state.values():
         box = rec.get("box", 0)
         box_counts[box] = box_counts.get(box, 0) + 1
         total_lapses += rec.get("lapses", 0)
+        leeches += is_leech(rec)
         due = rec.get("due")
         if due and due <= now_iso:
             due_now += 1
@@ -317,6 +371,7 @@ def deck_stats(state: dict, now: datetime) -> dict:
         "due_now": due_now,
         "box_counts": box_counts,
         "total_lapses": total_lapses,
+        "leeches": leeches,
     }
 
 

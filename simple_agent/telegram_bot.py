@@ -526,9 +526,10 @@ def _format_deck_stats(label: str, stats: dict) -> str:
     if stats["total"] == 0:
         return f"{label}: no items introduced yet."
     box_line = ", ".join(f"box {b}: {c}" for b, c in sorted(stats["box_counts"].items()))
+    leech_part = f", {stats['leeches']} leech(es)" if stats.get("leeches") else ""
     return (
         f"{label}: {stats['total']} item(s) total, {stats['due_now']} due now, "
-        f"{stats['total_lapses']} lifetime lapse(s) ({box_line})"
+        f"{stats['total_lapses']} lifetime lapse(s){leech_part} ({box_line})"
     )
 
 
@@ -561,6 +562,8 @@ def srs_due_items(deck: str, limit: int = 5) -> str:
         notes = rec.get("notes")
         if notes:
             note_hint = f", last note: {notes[-1]['note']}"
+        if srs.is_leech(rec):
+            note_hint += ", LEECH - keeps being forgotten; try a mnemonic or contrast it with what it's confused with"
         lines.append(
             f"{key} (box {rec.get('box', 0)}, {rec.get('lapses', 0)} lapse(s), "
             f"last rated: {rec.get('last_result', 'never')}{note_hint})"

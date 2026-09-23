@@ -34,16 +34,60 @@ class RecordReviewTest(unittest.TestCase):
         srs.record_review(state, "決", "easy", BOX_HOURS, NOW)
         self.assertEqual(state["決"]["box"], len(BOX_HOURS) - 1)
 
-    def test_again_resets_to_box_zero_and_counts_a_lapse(self):
+    def test_again_halves_the_box_and_counts_a_lapse(self):
         state = {"決": {"box": 3, "reps": 5, "lapses": 0}}
         srs.record_review(state, "決", "again", BOX_HOURS, NOW)
-        self.assertEqual(state["決"]["box"], 0)
+        self.assertEqual(state["決"]["box"], 1)
         self.assertEqual(state["決"]["lapses"], 1)
 
-    def test_hard_drops_one_box_but_not_below_zero(self):
-        state = {"決": {"box": 0, "reps": 1, "lapses": 0}}
-        srs.record_review(state, "決", "hard", BOX_HOURS, NOW)
+    def test_again_from_box_one_lands_in_box_zero(self):
+        state = {"決": {"box": 1, "reps": 1, "lapses": 0}}
+        srs.record_review(state, "決", "again", BOX_HOURS, NOW)
         self.assertEqual(state["決"]["box"], 0)
+
+    def test_hard_keeps_the_box(self):
+        state = {"決": {"box": 2, "reps": 3, "lapses": 0}}
+        interval = srs.record_review(state, "決", "hard", BOX_HOURS, NOW)
+        self.assertEqual(state["決"]["box"], 2)
+        self.assertEqual(interval, BOX_HOURS[2])
+
+    def test_good_on_time_gets_no_late_credit(self):
+        last = (NOW - timedelta(hours=BOX_HOURS[1])).isoformat()
+        state = {"決": {"box": 1, "reps": 1, "lapses": 0, "last_reviewed": last}}
+        srs.record_review(state, "決", "good", BOX_HOURS, NOW)
+        self.assertEqual(state["決"]["box"], 2)
+
+    def test_good_after_a_long_gap_credits_the_boxes_survived(self):
+        # Box 1 (3h) item recalled 10h later - past box 2's 8h too.
+        last = (NOW - timedelta(hours=10)).isoformat()
+        state = {"決": {"box": 1, "reps": 1, "lapses": 0, "last_reviewed": last}}
+        srs.record_review(state, "決", "good", BOX_HOURS, NOW)
+        self.assertEqual(state["決"]["box"], 3)
+
+    def test_hard_after_a_long_gap_gets_no_late_credit(self):
+        last = (NOW - timedelta(hours=10)).isoformat()
+        state = {"決": {"box": 1, "reps": 1, "lapses": 0, "last_reviewed": last}}
+        srs.record_review(state, "決", "hard", BOX_HOURS, NOW)
+        self.assertEqual(state["決"]["box"], 1)
+
+    def test_long_intervals_are_fuzzed_within_ten_percent(self):
+        class FixedRng:
+            def uniform(self, a, b):
+                return b
+
+        state = {"決": {"box": 0, "reps": 1, "lapses": 0}}
+        interval = srs.record_review(state, "決", "good", [1, 100], NOW, rng=FixedRng())
+        self.assertEqual(interval, 110)
+        self.assertEqual(datetime.fromisoformat(state["決"]["due"]), NOW + timedelta(hours=110))
+
+    def test_short_intervals_are_not_fuzzed(self):
+        class FixedRng:
+            def uniform(self, a, b):
+                return b
+
+        state = {}
+        interval = srs.record_review(state, "決", "good", BOX_HOURS, NOW, rng=FixedRng())
+        self.assertEqual(interval, BOX_HOURS[1])
 
     def test_due_date_is_now_plus_the_new_box_interval(self):
         state = {}
@@ -285,6 +329,31 @@ class WeakestItemsTest(unittest.TestCase):
         }
         self.assertEqual(srs.weakest_items(state), ["作", "決"])
 
+    def test_leeches_come_first(self):
+        state = {
+            "決": {"box": 5, "reps": 20, "lapses": 8},  # many lapses, but now stable
+            "作": {"box": 1, "reps": 9, "lapses": srs.LEECH_LAPSES},
+        }
+        self.assertEqual(srs.weakest_items(state), ["作", "決"])
+
+
+class LeechTest(unittest.TestCase):
+    def test_enough_lapses_in_a_low_box_is_a_leech(self):
+        self.assertTrue(srs.is_leech({"box": 0, "lapses": srs.LEECH_LAPSES}))
+
+    def test_too_few_lapses_is_not(self):
+        self.assertFalse(srs.is_leech({"box": 0, "lapses": srs.LEECH_LAPSES - 1}))
+
+    def test_climbing_past_the_clear_box_stops_being_one(self):
+        self.assertFalse(srs.is_leech({"box": srs.LEECH_CLEAR_BOX, "lapses": srs.LEECH_LAPSES}))
+
+
+class FormatIntervalTest(unittest.TestCase):
+    def test_days_are_rounded_to_one_decimal(self):
+        self.assertEqual(srs.format_interval(130), "5.4d")
+        self.assertEqual(srs.format_interval(720), "30d")
+        self.assertEqual(srs.format_interval(8), "8h")
+
 
 class ReviewCandidatesTest(unittest.TestCase):
     def test_due_items_come_before_weak_items(self):
@@ -315,6 +384,7 @@ class DeckStatsTest(unittest.TestCase):
         self.assertEqual(stats["due_now"], 1)
         self.assertEqual(stats["total_lapses"], 1)
         self.assertEqual(stats["box_counts"], {1: 2, 0: 1})
+        self.assertEqual(stats["leeches"], 0)
 
     def test_empty_state(self):
         stats = srs.deck_stats({}, NOW)
