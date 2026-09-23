@@ -33,6 +33,24 @@ tab-separated row per word):
 `frame` is the 助詞 / particle-pattern line; `note` is unused here. The
 three sentences already carry inline [furigana].
 
+Two card types per word, Anki-style recognition/production split (see
+2026-09 discussion): a RECOGNITION card (front = word+furigana, everything
+else behind the spoiler) is what every word gets from the start and is
+the only thing that drives new-word introduction (VOCAB_NEW_PER_DAY). Once
+a word's recognition card has survived enough real reviews to reach
+VOCAB_PRODUCTION_MIN_BOX, a second PRODUCTION card unlocks for that same
+word (front = meaning only, back = word+furigana+reading+particles+
+examples) - the harder "given the meaning, produce the word and use it
+correctly" direction. Production cards are gated on maturity and capped at
+VOCAB_PRODUCTION_PER_DAY/day, deliberately separate from
+VOCAB_NEW_PER_DAY, so testing production on words you already recognize
+never competes with the budget for meeting brand-new words - see
+_unlock_production_cards. Both card types for a word share one row, one
+TSV lookup, and one cached enrichment block, but get their OWN independent
+srs.py state entry (key vs. key+PRODUCTION_SUFFIX), so each is scheduled
+on its own actual forgetting curve instead of one rating trying to cover
+both skills at once.
+
 Optionally, ON TOP of that curated content, a full AI practice block
 (2-3 example sentences, a short explanation, a mini dialogue, and a
 multiple-choice practice question) gets generated ONCE per word, the
@@ -69,6 +87,12 @@ telegram_bot.py - real environment variables always win):
   VOCAB_LEVEL               optional, default "N3" (JLPT level, label only)
   VOCAB_BATCH_SIZE          optional, default 10 (words per push)
   VOCAB_NEW_PER_DAY         optional, default 16 (new words introduced/UTC day)
+  VOCAB_PRODUCTION_MIN_BOX  optional, default 3 (srs.py box a word's
+                            recognition card must reach before its
+                            production card unlocks - see module docstring)
+  VOCAB_PRODUCTION_PER_DAY  optional, default 5 (production cards
+                            unlocked/UTC day - own budget, separate from
+                            VOCAB_NEW_PER_DAY)
   VOCAB_UNRATED_RESURFACE_HOURS  optional, default 3 (see srs.pick_next).
                             Only relevant to the plain-text fallback
                             below (WEBAPP_BASE_URL unset): a sent-but-
@@ -128,6 +152,8 @@ import webapp  # noqa: E402 - needs sys.path insert above
 VOCAB_LEVEL = os.environ.get("VOCAB_LEVEL") or "N3"
 VOCAB_BATCH_SIZE = int(os.environ.get("VOCAB_BATCH_SIZE") or "10")
 VOCAB_NEW_PER_DAY = int(os.environ.get("VOCAB_NEW_PER_DAY") or "16")
+VOCAB_PRODUCTION_MIN_BOX = int(os.environ.get("VOCAB_PRODUCTION_MIN_BOX") or "3")
+VOCAB_PRODUCTION_PER_DAY = int(os.environ.get("VOCAB_PRODUCTION_PER_DAY") or "5")
 VOCAB_UNRATED_RESURFACE_HOURS = float(os.environ.get("VOCAB_UNRATED_RESURFACE_HOURS") or "3")
 VOCAB_TSV_GLOB = os.environ.get("VOCAB_TSV_GLOB") or os.path.join(
     _SIMPLE_AGENT_DIR, "N3_vocab_batch*.tsv"
@@ -199,12 +225,34 @@ def load_rows(glob_pattern: str) -> list:
     return rows
 
 
+# Appended to a word to make its production-card srs.py state key (see
+# module docstring) - "::" can't appear in a TSV word column, and is safe
+# inside telegram_bot.py's "|"-delimited SRS callback_data (handle_srs_
+# callback splits on "|" only, so this never collides with that parsing).
+PRODUCTION_SUFFIX = "::production"
+
+
+def production_key(word: str) -> str:
+    return word + PRODUCTION_SUFFIX
+
+
+def is_production_key(key: str) -> bool:
+    return key.endswith(PRODUCTION_SUFFIX)
+
+
+def base_word(key: str) -> str:
+    """`key` with any production suffix stripped - the TSV word either
+    card type's content actually comes from."""
+    return key[: -len(PRODUCTION_SUFFIX)] if is_production_key(key) else key
+
+
 def find_row(key: str) -> dict:
-    """The TSV row for one word, or None - used by webapp.py to look up
-    a card's content from its review link (see main()'s WEBAPP_BASE_URL
-    branch)."""
+    """The TSV row for one word (or its production-card key - see
+    base_word), or None - used by webapp.py to look up a card's content
+    from its review link (see main()'s WEBAPP_BASE_URL branch)."""
+    word = base_word(key)
     for row in load_rows(VOCAB_TSV_GLOB):
-        if (row.get("word") or "").strip() == key:
+        if (row.get("word") or "").strip() == word:
             return row
     return None
 
@@ -233,7 +281,20 @@ def row_to_entry(row: dict) -> dict:
     }
 
 
-def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
+def card_front(key: str, row: dict) -> str:
+    """Plain-text front-card prompt for `key` - the meaning alone for a
+    production card (see is_production_key: everything else, including
+    the word itself, is what production is testing), or the ordinary
+    word+furigana front for a ordinary recognition card. Used directly by
+    webapp.py's browser flow; format_word_block below builds the
+    HTML-escaped equivalent for the direct-Telegram-message flow."""
+    entry = row_to_entry(row)
+    if is_production_key(key):
+        return entry["meaning"] or entry["word"]
+    return row.get("word_furigana") or entry["word"]
+
+
+def build_body_lines(row: dict, enrichment: dict | None = None, key: str | None = None) -> list:
     """Reading/meaning/particles/examples for one word, as a list of
     HTML-escaped lines (see kanji_drip.build_body_lines - same
     join-with-'\\n' convention, shared by format_word_block's
@@ -242,20 +303,42 @@ def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
     present, its AI-generated practice block (examples, explanation,
     dialogue, practice question - see llm_enrich.format_blocks) is
     appended after the curated content; the curated content itself is
-    never replaced."""
+    never replaced. `key` - pass the SRS key being rendered so a
+    production card's spoiler leads with the word+furigana itself (the
+    one thing its front, unlike a recognition card's, doesn't already
+    show - see card_front)."""
     entry = row_to_entry(row)
-    lines = [
-        f"{html.escape(entry['reading'])} — {html.escape(entry['meaning'])}"
-    ]
+    lines = []
+    if key is not None and is_production_key(key):
+        lines.append(f"\U0001f210 <b>{_fx(row.get('word_furigana') or entry['word'])}</b>")
+    lines.append(
+        f"\U0001f524 <b>{html.escape(entry['reading'])}</b> · {html.escape(entry['meaning'])}"
+    )
     if entry["nepali"]:
         lines.append(f"\U0001f1f3\U0001f1f5 {html.escape(entry['nepali'])}")
     if entry["particles"]:
-        lines.append(f"助詞: {_fx(entry['particles'])}")
+        patterns = llm_enrich.vocab_patterns(entry["particles"])
+        lines.append("")
+        lines.append("\U0001f9e9 <b>Particles</b>")
+        if len(patterns) > 1:
+            # Numbered to match the AI examples below 1:1 (see
+            # llm_enrich.enrich_vocab/_align_vocab_examples) - each
+            # Example's pattern tag corresponds to the same-numbered line
+            # here, so a learner can see at a glance which pattern each
+            # example demonstrates.
+            for i, p in enumerate(patterns, 1):
+                lines.append(f"{i}. <code>{_fx(p)}</code>")
+        else:
+            lines.append(" ｜ ".join(f"<code>{_fx(p)}</code>" for p in patterns))
     if entry["examples"]:
         lines.append("")
-        lines.append("例文:")
+        lines.append(llm_enrich.SECTION_RULE)
+        lines.append("\U0001f4dd <b>Examples</b>")
         for i, example in enumerate(entry["examples"], 1):
-            lines.append(f"{i}. {html.escape(example)}")
+            jp, _, en = example.partition(" — ")
+            lines.append(f"{i}. {html.escape(jp)}")
+            if en:
+                lines.append(f"<i>{html.escape(en)}</i>")
 
     if enrichment:
         for block in llm_enrich.format_blocks(enrichment):
@@ -265,20 +348,64 @@ def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
     return lines
 
 
-def format_word_block(row: dict, status: str, enrichment: dict | None = None) -> str:
+def format_word_block(row: dict, status: str, enrichment: dict | None = None, key: str | None = None) -> str:
     """One word's HTML (parse_mode=HTML) block within a batch message:
-    the word itself visible, everything else under its own <tg-spoiler>
+    the front (word+furigana, or just the meaning for a production card -
+    see card_front) visible, everything else under its own <tg-spoiler>
     (each spoiler in a message reveals independently on tap). `status` is
-    "new" / "due" / "reminder" - see kanji_drip.format_card. `enrichment`
-    - see build_body_lines."""
+    "new" / "due" / "reminder" - see kanji_drip.format_card. `enrichment`,
+    `key` - see build_body_lines."""
     entry = row_to_entry(row)
-    lines = build_body_lines(row, enrichment)
+    lines = build_body_lines(row, enrichment, key=key)
     marker = _STATUS_MARKERS[status]
-    return f"{marker} <b>{_fx(row.get('word_furigana') or entry['word'])}</b>\n<tg-spoiler>{chr(10).join(lines)}</tg-spoiler>"
+    if key is not None and is_production_key(key):
+        front = html.escape(entry["meaning"] or entry["word"])
+    else:
+        front = _fx(row.get("word_furigana") or entry["word"])
+    return f"{marker} <b>{front}</b>\n<tg-spoiler>{chr(10).join(lines)}</tg-spoiler>"
 
 
 def build_message(blocks: list) -> str:
     return "\n\n".join(blocks)
+
+
+# Max stale cached practice blocks regenerated per run (see main()).
+VOCAB_STALE_REGEN_PER_RUN = 3
+
+
+def _unlock_production_cards(keys: list, state: dict, now) -> list:
+    """Creates a fresh srs.py state entry (box 0, no "due" yet - same
+    shape pick_next gives a brand-new item) for every word whose
+    RECOGNITION card has reached VOCAB_PRODUCTION_MIN_BOX and doesn't
+    already have a production card, capped at VOCAB_PRODUCTION_PER_DAY
+    per UTC day. Mutates `state` in place; returns the list of newly
+    created production keys so the caller can fold them into this run's
+    picks (they're never picked via srs.pick_batch's own new-item path,
+    which only ever considers `keys` themselves - see main()). A
+    deliberately separate daily counter from VOCAB_NEW_PER_DAY: unlocking
+    production for an already-known word is a maturity-gated second pass,
+    not a brand-new introduction, so it must never eat into the budget
+    for meeting words for the first time."""
+    today = now.date().isoformat()
+    unlocked_today = sum(
+        1
+        for key, rec in state.items()
+        if is_production_key(key) and rec.get("introduced_at", "")[:10] == today
+    )
+    newly_unlocked = []
+    for word in keys:
+        if unlocked_today >= VOCAB_PRODUCTION_PER_DAY:
+            break
+        rec = state.get(word)
+        if not rec or rec.get("box", 0) < VOCAB_PRODUCTION_MIN_BOX:
+            continue
+        pkey = production_key(word)
+        if pkey in state:
+            continue
+        state[pkey] = {"box": 0, "reps": 0, "lapses": 0, "introduced_at": now.isoformat()}
+        newly_unlocked.append(pkey)
+        unlocked_today += 1
+    return newly_unlocked
 
 
 def main() -> None:
@@ -299,10 +426,29 @@ def main() -> None:
 
     state = srs.load_state(VOCAB_SRS_PATH)
     now = srs.now_utc()
+
+    # Unlock production cards for any word whose recognition card has
+    # matured enough (own budget - see _unlock_production_cards) BEFORE
+    # picking this run's batch, so a freshly unlocked one can go out
+    # straight away instead of waiting for a future run to notice it.
+    newly_unlocked = _unlock_production_cards(keys, state, now)
+
+    # Already-unlocked production keys need to be in the pool pick_batch
+    # scans for DUE reviews (it only ever treats a key as "new" when it's
+    # not already in `state`, which every production key we pass here
+    # already is - by construction, from a previous run's unlock - so
+    # this can never double-introduce one or double-count it against
+    # VOCAB_NEW_PER_DAY). `newly_unlocked` keys are handled separately
+    # below, not through this pool, since they must count against
+    # VOCAB_PRODUCTION_PER_DAY, never VOCAB_NEW_PER_DAY.
+    existing_production_keys = [
+        k for k in state if is_production_key(k) and k not in newly_unlocked
+    ]
     picks = srs.pick_batch(
-        keys, state, now, VOCAB_BATCH_SIZE, VOCAB_NEW_PER_DAY,
+        keys + existing_production_keys, state, now, VOCAB_BATCH_SIZE, VOCAB_NEW_PER_DAY,
         unrated_resurface_hours=VOCAB_UNRATED_RESURFACE_HOURS,
     )
+    picks += [(pkey, True) for pkey in newly_unlocked]
 
     if not picks:
         print(
@@ -311,30 +457,48 @@ def main() -> None:
         )
         return
 
-    srs.save_state(VOCAB_SRS_PATH, state)  # pick_batch already recorded any new intros
+    srs.save_state(VOCAB_SRS_PATH, state)  # pick_batch/_unlock_production_cards already recorded any new intros
 
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = str(os.environ["TELEGRAM_ALLOWED_CHAT_ID"])
     api_base = f"https://api.telegram.org/bot{token}"
     picked_keys = [key for key, _ in picks]
-    entries = [row_to_entry(row_by_key[key]) for key in picked_keys]
+    # One entry per unique WORD touched this run (recognition and
+    # production keys for the same word collapse to one), preserving
+    # first-seen order - both card types share the same TSV row/
+    # enrichment/sink entry, there's nothing production-specific to add.
+    words_this_run = list(dict.fromkeys(base_word(key) for key in picked_keys))
+    entries = [row_to_entry(row_by_key[word]) for word in words_this_run]
 
     # A practice block generated ONCE per word, the first time it's ever
-    # picked, then reused on every later review from the persistent cache
-    # - see kanji_drip.py's identical comment / llm_enrich.py. No-op
-    # (skipped/None) when GCP_PROJECT_ID isn't set or the lifetime cost
-    # cap has been reached; either way the curated TSV content below is
-    # unaffected.
+    # picked (by either card type), then reused on every later review
+    # from the persistent cache - see kanji_drip.py's identical comment /
+    # llm_enrich.py. No-op (skipped/None) when GCP_PROJECT_ID isn't set or
+    # the lifetime cost cap has been reached; either way the curated TSV
+    # content below is unaffected.
     enrich_cache = llm_enrich.load_cache(VOCAB_ENRICH_CACHE_PATH)
     enrichments = {}
-    for key in picked_keys:
-        if key in enrich_cache:
-            enrichments[key] = enrich_cache[key]
+    regenerated = 0
+    for word in words_this_run:
+        cached = enrich_cache.get(word)
+        stale = cached is not None and llm_enrich.vocab_entry_is_stale(row_by_key[word], cached)
+        if cached is not None:
+            enrichments[word] = cached  # also the fallback if a stale entry can't be refreshed
+        # Refreshing a stale (pre full-particle-coverage) entry is a
+        # backlog, not urgent: cap it per run so a batch of 10 old
+        # entries can't fire 10 back-to-back Gemini calls and hit
+        # Vertex's 429 rate limit (which would also starve brand-new
+        # words of their first enrichment).
+        if stale and regenerated >= VOCAB_STALE_REGEN_PER_RUN:
             continue
-        result = llm_enrich.enrich_vocab(row_by_key[key], VOCAB_LEVEL)
+        if cached is not None and not stale:
+            continue
+        if stale:
+            regenerated += 1
+        result = llm_enrich.enrich_vocab(row_by_key[word], VOCAB_LEVEL)
         if result:
-            enrichments[key] = result
-            llm_enrich.save_cache_entry(VOCAB_ENRICH_CACHE_PATH, key, result)
+            enrichments[word] = result
+            llm_enrich.save_cache_entry(VOCAB_ENRICH_CACHE_PATH, word, result)
 
     if WEBAPP_BASE_URL:
         # One short message with a single "Open in browser" button that
@@ -351,8 +515,9 @@ def main() -> None:
         for key, is_new in picks:
             rec = state.get(key, {})
             status = "new" if is_new else ("due" if rec.get("due") else "reminder")
-            row = row_by_key[key]
-            blocks.append(format_word_block(row, status, enrichments.get(key)))
+            word = base_word(key)
+            row = row_by_key[word]
+            blocks.append(format_word_block(row, status, enrichments.get(word), key=key))
             statuses.append(f"{key} ({status})")
 
         print(build_message(blocks))  # cron log only - not what gets sent

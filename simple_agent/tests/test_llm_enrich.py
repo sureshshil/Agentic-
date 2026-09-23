@@ -195,7 +195,7 @@ class EnrichKanjiGrammarTest(unittest.TestCase):
             "frame": "AはBを含む／Aを含めて／Bが含まれている",
         }
         llm_enrich.enrich_vocab(row, "N3")
-        self.assertIn("AはBを含む／Aを含めて／Bが含まれている", captured["prompt"])
+        self.assertIn("AはBを含む | Aを含めて | Bが含まれている", captured["prompt"])
 
     def test_enrich_vocab_omits_frame_instructions_when_frame_is_blank(self):
         captured = {}
@@ -220,11 +220,11 @@ class FormatBlocksTest(unittest.TestCase):
         }
         blocks = llm_enrich.format_blocks(enrichment)
         self.assertEqual(len(blocks), 2)
-        self.assertIn("例文1", blocks[0])
+        self.assertIn("Example 1", blocks[0])
         self.assertIn("決[き]めた。", blocks[0])
         self.assertIn("きめた。", blocks[0])
         self.assertIn("I decided.", blocks[0])
-        self.assertIn("例文2", blocks[1])
+        self.assertIn("Example 2", blocks[1])
 
     def test_renders_examples_without_reading_field(self):
         enrichment = {"examples": [{"jp": "決[き]めた。", "en": "I decided."}]}
@@ -236,7 +236,7 @@ class FormatBlocksTest(unittest.TestCase):
     def test_renders_explanation_block(self):
         blocks = llm_enrich.format_blocks({"explanation": "Uses casual speech because it's a diary entry."})
         self.assertEqual(len(blocks), 1)
-        self.assertIn("解説", blocks[0])
+        self.assertIn("Explanation", blocks[0])
         self.assertIn("diary entry", blocks[0])
 
     def test_renders_dialogue_block_with_all_turns(self):
@@ -248,7 +248,7 @@ class FormatBlocksTest(unittest.TestCase):
         }
         blocks = llm_enrich.format_blocks(enrichment)
         self.assertEqual(len(blocks), 1)
-        self.assertIn("会話", blocks[0])
+        self.assertIn("Dialogue", blocks[0])
         self.assertIn("もう決[き]めた？", blocks[0])
         self.assertIn("うん、決[き]めたよ。", blocks[0])
 
@@ -262,10 +262,10 @@ class FormatBlocksTest(unittest.TestCase):
         }
         blocks = llm_enrich.format_blocks(enrichment)
         self.assertEqual(len(blocks), 1)
-        self.assertIn("クイズ", blocks[0])
-        self.assertIn("A) 決[き]めた", blocks[0])
-        self.assertIn("D) 決[き]められた", blocks[0])
-        self.assertIn("答え: 決[き]めた", blocks[0])
+        self.assertIn("Quiz", blocks[0])
+        self.assertIn("<b>A)</b> 決[き]めた", blocks[0])
+        self.assertIn("<b>D)</b> 決[き]められた", blocks[0])
+        self.assertIn("<b>Answer:</b> 決[き]めた", blocks[0])
 
     def test_missing_sections_are_simply_omitted(self):
         self.assertEqual(llm_enrich.format_blocks({}), [])
@@ -318,3 +318,27 @@ class FuriganaAnnotateTest(unittest.TestCase):
     def test_leaves_kana_and_ascii_alone(self):
         import furigana
         self.assertEqual(furigana.annotate("ひらがな ABC"), "ひらがな ABC")
+
+
+class VocabPatternCoverageTest(unittest.TestCase):
+    def test_vocab_patterns_splits_on_slash_and_middle_dot(self):
+        self.assertEqual(
+            llm_enrich.vocab_patterns("目標を立てる・達成する／目標に向かって"),
+            ["目標を立てる", "達成する", "目標に向かって"],
+        )
+        self.assertEqual(llm_enrich.vocab_patterns(""), [])
+
+    def test_entry_is_stale_until_it_records_every_pattern(self):
+        row = {"frame": "〜の目的／目的を持つ／V-る目的で"}
+        patterns = llm_enrich.vocab_patterns(row["frame"])
+        self.assertTrue(llm_enrich.vocab_entry_is_stale(row, {"examples": []}))
+        self.assertFalse(llm_enrich.vocab_entry_is_stale(row, {"patterns_covered": patterns}))
+
+    def test_single_pattern_rows_are_never_stale(self):
+        self.assertFalse(llm_enrich.vocab_entry_is_stale({"frame": "〜の目的"}, {}))
+
+    def test_format_blocks_tags_each_example_with_its_pattern(self):
+        blocks = llm_enrich.format_blocks(
+            {"examples": [{"pattern": "目的を持つ", "jp": "目的を持つ。", "en": "Have a purpose."}]}
+        )
+        self.assertIn("<code>目的を持つ</code>", blocks[0])

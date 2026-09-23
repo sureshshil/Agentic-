@@ -78,7 +78,7 @@ _KIND_CONFIG = {
     },
     "v": {
         "module": "vocab_drip", "env_var": "VOCAB_SRS_PATH", "default_path": ".vocab_srs.json",
-        "box_hours": srs.BOX_HOURS_VOCAB, "front_field": "word", "has_image": False, "label": "Vocab",
+        "box_hours": srs.BOX_HOURS_VOCAB, "front_field": "word_furigana", "has_image": False, "label": "Vocab",
         "enrich_env_var": "VOCAB_ENRICH_CACHE_PATH", "enrich_default_path": ".vocab_enrich_cache.json",
     },
 }
@@ -428,11 +428,25 @@ class ReviewHandler(BaseHTTPRequestHandler):
             # the unrated-resurface timer for every card in it (see
             # srs.mark_seen). That only happens once you actually rate a
             # specific card, in _handle_submit below.
-            body_html = "\n".join(module.build_body_lines(row, enrich_cache.get(key))).replace("\n", "<br>")
+            if kind == "v":
+                # Vocab has two card types per word (recognition vs.
+                # production - see vocab_drip.py's module docstring), so
+                # unlike kanji/grammar its front text and enrichment
+                # lookup both depend on which one `key` actually is, not
+                # just on `kind` - card_front/base_word know that split;
+                # kanji_drip.py/grammar_drip.py have no such thing since
+                # they only ever have one card type per item.
+                front = module.card_front(key, row)
+                body_html = "\n".join(
+                    module.build_body_lines(row, enrich_cache.get(module.base_word(key)), key=key)
+                ).replace("\n", "<br>")
+            else:
+                front = (row.get(cfg["front_field"]) or "").strip()
+                body_html = "\n".join(module.build_body_lines(row, enrich_cache.get(key))).replace("\n", "<br>")
             card = {
                 "key": key,
                 "badge": _status_badge(rec, cfg["box_hours"]),
-                "front": (row.get(cfg["front_field"]) or "").strip(),
+                "front": front,
                 "body_html": body_html,
             }
             if cfg["has_image"]:

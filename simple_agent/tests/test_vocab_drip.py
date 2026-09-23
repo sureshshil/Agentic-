@@ -104,10 +104,10 @@ class FormatWordBlockTest(unittest.TestCase):
         block = vd.format_word_block(self.rows[0], "new")
         self.assertIn("<b>場合[ばあい]</b>", block)
         self.assertIn("<tg-spoiler>", block)
-        self.assertIn("ばあい — case; situation", block)
+        self.assertIn("<b>ばあい</b> · case; situation", block)
         self.assertIn("\U0001f1f3\U0001f1f5 अवस्था", block)
-        self.assertIn("助詞: 〜の場合[ばあい]（は）", block)
-        self.assertIn("例文:\n1. 雨[あめ]の場合[ばあい]は中止[ちゅうし]。", block)
+        self.assertIn("<code>〜の場合[ばあい]（は）</code>", block)
+        self.assertIn("1. 雨[あめ]の場合[ばあい]は中止[ちゅうし]。\n<i>In case of rain, cancelled.</i>", block)
         # the word itself must be OUTSIDE the spoiler span (it's the recall prompt)
         self.assertLess(block.index("<b>場合[ばあい]</b>"), block.index("<tg-spoiler>"))
 
@@ -165,7 +165,7 @@ class EnrichmentTest(unittest.TestCase):
     def test_enrichment_without_examples_omits_the_example_blocks(self):
         enrichment = {"explanation": "just a note"}
         lines = vd.build_body_lines(self.rows[0], enrichment)
-        self.assertNotIn("例文1", "\n".join(lines))
+        self.assertNotIn("Example 1", "\n".join(lines))
 
     def test_format_word_block_passes_enrichment_through(self):
         enrichment = {"examples": [{"jp": "場合[ばあい]による。", "en": "It depends on the situation."}]}

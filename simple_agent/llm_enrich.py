@@ -29,6 +29,17 @@ build_client()/pricing pattern rather than importing telegram_bot.py's
 heavier tool-loop Agent (this only ever needs one plain, tool-free
 generate_content call).
 
+Furigana: every prompt asks the model to bracket its own Japanese output
+inline (漢字[かんじ]) rather than relying solely on furigana.py's offline
+tagger pass afterward - we're already paying for this call, so getting the
+reading from the same model that's reading the actual sentence it wrote
+resolves genuinely context-dependent words (e.g. 方 as かた "person" vs ほう
+"way") that a tagger's part-of-speech guess can still get wrong. format_blocks
+still runs everything through furigana.annotate() (see _fx below) purely as a
+safety net for any kanji run the model forgets to bracket - annotate() already
+skips anything already bracketed, so this costs nothing when the model
+complies and just fills gaps when it doesn't.
+
 Cost control: a LIFETIME cap (ENRICH_MAX_COST_USD, like telegram_bot.py's
 own AGENT_MAX_COST_USD) tracked in .llm_enrich_usage.json next to the
 other dotfile state. Once the cap is hit, enrich_kanji/enrich_grammar/
@@ -64,6 +75,8 @@ existing dotenv calls - nothing new to source):
 
 import html
 import json
+import re
+import time
 import os
 
 import furigana
@@ -149,6 +162,19 @@ def _save_usage(usage: dict) -> None:
         json.dump(usage, f, ensure_ascii=False, indent=2)
 
 
+def _generate_with_backoff(**kwargs):
+    """generate_content, retried a few times with a growing pause on a
+    429 RESOURCE_EXHAUSTED (Vertex's rate limit) - anything else, or the
+    last attempt, raises as before."""
+    for attempt, delay in enumerate((5, 15, 0)):
+        try:
+            return _client.models.generate_content(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            if "429" not in str(e) or not delay:
+                raise
+            time.sleep(delay)
+
+
 def _generate(prompt: str, schema: dict) -> dict | None:
     """One tool-free generate_content call constrained to `schema` via
     response_mime_type=application/json. Returns the parsed dict, or None
@@ -174,7 +200,7 @@ def _generate(prompt: str, schema: dict) -> dict | None:
         if _client is None:
             _client = _build_client()
 
-        response = _client.models.generate_content(
+        response = _generate_with_backoff(
             model=MODEL,
             contents=[{"role": "user", "parts": [{"text": prompt}]}],
             config=types.GenerateContentConfig(
@@ -208,6 +234,32 @@ def _generate(prompt: str, schema: dict) -> dict | None:
         print(f"[llm_enrich] enrichment call failed ({exc!r}) - sending CSV content only.")
         return None
 
+
+_FURIGANA_INSTRUCTION = (
+    "\nFurigana: in every field containing Japanese text, write inline "
+    "furigana readings immediately after each kanji run using Anki-style "
+    "brackets - kanji[reading] in hiragana, e.g. 厳しい as 厳[きび]しい "
+    "(bracket only the kanji stem, not trailing okurigana kana) and 今日 as "
+    "今日[きょう]. Every kanji character must be covered by a reading "
+    "bracket; leave kana-only text un-bracketed."
+)
+
+
+def _i_plus_one_instruction(level: str) -> str:
+    """Krashen's i+1 (comprehensible input): every example should have
+    exactly ONE new/harder element - the target word/pattern itself - not
+    that plus other unfamiliar vocab/grammar stacked in the same sentence.
+    A bare "at JLPT {level} difficulty" instruction doesn't by itself stop
+    the model from reaching for other N2/N1 words alongside the target,
+    which buries the one thing this card is actually teaching."""
+    return (
+        f"\nComprehensible input (i+1): everywhere else in each sentence "
+        f"(every word and grammar point other than the target item "
+        f"itself), stay AT OR BELOW JLPT {level} - the target word/pattern "
+        "should be the ONE new or harder element a learner at this level "
+        "hasn't necessarily seen yet, not one of several unfamiliar things "
+        "stacked together."
+    )
 
 _EXAMPLE_ITEM = {
     "type": "OBJECT",
@@ -317,6 +369,10 @@ def enrich_kanji(row: dict, level: str) -> dict | None:
         "reading or meaning in context (a cloze sentence with a blank, or 'what "
         "does X mean/how is X read'), with exactly 4 short options and the correct "
         "answer (answer must be one of the options, verbatim)."
+        + _FURIGANA_INSTRUCTION
+        + " (the per-example `reading` field is the exception - leave it as a "
+        "plain, unbracketed full-hiragana/katakana reading, same as before)."
+        + _i_plus_one_instruction(level)
     )
     return _generate(prompt, _KANJI_SCHEMA)
 
@@ -355,6 +411,8 @@ def enrich_grammar(row: dict, level: str) -> dict | None:
         "of this pattern (a cloze sentence with a blank, or 'which sentence "
         "correctly uses X'), with exactly 4 short options and the correct answer "
         "(answer must be one of the options, verbatim)."
+        + _FURIGANA_INSTRUCTION
+        + _i_plus_one_instruction(level)
     )
     return _generate(prompt, _GRAMMAR_SCHEMA)
 
@@ -362,7 +420,67 @@ def enrich_grammar(row: dict, level: str) -> dict | None:
 # Same shape as grammar's (jp/en, no per-line reading field - vocab's own
 # curated sentences carry inline [furigana] already, and the AI content
 # doesn't need to match that markup).
-_VOCAB_SCHEMA = _GRAMMAR_SCHEMA
+_VOCAB_SCHEMA = {
+    **_GRAMMAR_SCHEMA,
+    "properties": {
+        **_GRAMMAR_SCHEMA["properties"],
+        "examples": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "pattern": {"type": "STRING"},
+                    "jp": {"type": "STRING"},
+                    "en": {"type": "STRING"},
+                },
+                "required": ["pattern", "jp", "en"],
+            },
+        },
+    },
+}
+
+
+def vocab_patterns(frame: str) -> list:
+    """A vocab row's `frame` ("〜の目的／目的を持つ／V-る目的で") split into its
+    individual particle/usage patterns."""
+    return [p.strip() for p in re.split(r"[／・/]", frame or "") if p.strip()]
+
+
+def _align_vocab_examples(patterns: list, examples: list) -> list:
+    """Reorder/relabel `examples` so example i always demonstrates
+    patterns[i] verbatim - guards against the model returning the right
+    content but in a shuffled order, or with a slightly paraphrased
+    `pattern` label, which broke the 1:1 correspondence a learner sees
+    between the Particles line (vocab_drip.build_body_lines) and each
+    Example's pattern tag (format_blocks below). Only touches the case
+    enrich_vocab actually asked for one-per-pattern; left as-is (best
+    effort, no crash) if the model didn't return the right count."""
+    if len(patterns) < 2 or len(examples) != len(patterns):
+        return examples
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", "", s or "")  # ignore whitespace-only differences
+
+    remaining = list(examples)
+    aligned = []
+    for pattern in patterns:
+        match = next(
+            (e for e in remaining if _norm(e.get("pattern")) == _norm(pattern)), None
+        ) or remaining[0]  # no exact-ish match found - best effort, keep content in order
+        match["pattern"] = pattern  # canonical text, in case the model paraphrased it
+        remaining.remove(match)
+        aligned.append(match)
+    return aligned
+
+
+def vocab_entry_is_stale(row: dict, entry: dict) -> bool:
+    """True when a cached enrich_vocab() result doesn't have one tagged
+    example per pattern in the row's frame - i.e. it predates full
+    particle coverage and should be regenerated once."""
+    patterns = vocab_patterns(row.get("frame"))
+    if len(patterns) < 2:
+        return False
+    return entry.get("patterns_covered") != patterns
 
 
 def enrich_vocab(row: dict, level: str) -> dict | None:
@@ -386,22 +504,26 @@ def enrich_vocab(row: dict, level: str) -> dict | None:
     reading = (row.get("reading") or "").strip()
     meaning = (row.get("english") or "").strip()
     frame = (row.get("frame") or "").strip()
+    patterns = vocab_patterns(frame)
     prompt = (
         f"You are building a rich practice block for a JLPT {level} learner "
         f"reviewing the word '{word}' (reading: {reading}; meaning: {meaning}) "
         "via spaced-repetition flashcards. Generate:\n"
-        f"1. examples: 2-3 natural example sentences at JLPT {level} difficulty "
-        "using this word, each in a different register/context (e.g. one casual, "
-        "one more formal or written, one a question) and different from typical "
-        "textbook examples."
         + (
-            f" This word's particle-affinity patterns are: {frame} - if more than "
-            "one pattern is listed, make sure your examples collectively exercise "
-            "each different pattern at least once, not just the first one."
-            if frame
-            else ""
+            f"1. examples: EXACTLY {len(patterns)} natural example sentences at JLPT {level} "
+            f"difficulty using this word - ONE per particle/usage pattern, in this order: "
+            f"{' | '.join(patterns)}. Each example must clearly use its own pattern "
+            "(put that pattern verbatim in `pattern`), so together they cover every "
+            "pattern with none skipped or repeated. Vary register/context across them "
+            "and avoid typical textbook sentences. "
+            if len(patterns) >= 2
+            else f"1. examples: 2-3 natural example sentences at JLPT {level} difficulty "
+            "using this word, each in a different register/context and different from "
+            "typical textbook examples"
+            + (f" (usage pattern: {patterns[0]}; put it in `pattern`)" if patterns else " (set `pattern` to '-')")
+            + ". "
         )
-        + " Each needs the Japanese sentence (jp) and a natural English "
+        + "Each needs the Japanese sentence (jp), its `pattern`, and a natural English "
         "translation (en).\n"
         "2. explanation: ONE brief note (1-2 sentences) on why your FIRST example "
         "sentence naturally uses this word the way it does (e.g. word choice, "
@@ -414,8 +536,17 @@ def enrich_vocab(row: dict, level: str) -> dict | None:
         "blank, or 'what does X mean/which particle is correct'), with exactly 4 "
         "short options and the correct answer (answer must be one of the options, "
         "verbatim)."
+        + _FURIGANA_INSTRUCTION
+        + _i_plus_one_instruction(level)
     )
-    return _generate(prompt, _VOCAB_SCHEMA)
+    result = _generate(prompt, _VOCAB_SCHEMA)
+    if result is not None:
+        result["examples"] = _align_vocab_examples(patterns, result.get("examples") or [])
+        result["patterns_covered"] = patterns
+    return result
+
+
+SECTION_RULE = "━━━━━━━━━━━━"
 
 
 def _fx(text) -> str:
@@ -438,29 +569,34 @@ def format_blocks(enrichment: dict) -> list:
 
     examples = enrichment.get("examples") or []
     for i, example in enumerate(examples, start=1):
-        line = f"\U0001f916 例文{i}: {_fx(example['jp'])}"
+        pattern = example.get("pattern")
+        tag = f" · <code>{html.escape(pattern)}</code>" if pattern not in (None, "", "-") else ""
+        line = f"✏️ <b>Example {i}</b>{tag}\n{_fx(example['jp'])}"
         if example.get("reading"):
             line += f"\n{html.escape(example['reading'])}"  # full-kana line, kept
-        line += f"\n— {html.escape(example['en'])}"
+        line += f"\n<i>{html.escape(example['en'])}</i>"
         blocks.append(line)
 
     if enrichment.get("explanation"):
-        blocks.append(f"\U0001f916 解説: {_fx(enrichment['explanation'])}")
+        blocks.append(f"\U0001f4a1 <b>Explanation</b>\n{_fx(enrichment['explanation'])}")
 
     dialogue = enrichment.get("dialogue") or []
     if dialogue:
-        dialogue_lines = ["\U0001f916 会話:"]
+        dialogue_lines = ["\U0001f4ac <b>Dialogue</b>"]
         for turn in dialogue:
             speaker = html.escape(turn.get("speaker") or "")
-            dialogue_lines.append(f"{speaker}: {_fx(turn['jp'])} ({html.escape(turn['en'])})")
+            dialogue_lines.append(f"<b>{speaker}:</b> {_fx(turn['jp'])}")
+            dialogue_lines.append(f"<i>{html.escape(turn['en'])}</i>")
         blocks.append("\n".join(dialogue_lines))
 
     question = enrichment.get("practice_question")
     if question:
-        question_lines = [f"\U0001f916 クイズ: {_fx(question['question'])}"]
+        question_lines = [f"❓ <b>Quiz</b>\n{_fx(question['question'])}"]
         for letter, option in zip("ABCD", question.get("options") or []):
-            question_lines.append(f"{letter}) {_fx(option)}")
-        question_lines.append(f"✅ 答え: {_fx(question.get('answer') or '')}")
+            question_lines.append(f"<b>{letter})</b> {_fx(option)}")
+        question_lines.append(f"✅ <b>Answer:</b> {_fx(question.get('answer') or '')}")
         blocks.append("\n".join(question_lines))
 
+    if blocks:
+        blocks[0] = f"{SECTION_RULE}\n\U0001f916 <b>AI practice</b>\n\n{blocks[0]}"
     return blocks

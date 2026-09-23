@@ -174,27 +174,27 @@ def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
     the curated content; the curated content itself is never replaced."""
     body = []
     if (row.get("formation") or "").strip():
-        body.append(f"形: {_fx(row['formation'].strip())}")
+        body.append(f"\U0001f9f1 <b>Formation:</b> {_fx(row['formation'].strip())}")
 
     body.append(html.escape((row.get("meaning_en") or "").strip()))
     if (row.get("meaning_ne") or "").strip():
         body.append(f"\U0001f1f3\U0001f1f5 {html.escape(row['meaning_ne'].strip())}")
 
     if (row.get("nuance") or "").strip():
-        body.append(f"ニュアンス: {_fx(row['nuance'].strip())}")
+        body.append(f"\U0001f3af <b>Nuance:</b> {_fx(row['nuance'].strip())}")
     if (row.get("contrast") or "").strip():
-        body.append(f"対比: {_fx(row['contrast'].strip())}")
+        body.append(f"⚖️ <b>Contrast:</b> {_fx(row['contrast'].strip())}")
 
     ex_jp = (row.get("ex1") or "").strip()
     if ex_jp:
         body.append("")
-        example_lines = [f"例文: {_fx(ex_jp)}"]
+        example_lines = [f"✏️ <b>Example</b>\n{_fx(ex_jp)}"]
         ex_reading = (row.get("ex1_reading") or "").strip()
         if ex_reading:
             example_lines.append(html.escape(ex_reading))
         ex_en = (row.get("ex1_en") or "").strip()
         if ex_en:
-            example_lines.append(f"— {html.escape(ex_en)}")
+            example_lines.append(f"<i>{html.escape(ex_en)}</i>")
         body.append("\n".join(example_lines))
 
     if enrichment:

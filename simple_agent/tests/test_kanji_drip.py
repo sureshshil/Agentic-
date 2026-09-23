@@ -56,14 +56,14 @@ class BuildBodyLinesTest(unittest.TestCase):
     def test_enrichment_without_examples_omits_the_example_blocks(self):
         enrichment = {"explanation": "just a note"}
         lines = kd.build_body_lines(_ROW, enrichment)
-        self.assertNotIn("例文1", "\n".join(lines))
+        self.assertNotIn("Example 1", "\n".join(lines))
 
     def test_disc_note_is_shown_as_a_curated_hint_regardless_of_enrichment(self):
         row = {**_ROW, "disc_note": "決 has 夬 on the right; 快 (かい, pleasant) shares that same component."}
         lines = kd.build_body_lines(row)
         joined = "\n".join(lines)
         self.assertIn("快", joined)
-        self.assertIn("ヒント", joined)
+        self.assertIn("Hint:", joined)
         self.assertNotIn("\U0001f916", joined)  # curated, not AI-labelled
 
     def test_missing_disc_note_omits_the_hint_line(self):

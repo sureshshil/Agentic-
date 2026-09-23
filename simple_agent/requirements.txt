@@ -5,4 +5,5 @@ python-dotenv
 google-auth  # only for scheduled/vocab_sinks.py's optional Google Doc sink
 Pillow  # kanji_image.py - renders the kanji_drip.py glyph image sent to Telegram
 edge-tts  # jlpt_instructor.py's Listening narration, same voice as artifact_creation/build_vocab_audio.py
-pykakasi  # furigana.py - inline 漢字[かんじ] readings for Telegram cards (no ruby support there)
+fugashi  # furigana.py - MeCab-based tokenizer for inline 漢字[かんじ] readings (no ruby support in Telegram)
+unidic-lite  # fugashi's dictionary - swap for `unidic` for better coverage if size/build time allow it

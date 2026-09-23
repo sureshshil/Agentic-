@@ -45,6 +45,11 @@ Commands:
                  callback maintain. The model can also pull this (and quiz
                  you) mid-conversation via the srs_deck_stats/srs_due_items/
                  srs_record_review tools - see SYSTEM_PROMPT_BASE.
+  /streak        Current daily review streak (kanji+grammar+vocab combined)
+                 and a 7-day-per-day reviews/accuracy trend - see srs.py's
+                 current_streak/accuracy_trend. Only reflects reviews rated
+                 after each item's "history" field was introduced; older
+                 ratings aren't retroactively counted.
 
 Long-term memory: 'remember' skips a fact that's already stored (exact
 match, case-insensitive) instead of piling up duplicates, and stamps each
@@ -1597,6 +1602,22 @@ def main() -> None:
                         _format_deck_stats(label, srs.deck_stats(srs.load_state(SRS_KIND_PATHS[kind][0]), now))
                         for label, kind in (("Kanji", "k"), ("Grammar", "g"), ("Vocab", "v"))
                     ]
+                    reply = "\n".join(lines)
+                    print(f"Agent: {reply}")
+                    send_telegram_reply(api_base, chat_id, reply)
+                    continue
+
+                if text.strip().lower() == "/streak":
+                    now = srs.now_utc()
+                    states = [srs.load_state(SRS_KIND_PATHS[kind][0]) for kind in ("k", "g", "v")]
+                    streak = srs.current_streak(states, now)
+                    trend = srs.accuracy_trend(states, now, days=7)
+                    lines = [f"\U0001f525 Current streak: {streak} day{'s' if streak != 1 else ''}", ""]
+                    for day in trend:
+                        if day["reviews"] == 0:
+                            lines.append(f"{day['date']}: no reviews")
+                        else:
+                            lines.append(f"{day['date']}: {day['reviews']} review(s), {day['accuracy']:.0f}% correct")
                     reply = "\n".join(lines)
                     print(f"Agent: {reply}")
                     send_telegram_reply(api_base, chat_id, reply)

@@ -220,30 +220,30 @@ def build_body_lines(row: dict, enrichment: dict | None = None) -> list:
     readings = " / ".join(
         r.strip() for r in (row.get("onyomi", ""), row.get("kunyomi", "")) if r.strip()
     )
-    body = [f"{html.escape(readings)} — {html.escape((row.get('meaning_en') or '').strip())}"]
+    body = [f"\U0001f524 <b>{html.escape(readings)}</b> · {html.escape((row.get('meaning_en') or '').strip())}"]
 
     if (row.get("meaning_ne") or "").strip():
         body.append(f"\U0001f1f3\U0001f1f5 {html.escape(row['meaning_ne'].strip())}")
 
     if (row.get("component") or "").strip():
-        body.append(f"構成: {_fx(row['component'].strip())}")
+        body.append(f"\U0001f9f1 <b>Components:</b> {_fx(row['component'].strip())}")
     if (row.get("confusable") or "").strip():
-        body.append(f"似ている: {_fx(row['confusable'].strip())}")
+        body.append(f"\U0001f500 <b>Look-alikes:</b> {_fx(row['confusable'].strip())}")
     if (row.get("disc_note") or "").strip():
-        body.append(f"\U0001f4a1 ヒント: {_fx(row['disc_note'].strip())}")
+        body.append(f"\U0001f4a1 <b>Hint:</b> {_fx(row['disc_note'].strip())}")
 
     words = _split_words(row.get("words", ""))
     if words:
         body.append("")
-        body.append(f"単語: {html.escape(' / '.join(words))}")
+        body.append(f"\U0001f4da <b>Words:</b> {html.escape(' / '.join(words))}")
 
     example = (row.get("example") or "").strip()
     if example:
         body.append("")
-        line = f"例文: {html.escape(example)}"
+        line = f"✏️ <b>Example</b>\n{html.escape(example)}"
         example_en = (row.get("example_en") or "").strip()
         if example_en:
-            line += f"\n— {html.escape(example_en)}"
+            line += f"\n<i>{html.escape(example_en)}</i>"
         body.append(line)
 
     if enrichment:

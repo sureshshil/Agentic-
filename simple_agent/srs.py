@@ -38,6 +38,19 @@ State shape (one JSON file per deck, e.g. .kanji_srs.json):
                                      user directly, so a repeated mix-up is
                                      visible on the item itself rather than
                                      evaporating into chat history.
+      "history": [{"at": "<iso8601>", "action": "good", "box": 3}, ...]
+                                     one entry per rating, appended by
+                                     record_review, most recent 30 kept per
+                                     item (same bounded-growth pattern as
+                                     "notes" - box/reps/lapses are already
+                                     the permanent lifetime counters; this
+                                     is only for recent-trend reporting, so
+                                     it doesn't need to be unbounded). Feeds
+                                     review_events/accuracy_trend/
+                                     current_streak below - absent entirely
+                                     on items reviewed before this field was
+                                     added, which those functions treat the
+                                     same as "no history yet".
     },
     ...
   }
@@ -49,6 +62,7 @@ lands roughly one cadence step later, not days out.
 
 import json
 import os
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 ACTIONS = ("again", "hard", "good", "easy")
@@ -225,6 +239,9 @@ def record_review(state: dict, key: str, action: str, box_hours: list, now: date
     rec["last_result"] = action
     rec["last_reviewed"] = now.isoformat()
     rec["due"] = (now + timedelta(hours=interval_hours)).isoformat()
+    history = rec.setdefault("history", [])
+    history.append({"at": now.isoformat(), "action": action, "box": box})
+    del history[:-30]
     return interval_hours
 
 
@@ -301,3 +318,55 @@ def deck_stats(state: dict, now: datetime) -> dict:
         "box_counts": box_counts,
         "total_lapses": total_lapses,
     }
+
+
+def review_events(state: dict) -> list:
+    """Every recorded rating across all items in one deck's state, as flat
+    {"key", "at", "action", "box"} dicts - only as far back as each item's
+    capped "history" list reaches (see record_review). Backs
+    accuracy_trend/current_streak below."""
+    return [
+        {"key": key, **entry}
+        for key, rec in state.items()
+        for entry in rec.get("history", [])
+    ]
+
+
+def accuracy_trend(states: list, now: datetime, days: int = 14) -> list:
+    """[{"date", "reviews", "correct", "accuracy"}] for each of the last
+    `days` days (oldest first, today included), merged across `states` -
+    pass a single deck's state in a one-element list, or several to
+    combine them (e.g. kanji+grammar+vocab). "correct" counts "good"/
+    "easy" ratings; `accuracy` is that as a 0-100 percentage, or None on a
+    day with no reviews at all (so callers can render "no reviews" instead
+    of a misleading 0%)."""
+    buckets: dict = defaultdict(lambda: {"reviews": 0, "correct": 0})
+    for state in states:
+        for ev in review_events(state):
+            bucket = buckets[ev["at"][:10]]
+            bucket["reviews"] += 1
+            if ev["action"] in ("good", "easy"):
+                bucket["correct"] += 1
+
+    today = now.date()
+    out = []
+    for i in range(days - 1, -1, -1):
+        date = (today - timedelta(days=i)).isoformat()
+        b = buckets.get(date, {"reviews": 0, "correct": 0})
+        accuracy = (b["correct"] / b["reviews"] * 100) if b["reviews"] else None
+        out.append({"date": date, "reviews": b["reviews"], "correct": b["correct"], "accuracy": accuracy})
+    return out
+
+
+def current_streak(states: list, now: datetime) -> int:
+    """Consecutive days, ending today and counting backward, with at least
+    one review recorded in ANY of `states` - 0 if today has no review yet
+    (a day with no review at all breaks the streak, even if "today" isn't
+    over - same semantics as any other daily-streak counter)."""
+    reviewed_dates = {ev["at"][:10] for state in states for ev in review_events(state)}
+    streak = 0
+    day = now.date()
+    while day.isoformat() in reviewed_dates:
+        streak += 1
+        day -= timedelta(days=1)
+    return streak
