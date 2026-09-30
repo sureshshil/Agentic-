@@ -111,48 +111,26 @@ call (real environment variables always win):
    to reset and force a send). Tapping their inline buttons only does
    anything if `telegram_bot.py` is already running and listening.
 
-3. Add cron entries. Edit the crontab for whichever user runs
-   `telegram_bot.py` (`crontab -e`, or `sudo -u <user> crontab -e` if it
-   runs under a dedicated service user per `telegram-bot.service`):
+3. Install the crontab. The live schedule is checked in as
+   [`deploy/crontab`](crontab) - the source of truth for when every job
+   in this doc runs (hour lists, JST quiet hours, log paths, virtualenv
+   interpreter). Install it as whichever user runs `telegram_bot.py`:
 
-   ```cron
-   # Weather alert - every 30 minutes
-   cron */30 * * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 rain_alert_cron.py >> /var/log/weather-alert.log 2>&1
-
-   # News digest - once a day at 08:00 (agent-generated; swap in
-   # news_digest.py for the simpler, cheaper, non-agent version instead -
-   # but that one still needs the shell-export approach below since it
-   # doesn't call load_dotenv())
-   0 8 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 news_digest_agent.py >> /var/log/news-digest.log 2>&1
-
-   # Vocab active-recall drip (10-word batch) - every 2 hours, but only
-   # 07:00-23:00 JST (0,2,4,...,22 minus the overnight hours) - adjust
-   # this hour list to your own waking hours/timezone; there's no
-   # quiet-hours logic in the script itself. Offset 15min from kanji's
-   # hourly :00 so the two never land in the same minute (they otherwise
-   # collide on every even JST hour, since vocab's 2-hourly slots are a
-   # subset of kanji's hourly ones).
-   15 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 vocab_drip.py >> /var/log/vocab-drip.log 2>&1
-
-   # Kanji active-recall drip (3-kanji batch) - every hour within that same window
-   0 22,23,0-14 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 kanji_drip.py >> /var/log/kanji-drip.log 2>&1
-
-   # Grammar active-recall drip (3-pattern batch) - every 2 hours, offset
-   # 30min from vocab (and thus 30min from kanji's hourly :00 too)
-   30 0,2,4,6,8,10,12,14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 grammar_drip.py >> /var/log/grammar-drip.log 2>&1
+   ```bash
+   crontab simple_agent/deploy/crontab   # replaces that user's whole crontab
    ```
 
-   With WEBAPP_BASE_URL set, each of these fires is ONE review-link
-   message (the whole batch as a swipeable deck, opened in the browser),
-   not one message per item - see the review section below. This is
-   still a lot of
-   pushes/day (kanji hourly = 17/day, vocab + grammar every 2h = 9/day
-   each => ~35/day across the 07:00-23:00 window) - widen the hour
-   lists or drop to every-3/4-hours if that's too frequent for you.
+   If you change the schedule on the box with `crontab -e`, re-export and
+   commit it (`crontab -l > simple_agent/deploy/crontab`) so the repo
+   doesn't drift from what's live.
 
-   Replace `/path/to/Agentic-` with the repo's actual path on the VPS,
-   and `python3` with a full interpreter path (`which python3`) if
-   you're using a virtualenv.
+   Current cadence (box is UTC; JST = UTC+9): vocab 3x/day, kanji and
+   grammar 1x/day each - deliberately low to keep Telegram pushes to
+   ~5/day. With WEBAPP_BASE_URL set, each fire is ONE review-link message
+   (the whole batch as a swipeable deck), not one message per item. The
+   *_NEW_PER_DAY caps in `scheduled.env` are lowered to match this cadence
+   (see scheduled.env.example) so due reviews don't outgrow what each
+   push clears - revisit them if you increase the frequency again.
 
 Cron has no journal the way systemd does - that's what the `>> ... 2>&1`
 redirect above is for; check those log files if an expected run doesn't
@@ -329,15 +307,10 @@ existing dated rows) with the same integration used by `NOTION_API_KEY` -
 an internal integration only sees pages/databases explicitly shared with
 it.
 
-Crontab - hourly is deliberate here rather than pinning exact UTC times
-for 07:00/23:00 JST: the script's own JST branch + email ledger decide
-whether to actually act, so an hourly tick is robust to a missed/late
-cron run in a way a once-a-day pinned time isn't (same reasoning as
-kanji_drip.py's multiple-times-a-day cadence above):
-
-```cron
-7 * * * * cd /home/projects/Agentic-/simple_agent/scheduled && python3 jlpt_instructor.py >> /var/log/jlpt-instructor.log 2>&1
-```
+Crontab: see [`deploy/crontab`](crontab) - currently 07:07 and 23:07 JST,
+one tick per branch (morning plan + email, evening feedback). Keep at
+least one run before noon JST and one after, or a branch never runs; the
+script's JST branch + email ledger make extra ticks harmless.
 
 Test manually first:
 

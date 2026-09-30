@@ -1,0 +1,29 @@
+# Live VPS crontab for the scheduled/ scripts - the source of truth for
+# when each job runs. Install with:  crontab simple_agent/deploy/crontab
+# (this REPLACES the user's whole crontab). After a `crontab -e` edit on
+# the box, re-export with `crontab -l > simple_agent/deploy/crontab` and commit.
+#
+# Box timezone is UTC; JST = UTC+9. No quiet-hours logic lives in the
+# scripts - these hour lists are it. Settings/secrets come from
+# ../telegram_bot.env and deploy/scheduled.env (gitignored), which the
+# scripts load themselves via load_dotenv().
+
+# Weather alert - every 30 minutes (only notifies above threshold)
+*/30 * * * * cd /home/projects/Agentic-/simple_agent/scheduled && /home/projects/Agentic-/simple_agent/myenv/bin/python3  rain_alert_cron.py >> /var/log/weather-alert.log 2>&1
+
+# News digest - 08:00 UTC (17:00 JST)
+0 8 * * * cd /home/projects/Agentic-/simple_agent/scheduled && /home/projects/Agentic-/simple_agent/myenv/bin/python3  news_digest_agent.py >> /var/log/news-digest.log 2>&1
+
+# Vocab drip - 3x/day: 08:15, 13:15, 20:15 JST
+15 23,4,11 * * * cd /home/projects/Agentic-/simple_agent/scheduled && /home/projects/Agentic-/simple_agent/myenv/bin/python3 vocab_drip.py >> /var/log/vocab-drip.log 2>&1
+
+# Kanji drip - 1x/day: 07:00 JST
+0 22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && /home/projects/Agentic-/simple_agent/myenv/bin/python3 kanji_drip.py >> /var/log/kanji-drip.log 2>&1
+
+# Grammar drip - 1x/day: 12:30 JST
+30 3 * * * cd /home/projects/Agentic-/simple_agent/scheduled && /home/projects/Agentic-/simple_agent/myenv/bin/python3 grammar_drip.py >> /var/log/grammar-drip.log 2>&1
+
+# JLPT instructor - 07:07 JST (morning: Notion plan + email) and 23:07 JST
+# (evening: feedback). Not a Telegram push; needs both runs - see the
+# morning/evening branch in jlpt_instructor.py.
+7 14,22 * * * cd /home/projects/Agentic-/simple_agent/scheduled && /home/projects/Agentic-/simple_agent/myenv/bin/python3 jlpt_instructor.py >> /var/log/jlpt-instructor.log 2>&1
